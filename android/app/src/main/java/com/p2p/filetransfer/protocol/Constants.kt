@@ -1,0 +1,89 @@
+package com.p2p.filetransfer.protocol
+
+/** 网络协议常量（与桌面端 Python 实现严格一致） */
+object Constants {
+
+    // 端口
+    const val UDP_PORT = 9998      // 设备发现（心跳/广播/回复）
+    const val TCP_PORT = 9999      // 文件传输
+    const val SCAN_PORT = 9997     // 扫描探测
+
+    // 时间/大小
+    const val NODE_TIMEOUT_MS = 600_000L          // 节点 10 分钟无响应则移除
+    const val BUFFER_SIZE = 1 * 1024 * 1024       // 初始缓冲区 1MB
+    const val MAX_BUFFER_SIZE = 8 * 1024 * 1024   // 最大 8MB
+    const val SOCKET_BUFFER_SIZE = 16 * 1024 * 1024
+    const val AUTO_SCAN_INTERVAL_MS = 20_000L     // 后台扫描间隔
+    const val HEARTBEAT_MAX_FAIL = 3
+    const val MAX_RETRIES = 3
+
+    // 扫描
+    const val SCAN_TIMEOUT_MS = 500               // 单次探测超时
+    const val MAX_SCAN_IPS = 65536                // 单次扫描最大 IP 数
+    const val SCAN_CONCURRENCY = 200              // Android 上并发扫描数（低于桌面 1000）
+
+    // 低网络 / 静默超时
+    const val LOW_NETWORK_THRESHOLD = 512 * 1024.0
+    const val RECV_ACTIVITY_TIMEOUT_MS = 60_000L  // 接收静默超时
+    const val ACTIVITY_TIMEOUT_MS = 30_000L       // 发送静默超时
+    const val WRITE_BATCH_SIZE = 1 * 1024 * 1024  // 磁盘写入批量
+
+    // 动态缓冲区下限 / 上限
+    const val MIN_BUFFER_SIZE = 64 * 1024         // 最小 64KB
+    const val MIN_ADAPTIVE_CHUNK = 256 * 1024     // 发送端最小块 256KB
+    const val MAX_ADAPTIVE_CHUNK = 4 * 1024 * 1024  // 发送端最大块 4MB
+
+    // 广播
+    const val BROADCAST_BURST_INTERVAL_MS = 200L
+    const val BROADCAST_BURST_DURATION_MS = 5000L
+    const val BROADCAST_INTERVAL_MS = 1000L
+
+    // 消息类型（TCP 首个字节）
+    const val FLAG_FILE = 0x00
+    const val FLAG_FOLDER = 0x01
+    const val FLAG_QUERY_OFFSET = 0x02
+
+    // flags 位
+    const val FLAG_COMPRESS = 0x01   // bit0
+    const val FLAG_RESUME = 0x02     // bit1
+
+    // 文本文件压缩白名单
+    val TEXT_EXTENSIONS = setOf(
+        ".txt", ".log", ".json", ".xml", ".py", ".js", ".html", ".htm",
+        ".css", ".csv", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+        ".md", ".rst", ".sh", ".bat", ".ps1", ".vbs"
+    )
+
+    /** 判断文件名是否为可压缩文本文件 */
+    fun isTextFile(name: String): Boolean {
+        val idx = name.lastIndexOf('.')
+        if (idx < 0) return false
+        return TEXT_EXTENSIONS.contains(name.substring(idx).lowercase())
+    }
+
+    /**
+     * 接收端：根据速度（字节/秒）计算接收缓冲区大小。
+     * 未使用（保留供未来扩展）。接收端现在固定使用 BUFFER_SIZE（1MB）。
+     */
+    fun recvBufferSizeFor(speed: Double): Int = when {
+        speed < 1024.0 * 1024 -> 512 * 1024
+        speed < 5.0 * 1024 * 1024 -> 1024 * 1024
+        speed < 20.0 * 1024 * 1024 -> 2 * 1024 * 1024
+        else -> 4 * 1024 * 1024
+    }.coerceIn(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE)
+
+    /**
+     * 发送端：根据速度（字节/秒）计算自适应发送块大小。
+     *
+     * 注意：不做"变小"调整。低速度下也至少维持 256KB~1MB 的块，
+     * 避免慢 → 缓冲变小 → 更慢的负反馈循环。发送块只往上调，不往下调。
+     */
+    fun adaptiveChunkFor(speed: Double): Int = when {
+        // 极低网络也保持 256KB（原 16KB 太小，导致频繁系统调用）
+        speed < 512 * 1024 -> 256 * 1024
+        speed < 2 * 1024 * 1024 -> 512 * 1024
+        speed < 10 * 1024 * 1024 -> 1024 * 1024
+        speed < 40 * 1024 * 1024 -> 2 * 1024 * 1024
+        else -> 4 * 1024 * 1024
+    }.coerceIn(MIN_ADAPTIVE_CHUNK, MAX_ADAPTIVE_CHUNK)
+}

@@ -1,0 +1,39 @@
+# ===== Android / Gradle =====
+android/.gradle/
+android/.idea/
+android/local.properties
+android/build/
+android/app/build/
+android/captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.hprof
+
+# ===== Kotlin / Java =====
+*.iml
+*.jar
+*.war
+out/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ===== IDE / Editor =====
+.vscode/
+*.swp
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
