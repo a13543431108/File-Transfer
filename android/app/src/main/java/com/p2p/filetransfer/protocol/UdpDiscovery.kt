@@ -42,8 +42,17 @@ class UdpDiscovery(
 ) {
 
     private val gson = Gson()
-    private val hostname: String = NetworkUtil.hostname()
+    /** 当前设备名（可通过 setHostname 修改，立即生效于下次广播/心跳/回复） */
+    @Volatile private var hostname: String = NetworkUtil.hostname()
     private val myIps: Set<String> = (NetworkUtil.getLocalIPv4List() + NetworkUtil.getLocalIPv6List()).toSet()
+
+    /** 修改本机设备名（下次发送广播/回复时使用新名字） */
+    fun setHostname(newName: String) {
+        if (newName.isNotEmpty()) hostname = newName
+    }
+
+    /** 读取当前设备名 */
+    fun currentHostname(): String = hostname
 
     private var scope: CoroutineScope? = null
     private var udpListenerJob: Job? = null

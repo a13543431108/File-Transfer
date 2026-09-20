@@ -1,0 +1,1317 @@
+================================================================================
+                    P2P 文件互传系统 - Android App 开发工作流程文档
+                       (详尽版 - 基于 Python 桌面端源码分析)
+================================================================================
+
+一、系统概述
+================================================================================
+
+  系统名称: 全环境极速传输 V14.0
+  协议类型: P2P 局域网/广域网文件传输协议
+  核心架构: UDP 设备发现 + TCP 文件传输
+  源码文件: 文件互传.py (2363行, Python, tkinter GUI)
+
+  功能特性:
+    - 设备自动发现 (UDP广播 + 子网扫描 + 手动添加)
+    - 单文件 / 文件夹传输
+    - 断点续传 (进程崩溃/网络断开后可恢复)
+    - 文本文件 zlib 压缩传输
+    - IPv4 / IPv6 双栈支持
+    - 动态缓冲区适配 (根据网络速度自动调整)
+    - SHA256 完整性校验
+    - 多设备并发发送 (每设备独立线程)
+    - 文件夹增量传输 (skip / full / resume)
+
+  运行环境:
+    - 桌面端: Python 3.x + tkinter (Windows/Linux/macOS)
+    - 目标端: Android (待开发)
+
+================================================================================
+
+二、端口定义与常量
+================================================================================
+
+  端口:
+    UDP_PORT  = 9998    设备发现（心跳/广播/互相回复）
+    TCP_PORT  = 9999    文件传输通道
+    SCAN_PORT = 9997    扫描探测（与设备发现隔离，防止扫描影响收发）
+
+  关键常量 (供 Android 端实现参考):
+    BROADCAST_INTERVAL          = 1 秒      （正常广播间隔）
+    BROADCAST_BURST_INTERVAL    = 0.2 秒    （启动爆发广播间隔）
+    BROADCAST_BURST_DURATION    = 5 秒      （爆发广播持续时间）
+    NODE_TIMEOUT                = 600 秒    （节点超时时间，10分钟未响应移除）
+    BUFFER_SIZE                 = 1MB       （初始缓冲区，动态调整）
+    MAX_BUFFER_SIZE             = 8MB       （最大缓冲区）
+    SOCKET_BUFFER_SIZE          = 16MB      （socket 缓冲区）
+    AUTO_SCAN_INTERVAL          = 20 秒     （后台自动扫描间隔）
+    SCAN_TIMEOUT                = 0.5 秒    （扫描探测超时，适配高延迟网络）
+    SCAN_THREADS                = 1000      （扫描并发线程数）
+    MAX_SCAN_IPS                = 65536     （单次扫描最大IP数，防大网段耗尽资源）
+    RECV_ACTIVITY_TIMEOUT       = 60 秒     （接收静默超时阈值）
+    ACTIVITY_TIMEOUT            = 30 秒     （发送静默超时阈值）
+    LOW_NETWORK_THRESHOLD       = 512KB/s   （低网络判定阈值）
+    WRITE_BATCH_SIZE            = 1MB       （磁盘写入批量大小）
+    HEARTBEAT_MAX_FAIL          = 3         （心跳连续失败次数阈值）
+    MAX_RETRIES                 = 3         （文件传输最大重试次数）
+
+  标志位定义:
+    FLAG_FILE       = 0x00    （单文件传输标志）
+    FLAG_FOLDER     = 0x01    （文件夹传输标志）
+    FLAG_COMPRESS   = 0x01    （压缩标志 - 在 flags 字段的 bit0）
+    FLAG_RESUME     = 0x02    （续传标志 - 在 flags 字段的 bit1）
+    FLAG_QUERY      = 0x02    （续传偏移量查询 - 作为首个 flag 字节时使用）
+
+  文本文件扩展名白名单 (触发 zlib 压缩):
+    .txt, .log, .json, .xml, .py, .js, .html, .htm
+    .css, .csv, .yaml, .yml, .toml, .ini, .cfg, .conf
+    .md, .rst, .sh, .bat, .ps1, .vbs
+
+  路径配置:
+    RESUME_DIR  = ~/.p2p_resume/       （续传状态存储目录）
+    SAVE_DIR    = ./Received/          （默认接收目录，用户可配置）
+    CONFIG_FILE = ~/.p2p_config.json   （用户配置：保存路径等）
+    LOG_FILE    = transfer.log         （运行日志）
+
+三、协议流程 (详尽版)
+================================================================================
+
+--- 3.1 设备发现流程 ---
+
+  3.1.1 启动初始化序列
+
+    [应用启动]
+      |
+      +-> Node.__init__(gui):
+      |     获取本机所有 IPv4 地址 -> self.my_ips
+      |     获取本机所有 IPv6 地址 -> self.my_ips_v6
+      |     计算所有广播地址 -> self.broadcast_addrs
+      |     获取主机名 -> self.hostname
+      |     初始化 nodes = {} (线程安全锁 self.lock)
+      |
+      +-> Node.run():
+      |     线程1: udp_listener()  (监听 UDP_PORT 9998)
+      |     线程2: scan_listener() (监听 SCAN_PORT 9997)
+      |     线程3..N: _start_broadcasters() (每个网卡一个广播线程)
+      |     线程4: tcp_file_receiver() (TCP 监听 TCP_PORT 9999)
+      |     定时任务: clean_nodes() (每2秒清理超时节点)
+      |     延迟任务: _startup_scan() (500ms 后执行启动扫描)
+      |
+      +-> P2PApp.__init__():
+            构建 GUI
+            node.start_auto_scan()  (每20秒自动扫描)
+
+  3.1.2 UDP 广播发送 (_udp_broadcaster_on_sock)
+
+    每个广播线程独立运行:
+      循环:
+        如果 self.pausing_network == True: 跳过 (传输中暂停)
+        构建消息: json.dumps({"hostname": self.hostname})
+        如果是绑定到特定IP的socket:
+          计算该IP的子网广播地址
+          发送到此广播地址 : UDP_PORT
+        否则 (全局socket):
+          发送到 255.255.255.255 : UDP_PORT
+        等待间隔:
+          启动前5秒: 0.2秒 (爆发模式)
+          5秒后: 1.0秒 (正常模式)
+
+  3.1.3 UDP 监听 (udp_listener)
+
+    同时监听 IPv4 和 IPv6 套接字，绑定 UDP_PORT:
+      循环 recvfrom(1024):
+        JSON.parse(data) -> msg
+        remote_ip = addr[0]
+
+        过滤规则:
+          - 如果是本机IP -> 忽略
+          - 如果是 127.0.0.1 / ::1 / 0.0.0.0 -> 忽略
+
+        消息类型判断:
+          case msg["heartbeat"] == True:
+            → 更新节点 last_seen
+            → 回复: {"heartbeat": true, "ack": true}
+            → 继续
+
+          case msg["scan_reply"] 或 msg["reply"]:
+            → 如果节点已存在: 更新 last_seen
+            → 如果节点不存在:
+               创建: {hostname, last_seen, source: "udp", heartbeat_fail: 0}
+               触发 GUI 刷新
+               启动线程: check_resume_on_online(remote_ip, hostname)
+            → 继续
+
+          default (普通广播包):
+            → 创建/更新节点
+            → 触发 GUI 刷新
+            → 启动线程: check_resume_on_online(remote_ip, hostname)
+            → 如果 msg["reply"] 不是 True:
+               回复: {"hostname": self.hostname, "reply": true}
+
+  3.1.4 扫描监听 (scan_listener)
+
+    绑定 SCAN_PORT，同时监听 IPv4 和 IPv6:
+      循环 recvfrom(1024):
+        JSON.parse -> msg
+        过滤本机IP / 回环地址
+        构建回复: {"hostname": self.hostname, "scan_reply": true}
+        向发送方同时回复到 SCAN_PORT 和 UDP_PORT (确保收到)
+
+  3.1.5 主动扫描 (scan_subnet)
+
+    scan_subnet(network_cidr):
+      解析 CIDR -> 生成所有主机IP列表
+      过滤本机IP
+      如果IP数 > MAX_SCAN_IPS (65536) -> 只扫描前65536个
+      ThreadPoolExecutor(SCAN_THREADS=1000):
+        对每个IP并行执行 scan_one(ip):
+          双端口探测 (先 SCAN_PORT，后 UDP_PORT):
+            创建 UDP socket -> settimeout(SCAN_TIMEOUT=0.5s)
+            发送: {"hostname": self.hostname}
+            等待回复 (0.5秒超时)
+            如果收到 -> 解析 hostname -> 返回 (ip, hostname)
+            如果超时 -> 尝试下一端口
+          如果任一端口收到回复:
+            add_manual_node(ip, source="scan", hostname=hostname)
+            计数 +1
+
+  3.1.6 广播搜索 (broadcast_discovery)
+
+    比逐IP扫描更快的方式:
+      构建消息: {"hostname": self.hostname, "discovery": true}
+      循环3次:
+        对每个广播地址:
+          创建UDP socket -> SO_BROADCAST -> 发送消息
+          关闭socket
+        间隔 0.2秒
+      然后等待 5秒 (让回复包在 udp_listener 中自然到达)
+
+  3.1.7 心跳检测 (heartbeat_check)
+
+    每20秒执行一次 (自扫描循环中):
+      获取所有节点IP列表
+      ThreadPoolExecutor(max_workers=16):
+        对每个IP并行执行 check(ip):
+          创建 UDP socket (根据IPv4/v6选择)
+          settimeout(1.0s)
+          发送: {"heartbeat": true} -> UDP_PORT
+          等待回复 (1秒超时)
+          如果收到 -> 在线
+          如果超时 -> 离线
+
+      结果处理:
+        在线: heartbeat_fail = 0, 更新 last_seen
+        离线: heartbeat_fail += 1
+        如果 heartbeat_fail >= 3 (HEARTBEAT_MAX_FAIL):
+          添加到 offline_ips 列表
+      批量删除离线IP -> 刷新GUI
+
+  3.1.8 新设备上线续传提醒 (check_resume_on_online)
+
+    当检测到新节点加入时触发 (也可在手动添加时触发):
+      扫描 RESUME_DIR:
+        pattern1: resume_sender_{ip}_*.json  (单文件续传)
+        pattern2: folder_resume_{ip}_*.json   (文件夹续传)
+      解析每个续传文件:
+        检查源文件是否还存在
+        计算已传百分比
+      如果找到待续传文件:
+        GUI 弹窗: "检测到设备上线，以下文件未完成传输，是否继续？"
+        用户确认 -> _do_resume_upload(ip, resume_files)
+        用户取消 -> 删除所有续传状态文件
+
+  3.1.9 节点清理 (clean_nodes)
+
+    每2秒执行:
+      now = time.time()
+      遍历 nodes:
+        如果 now - last_seen > NODE_TIMEOUT (600秒):
+          从 nodes 字典删除
+      刷新 GUI
+
+  3.1.10 子网推断规则 (get_subnet_for_ip)
+
+    根据不同IP段自动推断扫描范围:
+      10.x.x.x     -> /24  (避免/8扫描1600万IP，适配ZeroTier/Tailscale)
+      172.16-31.x.x -> /12
+      169.254.x.x   -> /16  (链路本地地址)
+      其他          -> /24  (标准局域网)
+
+--- 3.2 单文件发送流程 ---
+
+  3.2.1 发送前准备 (_send_single_file)
+
+    输入: TCP socket (已连接), filepath (绝对路径), target_ip
+
+    Step 1: 获取文件信息
+      total_size = os.path.getsize(filepath)
+      filename = os.path.basename(filepath)
+      mtime = os.path.getmtime(filepath)
+
+    Step 2: 判断是否压缩
+      compress = filename 扩展名在白名单内
+      flags = FLAG_COMPRESS (如果 compress 为 True)
+
+    Step 3: 加载续传状态
+      sender_offset = load_resume_state(target_ip, filepath, role='sender')
+        → 检查: filepass 一致, 文件大小未变 (mtime 一致)
+        → 返回 offset 值, 或不一致则返回 0
+      recv_offset = load_resume_state(target_ip, filepath, role='recv')
+      计算最终偏移量:
+        双方都有记录 -> offset = min(sender_offset, recv_offset)
+        仅一方有记录 -> offset = max(sender_offset, recv_offset)
+        都没有      -> offset = 0
+      如果 offset > 0 -> flags |= FLAG_RESUME
+
+    Step 4: 处理压缩文件特殊逻辑
+      如果 compress 为 True:
+        读取整个文件 -> zlib.compress(data, level=6)
+        file_size = len(compressed_data)  (压缩后大小)
+        temp_data = compressed_data
+        注意: 如果 offset > 0:
+          日志警告: "压缩文件不支持续传，从头发送"
+          offset = 0, 清除 FLAG_RESUME, 重新压缩
+
+    Step 5: 保存发送方初始续传状态
+      save_resume_state(target_ip, filepath, offset, total_size, mtime, role='sender')
+
+    Step 6: 在线协商续传偏移量 (仅非压缩文件)
+      这是为了让发送方了解接收方的真实接收进度:
+      发送查询包:
+        sock.sendall(0x02)                  # FLAG_QUERY_OFFSET
+        sock.sendall(struct.pack('!Q', total_size))    # 8字节
+        sock.sendall(struct.pack('!I', len(fname)))    # 4字节
+        sock.sendall(filename.encode('utf-8'))         # N字节
+      
+      接收方 _handle_query_offset 处理:
+        查找 Received/filename
+        如果存在 -> local_offset = st_size
+        如果 st_size > total_size -> local_offset = 0 (文件不一致)
+        回复: struct.pack('!Q', local_offset)          # 8字节
+      
+      发送方收到 remote_offset 后:
+        如果 0 < remote_offset < total_size 且 remote_offset > offset:
+          offset = remote_offset (使用更大的)
+          flags |= FLAG_RESUME
+        如果 remote_offset == 0:
+          对方没有记录，保持当前 offset
+        如果 remote_offset >= total_size:
+          文件不一致, offset = 0, 清除 FLAG_RESUME
+      更新保存续传状态
+
+  3.2.2 发送文件头
+
+    构建二进制头部:
+      header = struct.pack('!B', FLAG_FILE)     # 1字节
+      header += struct.pack('!I', len(fname))    # 4字节 文件名长度
+      header += filename.encode('utf-8')         # N字节  文件名
+      header += struct.pack('!B', flags)         # 1字节  标志位
+      header += struct.pack('!Q', file_size)     # 8字节  文件大小
+      if flags & FLAG_RESUME:
+        header += struct.pack('!Q', offset)      # 8字节  续传偏移量
+    sock.sendall(header)
+
+    等待接收方确认:
+      ack = recv_exact(sock, 2)
+      if ack == b'NO': 日志"对方拒绝传输" -> 返回
+      if ack != b'OK': 日志"对方拒绝传输" -> 返回
+
+  3.2.3 发送文件数据
+
+    if compress and temp_data:
+      sock.sendall(temp_data)   # 一次性发送压缩数据
+    else:
+      _send_file_data_fast(sock, filepath, file_size, offset, progress_cb)
+
+    _send_file_data_fast 内部实现:
+      优先路径 (Linux): os.sendfile() 零拷贝
+        with open(filepath, 'rb') as f:
+          f.seek(offset)
+          while sent < file_size:
+            n = os.sendfile(sock.fileno(), f.fileno(), None, chunk_size)
+            sent += n
+
+      回退路径 (Windows/通用): 缓冲读取 + 自适应块大小
+        with open(filepath, 'rb') as f:
+          f.seek(offset)
+          buf = bytearray(BUFFER_SIZE)   # 可复用缓冲区
+          adaptive_chunk_size = 256 * 1024  # 初始256KB
+          while sent < file_size:
+            chunk_size = min(BUFFER_SIZE, file_size - sent)
+            f.readinto(memoryview(buf)[:chunk_size])
+            sock.sendall(memoryview(buf)[:chunk_size])
+            sent += chunk_size
+            # 每1秒采样速度 -> 调整 adaptive_chunk_size
+            # 低网络静默超时检测 (avg_speed < 512KB/s 且 30秒无活动)
+            # 预读下一块 (掩盖磁盘延迟)
+            progress_cb(sent, file_size, time.time())
+
+  3.2.4 数据完整性校验
+
+    发送端计算完整文件的 SHA256:
+      file_hash = compute_sha256(filepath)  # 64字符 hex 字符串
+    sock.sendall(file_hash.encode('utf-8'))  # 64字节
+
+    等待接收方校验结果:
+      result = recv_exact(sock, 10).strip()
+      if result == b'MATCH':
+        日志: "校验通过"
+        delete_resume_state(target_ip, filepath, role='sender')
+        delete_resume_state(target_ip, filepath, role='recv')   # 同时清理接收方记录
+      else:
+        日志: "校验失败"
+
+  3.2.5 进度回调 (progress_cb)
+
+    每收到一个数据块触发:
+      计算: elapsed, speed, remaining, percent
+      GUI 更新: send_progress, send_info_label, status_bar
+      续传状态保存:
+        每5秒 或 每10%进度:
+          save_resume_state(target_ip, filepath, sent, total_size, mtime, role='sender')
+
+  [接收方] _handle_query_offset(conn, addr)
+    收到: total_size(8) + filename
+    查找本地 Received/filename -> 获取 st_size 作为 offset
+    回复: offset(8字节)
+
+--- 3.3 单文件接收流程 ---
+
+  3.3.1 TCP 监听与连接接入 (tcp_file_receiver)
+
+    绑定: 0.0.0.0:TCP_PORT (IPv4),  fallback 到 IPv6 双栈
+    backlog: 50 (最大等待连接队列)
+
+    accept 循环:
+      conn, addr = sock.accept()
+      _optimize_socket(conn):
+        TCP_NODELAY = 1        (禁用 Nagle, 减少延迟)
+        SO_KEEPALIVE = 1       (60秒 idle -> 10秒 interval -> 3次 probe 后断开)
+        SO_SNDBUF = 32MB       (尝试 32MB, fallback 16MB)
+        SO_RCVBUF = 32MB
+      conn.settimeout(5)       (短超时验证真正连接)
+      启动新线程: handle_receive(conn, addr)
+
+  3.3.2 消息分发 (handle_receive)
+
+    conn.settimeout(15)   (等待首字节超时)
+    flag = recv_exact(conn, 1)[0]
+
+    根据标志位分发:
+      0x00 (FLAG_FILE)   -> _receive_single_file(conn, addr)
+      0x01 (FLAG_FOLDER) -> _receive_folder(conn, addr)
+      0x02 (QUERY_OFFSET)-> _handle_query_offset(conn, addr)
+
+    conn.settimeout(None)  (取消超时, 大文件不设超时)
+    异常处理:
+      socket.timeout -> 静默关闭 (验证连接)
+      ConnectionError("连接中断") -> 静默关闭
+      其他可恢复异常 -> 记录日志
+
+  3.3.3 续传偏移量查询 (_handle_query_offset)
+
+    接收端收到查询请求:
+      total_size = recv_exact(conn, 8) -> unpack('!Q')
+      filename   = recv_exact(conn, 4+len) -> decode('utf-8')
+
+    本地查找:
+      save_path = SAVE_DIR / filename
+      安全检查: resolve() 确保在 SAVE_DIR 内
+      if save_path.exists():
+        local_offset = save_path.stat().st_size
+        if local_offset > total_size:
+          local_offset = 0  (文件比预期大，视为不一致)
+      else:
+        local_offset = 0
+
+    回复: struct.pack('!Q', local_offset)  # 8字节
+
+  3.3.4 接收单文件数据 (_receive_single_file)
+
+    Step 1: 接收文件头
+      filename = recv_exact(conn, 4+len) -> decode
+      flags = recv_exact(conn, 1)[0]
+      compressed = flags & FLAG_COMPRESS
+      resume = flags & FLAG_RESUME
+      file_size = recv_exact(conn, 8) -> unpack('!Q')
+      if resume:
+        offset = recv_exact(conn, 8) -> unpack('!Q')
+
+    Step 2: 安全检查
+      save_path = (SAVE_DIR / filename).resolve()
+      if not str(save_path).startswith(str(SAVE_DIR.resolve())):
+        conn.sendall(b'NO') -> 返回 (防路径穿越)
+
+    Step 3: 文件存在处理
+      if save_path.exists():
+        current_size = os.path.getsize(save_path)
+        if resume 且 current_size == offset:
+          继续续传
+        else:
+          GUI 弹窗: "文件已存在，是否覆盖？"
+          用户拒绝:
+            conn.sendall(b'NO') -> 返回
+          用户确认:
+            save_path.unlink() -> offset = 0
+      conn.sendall(b'OK')
+
+    Step 4: 续传哈希初始化
+      sha = hashlib.sha256()
+      if offset > 0 且 save_path.exists():
+        读取已有文件内容更新 sha (续传需要已有部分的哈希)
+        如果读取失败 -> offset = 0, 删除文件, 重新开始
+
+    Step 5: 保存初始续传状态
+      save_resume_state(addr[0], str(save_path), offset, file_size, 0, role='recv')
+
+    Step 6: 接收数据 (_recv_file_data_with_hash)
+      设置无超时
+      buf = bytearray(1MB)  (复用接收缓冲区)
+      mode = 'ab' (续传) 或 'wb' (新文件)
+      循环 recv_into 直到 received == file_size:
+        chunk = min(BUFFER_SIZE, file_size - received)
+        n = conn.recv_into(buf[:chunk], chunk)
+        if n == 0: raise ConnectionError("接收中断")
+        if decompressor (压缩文件):
+          decompressed = decompressor.decompress(data)
+          write_buf.extend(decompressed)
+          sha.update(decompressed)
+        else:
+          write_buf.extend(data)
+          sha.update(data)
+        当 write_buf >= 1MB 或最后一波 -> f.write(write_buf)
+        每0.5秒 或 每1MB 更新进度
+        低网络静默超时: speed < 512KB/s 且 60秒无活动 -> 抛异常触发续传
+        每5秒 或 每10% 保存续传进度
+      if decompressor:
+        tail = decompressor.flush()
+        sha.update(tail)
+      最后写入剩余 write_buf
+
+    Step 7: 临时文件重命名
+      如果非续传 (offset == 0) 且成功:
+        os.rename(temp_path, save_path)  (.tmp -> 最终文件名)
+
+    Step 8: 哈希校验
+      remote_hash = recv_exact(conn, 64).decode  # 64字符 hex
+      local_hash = sha.hexdigest()
+      if local_hash == remote_hash:
+        conn.sendall(b'MATCH     ')    # 10字节 (固定长度)
+        日志: "校验通过"
+        delete_resume_state(addr[0], str(save_path), role='recv')
+        GUI: "接收完成" 弹窗
+        可选: 打开接收目录
+      else:
+        conn.sendall(b'MISMATCH  ')    # 10字节 (固定长度)
+        日志: "校验失败"
+        delete_resume_state(addr[0], str(save_path), role='recv')
+
+  3.3.5 续传状态管理函数
+
+    save_resume_state(ip, filepath, offset, total_size, mtime, role):
+      filename = get_resume_file(ip, basename, role)
+      JSON.dump: {filepath, offset, total_size, mtime, target_ip, role, timestamp}
+
+    load_resume_state(ip, filepath, role)
+      sender 模式: 检查 filepath 一致 + mtime 一致 -> 返回 data 或 None
+      recv 模式: 检查目标文件存在 且 size == offset -> 返回 data 或 None
+      不一致: 删除续传文件 -> 返回 None
+
+    delete_resume_state(ip, filepath, role):
+      删除对应的续传 JSON 文件
+
+--- 3.4 文件夹发送流程 ---
+
+  3.4.1 文件夹头发送 (_send_folder)
+
+    输入: TCP socket, folder_path, target_ip
+
+    Step 1: 生成文件清单
+      manifest = _get_folder_manifest(folder_path)
+      os.walk 递归遍历 -> 列表 [(rel_path, size, mtime), ...]
+      file_count = len(manifest)
+      total_bytes = sum(s for _, s, _ in manifest)
+
+    Step 2: 发送文件夹头
+      header = struct.pack('!B', FLAG_FOLDER)
+      header += struct.pack('!I', len(dname)) + folder_name.encode('utf-8')
+      header += struct.pack('!I', file_count)
+      header += struct.pack('!Q', total_bytes)
+      sock.sendall(header)
+
+    Step 3: 等待接收方确认
+      ack = recv_exact(sock, 2)
+      if ack in (b'NO', != b'OK'): 返回
+
+    Step 4: 发送文件清单 (每个文件3个字段)
+      for rel_path, size, mtime in manifest:
+        sock.sendall(struct.pack('!I', len(path_enc)) + path_enc)
+        sock.sendall(struct.pack('!Q', size))
+        sock.sendall(struct.pack('!d', mtime))  # IEEE 754 double
+
+    Step 5: 等待接收方清单确认
+      ack = recv_exact(sock, 1)
+      if ack != b'\x01': 清单处理失败 -> 返回
+
+    Step 6: 接收处理指令
+      actions = []
+      for _ in range(file_count):
+        act_byte = recv_exact(sock, 1)[0]
+        case 0x00: actions.append(('skip', 0))
+        case 0x01: actions.append(('full', 0))
+        case 0x02:
+          offset = recv_exact(sock, 8) -> unpack('!Q')
+          actions.append(('resume', offset))
+
+    Step 7: 预计算哈希 (多线程)
+      ThreadPoolExecutor(max_workers=8):
+        对非 skip 的文件并行计算 SHA256
+        存储在 file_hashes[idx]
+
+    Step 8: 逐个发送文件
+      sent_counter = [0]  (累计发送统计)
+      for idx in range(file_count):
+        rel_path, size, mtime = manifest[idx]
+        act, offset = actions[idx]
+
+        if act == 'skip':
+          日志: "已存在，跳过"
+          delete_folder_resume_state()
+          continue
+
+        加载本地续传状态:
+          folder_state = load_folder_resume_state(...)
+          如果接收方 offset > 本地状态 -> 使用接收方 offset
+          effective_offset = max(recv_offset, local_state_offset)
+
+        保存发送方续传状态:
+          save_folder_resume_state(target_ip, folder_name, rel_path, offset, size, mtime)
+
+        重试循环 (MAX_RETRIES=3):
+          判断压缩:
+            仅 full 且文本文件 -> zlib.compress(level=6)
+            续传不支持压缩
+          
+          发送文件头:
+            rel_path_len(4) + rel_path(N) + flags(1) + file_size(8)
+            if FLAG_RESUME: offset(8)
+          
+          等待 "OK"
+          
+          发送数据:
+            如果压缩: sock.sendall(compressed_data)
+            否则: _send_file_data_fast()
+          
+          发送 SHA256 哈希 (64字节 hex)
+          
+          等待结果:
+            "MATCH" -> 删除续传状态, file_ok=True, break
+            "MISMATCH" -> 继续重试
+          
+          如果3次都失败:
+            failed_items.append(idx)
+
+    Step 9: 发送完成
+      if failed_items 为空:
+        GUI: "文件夹发送完成，全部校验通过"
+      else:
+        GUI: "文件夹发送完成，X 个文件失败"
+
+--- 3.5 文件夹接收流程 ---
+
+  3.5.1 接收文件夹 (_receive_folder)
+
+    Step 1: 接收文件夹头
+      folder_name = recv_exact(conn, 4+len) -> decode
+      file_count = recv_exact(conn, 4) -> unpack('!I')
+      total_bytes = recv_exact(conn, 8) -> unpack('!Q')
+
+    Step 2: 文件夹存在检查
+      save_dir = SAVE_DIR / folder_name
+      if save_dir.exists():
+        GUI 弹窗: "文件夹已存在，是否覆盖？"
+        拒绝: conn.sendall(b'NO') -> 返回
+      conn.sendall(b'OK')
+      save_dir.mkdir(parents=True, exist_ok=True)
+
+    Step 3: 接收清单
+      manifest = []
+      for _ in range(file_count):
+        rel_path = recv_exact(conn, 4+plen) -> decode
+        size = recv_exact(conn, 8) -> unpack('!Q')
+        mtime = recv_exact(conn, 8) -> unpack('!d')
+        manifest.append((rel_path, size, mtime))
+
+    Step 4: 决定每个文件的处理方式
+      actions = []
+      for rel_path, size, mtime in manifest:
+        dest_path = (save_dir / rel_path).resolve()
+        
+        安全检查:
+          if not str(dest_path).startswith(str(base_path)):
+            conn.sendall(b'\x00') -> 返回 (防路径穿越)
+        
+        if dest_path.exists():
+          local_size = dest_path.stat().st_size
+          local_mtime = dest_path.stat().st_mtime
+          if local_size == size 且 abs(local_mtime - mtime) < 0.1:
+            actions.append(('skip', 0))     # 完全一致，跳过
+          elif local_size < size:
+            actions.append(('resume', local_size))  # 部分存在，续传
+          else:
+            actions.append(('full', 0))     # 不一致，重传
+        else:
+          actions.append(('full', 0))       # 不存在，全量
+
+    Step 5: 发送清单确认
+      conn.sendall(b'\x01')
+
+    Step 6: 发送处理指令
+      for act, offset in actions:
+        case 'skip': conn.sendall(b'\x00')
+        case 'full': conn.sendall(b'\x01')
+        case 'resume':
+          conn.sendall(b'\x02')
+          conn.sendall(struct.pack('!Q', offset))
+
+    Step 7: 逐个接收文件 (支持重试)
+      received_global = 0
+      failed = 0
+      for idx in range(file_count):
+        rel_path, size, mtime = manifest[idx]
+        act = actions[idx]
+
+        if act == 'skip': continue
+
+        重试循环 (MAX_RETRIES=3):
+          接收文件头: rel_path + flags + file_size [+ offset]
+          
+          安全检查 -> 创建父目录
+          
+          如果 full 且文件存在: 删除旧文件
+          如果 resume 且 offset 不匹配: 纠正 offset
+
+          conn.sendall(b'OK')
+          
+          续传哈希初始化 (读取已有文件内容更新 sha)
+          
+          保存续传状态:
+            save_folder_resume_state(addr[0], folder_name, rel_path, offset, size, 0)
+          
+          接收数据: _recv_file_data_with_hash()
+            如果压缩: 使用 zlib.decompressobj() 解压
+            否则: 直接写入 (续传追加模式)
+          
+          哈希校验:
+            remote_hash = recv_exact(conn, 64)
+            if sha.hexdigest() == remote_hash:
+              conn.sendall(b'MATCH     ')
+              file_ok = True
+              delete_folder_resume_state()
+              break
+            else:
+              conn.sendall(b'MISMATCH  ')
+              失败文件清理: dest_path.unlink()
+          
+          如果3次都失败: failed += 1
+
+    Step 8: 完成处理
+      if failed == 0:
+        GUI: "文件夹接收完成，全部校验通过"
+        打开接收目录
+      else:
+        GUI: "文件夹接收完成，X 个文件失败"
+        打开接收目录
+
+--- 3.6 发送端入口 (多设备并发) ---
+
+  3.6.1 发送入口 (send_items_action)
+
+    用户点击"极速发送"按钮触发:
+      检查: 是否选择了设备 -> 未选择则弹窗提示
+      检查: 是否有待发送项目 -> 为空则弹窗提示
+
+    target_ips = list(selected_ips)         # 选中的设备IP列表
+    items = list(send_items)                # [(path, is_folder), ...]
+    total_tasks = len(target_ips) * len(items)
+
+    初始化全局进度:
+      finished_tasks = 0
+      global_progress.value = 0
+
+    启动发送:
+      创建后台线程 do_send():
+        threads = []
+        for ip in target_ips:
+          thread = Thread(target=_send_to_one_ip, args=(ip, items))
+          thread.start()
+          threads.append(thread)
+        for t in threads:
+          t.join()
+        完成: 清空发送列表, 日志"所有项目发送完成"
+
+  3.6.2 单IP发送 (_send_to_one_ip -> send_files)
+
+    _send_to_one_ip(ip, items):
+      注册回调 on_item_done:
+        finished_tasks += 1
+        更新全局进度栏
+        记录成功/失败日志
+
+      send_files(ip, items, callback=on_item_done):
+        self.pausing_network = True    # ⚠️ 重要: 传输期间暂停广播/扫描/心跳
+
+        # 串行发送每个项目
+        for idx, (path, is_folder) in enumerate(items):
+          success = _send_item_with_retry(ip, path, is_folder, max_retries=3)
+          if callback:
+            callback(path, success)
+
+        self.pausing_network = False   # 恢复网络活动
+
+  3.6.3 带重试的发送 (_send_item_with_retry)
+
+    retry = 0
+    while retry < max_retries:
+      try:
+        创建 TCP socket:
+          family = AF_INET6 (IPv6) / AF_INET (IPv4)
+          sock.settimeout(30)  # 连接超时
+          sock.connect((target_ip, TCP_PORT))
+          sock.settimeout(None)  # 数据传输不限超时
+          _optimize_socket(sock)
+
+        执行发送:
+          if is_folder: _send_folder(sock, path, target_ip)
+          else: _send_single_file(sock, path, target_ip)
+
+        成功 -> return True
+
+      except Exception as e:
+        retry += 1
+        日志: "发送失败 (尝试 {retry}/{max_retries}): {e}"
+        if retry >= max_retries:
+          日志: "最终失败，放弃"
+          return False
+        backoff = min(2 ** retry, 64)     # 指数退避: 2, 4, 8, ... 最大64秒
+        日志: "等待 {backoff} 秒后重试"
+        time.sleep(backoff)
+      finally:
+        sock.close()
+
+    return False
+
+  3.6.4 Socket 优化 (_optimize_socket)
+
+    发送端和接收端都会调用的优化函数:
+      TCP_NODELAY = 1                    # 禁用 Nagle 算法 (减少小数据包延迟)
+      SO_KEEPALIVE = 1                   # 启用 TCP 保活
+      TCP_KEEPIDLE = 60                  # 空闲60秒后开始探测
+      TCP_KEEPINTVL = 10                 # 探测间隔10秒
+      TCP_KEEPCNT = 3                    # 探测3次后断开
+      SO_SNDBUF = 16MB (尝试 32MB)      # 发送缓冲区
+      SO_RCVBUF = 16MB (尝试 32MB)      # 接收缓冲区
+
+四、Wire 协议格式
+================================================================================
+
+--- 4.1 UDP 消息 (JSON) ---
+
+  心跳 / 广播:
+    {"hostname": "xxx"}
+    
+  回复:
+    {"hostname": "xxx", "reply": true}
+    
+  扫描回复:
+    {"hostname": "xxx", "scan_reply": true}
+    
+  心跳包:
+    {"heartbeat": true}
+    
+  心跳确认:
+    {"heartbeat": true, "ack": true}
+
+--- 4.2 TCP 协议 (二进制) ---
+
+  连接建立后首个字节:
+    0x00 -> 单文件传输
+    0x01 -> 文件夹传输
+    0x02 -> 续传偏移量查询
+
+  单文件传输:
+    [发送方 -> 接收方]
+      4字节  filename_len (大端)
+      N字节  filename (UTF-8)
+      1字节  flags  (bit0=压缩, bit1=续传)
+      8字节  file_size (大端, 原始大小)
+      8字节  offset (仅当 FLAG_RESUME 设置)
+    
+    [接收方 -> 发送方]
+      2字节  "OK" 或 "NO"
+    
+    [发送方 -> 接收方]
+      N字节  文件数据 (可能压缩)
+      64字节 SHA256 哈希 (hex字符串)
+    
+    [接收方 -> 发送方]
+      10字节 "MATCH" 或 "MISMATCH"
+
+  文件夹传输:
+    [发送方 -> 接收方]
+      4字节  folder_name_len
+      N字节  folder_name (UTF-8)
+      4字节  file_count
+      8字节  total_bytes
+    
+    [接收方 -> 发送方]
+      2字节  "OK" 或 "NO"
+    
+    [发送方 -> 接收方] (清单)
+      循环 file_count 次:
+        4字节  rel_path_len
+        N字节  rel_path (UTF-8)
+        8字节  size
+        8字节  mtime (double, IEEE 754)
+    
+    [接收方 -> 发送方]
+      1字节  \x01 (清单确认)
+      循环 file_count 次 (处理指令):
+        \x00 skip
+        \x01 full
+        \x02 resume + 8字节 offset
+    
+    [然后逐个文件传输，协议同单文件]
+
+  续传偏移量查询:
+    [发送方 -> 接收方]
+      8字节  total_size
+      4字节  filename_len
+      N字节  filename
+    
+    [接收方 -> 发送方]
+      8字节  local_offset
+
+五、断点续传机制
+================================================================================
+
+  存储位置: ~/.p2p_resume/
+  文件格式: JSON
+  命名规则:
+    单文件:  resume_{role}_{ip}_{filename}.json
+    文件夹:  folder_resume_{ip}_{folder}_{relpath}.json
+  
+  role: sender 或 recv
+  
+  JSON 内容:
+    {
+      "filepath": "/abs/path/to/file",
+      "offset": 123456,
+      "total_size": 789012,
+      "mtime": 1234567890.0,
+      "target_ip": "192.168.1.100",
+      "role": "sender",
+      "timestamp": 1234567890.0
+    }
+
+  续传触发条件:
+    1. 文件传输中断 (进程崩溃/网络断开)
+    2. 设备重新上线时 -> check_resume_on_online() 检测到续传记录
+    3. 弹窗询问用户是否继续
+
+  续传偏移量计算:
+    sender_offset = load_resume_state(..., role='sender')
+    recv_offset   = load_resume_state(..., role='recv')
+    双方都有记录 -> offset = min(sender_offset, recv_offset)
+    仅一方有记录 -> offset = max(sender_offset, recv_offset)
+    在线协商: 发送 FLAG_QUERY_OFFSET，取实际本地文件大小
+
+  保存频率:
+    每5秒或每10%进度保存一次
+
+六、性能优化措施
+================================================================================
+
+  1. 动态缓冲区:
+     < 1 MB/s     -> 64KB 块
+     < 512 KB/s   -> 128KB 块
+     1-5 MB/s     -> 1MB 块
+     5-20 MB/s    -> 2MB 块
+     > 20 MB/s    -> 4MB 块
+     MAX: 8MB
+
+  2. 自适应发送块大小:
+     < 128 KB/s   -> 16KB
+     < 512 KB/s   -> 64KB
+     < 1 MB/s     -> 128KB
+     < 5 MB/s     -> 256KB
+     < 20 MB/s    -> 512KB
+     < 50 MB/s    -> 1MB
+     > 50 MB/s    -> 2MB
+
+  3. 零拷贝 (Linux):
+     os.sendfile() 直接内核级数据搬运
+
+  4. 文本压缩:
+     白名单: .txt, .log, .json, .xml, .py, .js, .html, .html,
+             .css, .csv, .yaml, .yml, .toml, .ini, .cfg, .conf,
+             .md, .rst, .sh, .bat, .ps1, .vbs
+     压缩级别: zlib level 6
+
+  5. Socket 优化:
+     TCP_NODELAY     (禁用 Nagle 算法)
+     SO_KEEPALIVE    (空闲60秒 -> 间隔10秒 -> 3次后断开)
+     SO_SNDBUF       16MB
+     SO_RCVBUF       16MB
+
+  6. 磁盘IO优化:
+     写入缓冲: 累计1MB再刷盘
+     文件打开重试: 3次
+
+  7. 传输中网络资源优化:
+     传输时暂停广播/扫描/心跳 (pausing_network = True)
+
+  8. 静默超时检测:
+     低网络下 (<512KB/s): 60秒无数据 -> 触发续传
+     发送端: 30秒无发送 -> 触发重试
+
+七、Android App 适配要点
+================================================================================
+
+  1. 网络发现:
+     - Android 不支持 UDP 广播 ( captive portal 限制)
+     - 替代方案只显示 点对点扫描 + MANUAL 添加
+     - 使用 Wi-Fi Direct API 替代局域网发现
+     - 或使用 mDNS/Bonjour 进行设备发现
+
+  2. 后台服务:
+     - 使用 Foreground Service (Android 8.0+) 
+     - 需要 NETWORK_STATE 和 ACCESS_WIFI_STATE 权限
+     - Android 13+ 需要 NEARBY_WIFI_DEVICES 权限
+
+  3. 权限需求:
+     - INTERNET
+     - ACCESS_NETWORK_STATE
+     - ACCESS_WIFI_STATE
+     - POST_NOTIFICATIONS (后台传输进度通知)
+     - READ_MEDIA_VISUAL_USER_SELECTED / READ_EXTERNAL_STORAGE
+     - MANAGE_EXTERNAL_STORAGE (文件管理器需要)
+
+  4. 文件存储:
+     - 使用 Storage Access Framework (SAF)
+     - 或使用 MediaStore API
+     - 接收目录建议用应用私有目录
+
+  5. 线程模型:
+     - Java: ExecutorService + Handler/Looper for UI
+     - Kotlin: Coroutine + withContext(Dispatchers.IO)
+     - TCP 监听用 SocketServer -> accept() 循环
+
+  6. 电池优化:
+     - 传输请求忽略电池优化 (Doze mode 豁免)
+     - JobScheduler 用于定时扫描
+
+  7. 通知系统:
+     - 传输进度使用 Ongoing Notification
+     - 接收请求需要 Notification 提醒用户
+
+  8. Wi-Fi 要求:
+     - 两台设备需要在同一网络 (或 VPN)
+     - 需要保持 Wi-Fi 唤醒锁 (WifiManager.WIFI_MODE_FULL)
+
+  9. 协议兼容性:
+     - TCP 协议部分可完全复用 (二进制 wire 协议相同)
+     - UDP 端口保持一致 (9998, 9997)
+     - JSON 消息格式可复用
+
+八、网络架构
+================================================================================
+
+  设备 A (发送端)                        设备 B (接收端)
+  ================                       ================
+  
+  [UI] -----> [Node 类]                  [Node 类] <---- [UI]
+               |                                   |
+               +-- UDP Broadcaster (9998) ---------+
+               |                                   |
+               +-- UDP Listener (9998) ------------+
+               |                                   |
+               +-- Scan Listener (9997) -----------+
+               |                                   |
+               +-- TCP Client (9999) -------------> [TCP Server (9999)]
+               |       文件传输                                  |
+               |                                   |
+               +-- Resume State                  +-- Resume State
+                   (sender)                        (recv)
+                   ~/.p2p_resume/                  ~/.p2p_resume/
+
+  线程模型:
+    主线程: GUI 任务
+    广播线程 xN: 每个网卡一个
+    UDP 监听线程 x2: IPv4 + IPv6
+    扫描监听线程 x2: IPv4 + IPv6
+    TCP 接收线程: accept 循环
+    传输线程: 每个连接一个
+    心跳/扫描线程: 后台循环
+
+九、错误处理
+================================================================================
+
+  连接失败: 指数退避重试 (2^retry秒, 最大64秒)
+  哈希不匹配: 重新发送 (最多3次)
+  压缩失败: 回退到原始发送
+  文件打开失败: 3次重试
+  续传偏移不匹配: 从头发送
+  接收静默超时: 触发续传机制
+
+十、配置文件
+================================================================================
+
+  位置: ~/.p2p_config.json
+  内容: {"save_dir": "/path/to/received"}
+  
+  日志: transfer.log
+  格式: [YYYY-MM-DD HH:MM:SS] message
+
+================================================================================
+                              文档结束
+================================================================================
+
+附录 A: 完整交互时序图
+================================================================================
+
+A.1 单文件传输时序 (无续传)
+
+  T+0ms   发送端: TCP Connect -> 接收端 (target_ip:9999)
+  T+10ms  接收端: accept() -> 新线程 handle_receive()
+  T+15ms  发送端: 发送 QUERY_OFFSET:
+             0x02 + total_size(8B) + fn_len(4B) + filename(NB)
+  T+20ms  接收端: 查本地 -> 无记录 -> 回复: offset(8B) = 0
+  T+25ms  发送端: 发送文件头:
+             0x00 + fn_len(4B) + filename(NB) + flags(1B: 0x01 压缩/0x00 原图)
+             + file_size(8B)
+  T+30ms  接收端: 安全检查 -> 回复 "OK"
+  T+35ms  发送端: 开始发送文件数据...
+             [数据流: file_size 字节, 可能 zlib 压缩]
+  T+5000ms 发送端: 发送 SHA256 hash (64B hex)
+  T+5010ms 接收端: 计算本地哈希 -> 匹配 -> 回复 "MATCH     " (10B)
+  T+5015ms 发送端: 删除续传记录 -> 成功
+  T+5020ms 关闭连接
+
+A.2 单文件续传时序
+
+  T+0ms   发送端: TCP Connect
+  T+10ms  发送端: 加载本地续传状态 -> sender_offset = 1024000
+              查询: QUERY_OFFSET + filename
+  T+20ms  接收端: 本地文件存在, st_size = 999500 -> 回复: 999500
+  T+30ms  发送端: offset = max(1024000, 999500) = 1024000
+              flags = 0x03 (FLAG_COMPRESS | FLAG_RESUME... 如果压缩)
+              或 flags = 0x02 (仅 FLAG_RESUME, 如果非压缩)
+              发送文件头 + offset(8B: 1024000)
+  T+40ms  接收端: 检查本地大小 == offset -> 回复 "OK"
+  T+45ms  接收端: 读取已有文件 1MB -> 计算 SHA256 前缀哈希
+  T+50ms  发送端: 从 offset 1024000 开始发送剩余数据
+  T+3000ms 发送端: 发送 SHA256 hash
+  T+3010ms 接收端: 哈希匹配 -> 回复 "MATCH"
+  T+3015ms 两端: 清理续传记录
+
+A.3 文件夹传输时序 (含 skip 和 resume)
+
+  T+0ms   发送端: TCP Connect
+  T+10ms  发送端: 发送文件夹头:
+             0x01 + fn_len(4B) + folder_name(NB) + count(4B) + total(8B)
+  T+15ms  接收端: 文件夹不存在 -> 回复 "OK" -> mkdir
+  T+20ms  发送端: 发送清单 (假设为3个文件):
+             #1: "readme.txt"  size=1024   mtime=1234567890.0
+             #2: "data.bin"    size=100000000  mtime=1234567891.0
+             #3: "small.txt"   size=512   mtime=1234567892.0
+  T+30ms  接收端: 检查每个文件:
+             #1 readme.txt:  不存在 -> full
+             #2 data.bin:    存在, size=50000000 < 100000000 -> resume(offset=50000000)
+             #3 small.txt:   存在, size=512, mtime 匹配 -> skip
+             回复: 0x01 (清单确认)
+             回复: 0x01 (full), 0x02 + 50000000 (resume), 0x00 (skip)
+  T+35ms  发送端: 接收指令 -> 预计算哈希 (3线程)
+  T+40ms  发送端: 发送 #1 readme.txt (全量) -> MATCH
+  T+50ms  发送端: 发送 #2 data.bin (续传, offset=50000000) -> MATCH
+  T+100ms 发送端: 跳过 #3 small.txt (skip)
+  T+105ms 发送端: 完成 -> 关闭连接
+
+A.4 多设备并发发送时序
+
+  用户: 选择设备 [192.168.1.100, 192.168.1.101]
+  用户: 添加文件 [file1.txt, file2.zip]
+  用户: 点击发送
+
+  T+0ms   pausing_network = True  (暂停广播/扫描)
+  T+5ms   线程1: _send_to_one_ip(192.168.1.100, [file1.txt, file2.zip])
+  T+5ms   线程2: _send_to_one_ip(192.168.1.101, [file1.txt, file2.zip])
+
+  T+10ms  线程1: TCP -> 192.168.1.100:9999 -> 发送 file1.txt
+  T+15ms  线程2: TCP -> 192.168.1.101:9999 -> 发送 file1.txt
+  ... (并行传输)
+  T+1000ms 线程1: file1.txt 完成 -> file2.zip
+  T+1005ms 线程2: file1.txt 完成 -> file2.zip
+  ... (全部完成)
+  T+2000ms 所有线程返回 -> 清空列表 -> pausing_network = False
+
+附录 B: 状态机图
+================================================================================
+
+B.1 连接状态机
+
+  [IDLE] --用户选择文件+设备-->
+  [IDLE] --点击发送-->
+  [CONNECTING] --TCP成功--> [NEGOTIATING]
+  [CONNECTING] --TCP失败--> [RETRY] --指数退避--> [CONNECTING]
+  [CONNECTING] --超过3次--> [FAILED]
+
+  [NEGOTIATING] --QUERY_OFFSET--> [HEADER]
+  [HEADER] -----> --对方拒绝--> [ABORT]
+  [HEADER] -----> --对方接受--> [TRANSFERRING]
+
+  [TRANSFERRING] --数据发送完--> [VERIFYING]
+  [VERIFYING] --MATCH--> [COMPLETE] --清理续传--> [IDLE]
+  [VERIFYING] --MISMATCH--> [RETRY_FILE] --最多3次--> [HEADER]
+  [VERIFYING] --MISMATCH 3次--> [FAILED_FILE]
+
+B.2 节点状态机
+
+  [UNKNOWN] --UDP广播收到--> [DISCOVERED] {hostname, ip, last_seen}
+  [DISCOVERED] --心跳正常--> [ONLINE] {heartbeat_fail=0}
+  [ONLINE] --心跳失败1次--> [WARNED] {heartbeat_fail=1}
+  [WARNED] --心跳失败3次--> [OFFLINE] --从列表删除
+  [ONLINE/WARNED] --超过10分钟--> [EXPIRED] --从列表删除
+
+附录 C: 续传状态存储详细格式
+================================================================================
+
+C.1 单文件续传记录
+
+  路径: ~/.p2p_resume/resume_{role}_{ip}_{filename}.json
+  示例: ~/.p2p_resume/resume_sender_192.168.1.100_document.pdf.json
+
+  {
+    "filepath": "/home/user/Documents/document.pdf",
+    "offset": 1048576,
+    "total_size": 10485760,
+    "mtime": 1234567890.123,
+    "target_ip": "192.168.1.100",
+    "role": "sender",
+    "timestamp": 1694895723.456
+  }
+
+  字段说明:
+    filepath  - 文件的绝对路径 (sender) 或 接收保存路径 (recv)
+    offset    - 已传输字节数 (发送方) 或 已接收字节数 (接收方)
+    total_size- 文件总大小 (原始大小)
+    mtime     - 文件修改时间 (用于验证文件是否被修改)
+    target_ip - 目标设备 IP 地址
+    role      - "sender" 或 "recv"
+    timestamp - 记录创建/更新时间戳
+
+C.2 文件夹续传记录
+
+  路径: ~/.p2p_resume/folder_resume_{ip}_{folder}_{relpath}.json
+  示例: ~/.p2p_resume/folder_resume_192.168.1.100_myproject_src_main.py.json
+
+  {
+    "folder_name": "myproject",
+    "rel_path": "src/main.py",
+    "offset": 4096,
+    "total_size": 8192,
+    "mtime": 1234567890.123,
+    "target_ip": "192.168.1.100",
+    "timestamp": 1694895723.456
+  }
+
+C.3 续传状态生命周期
+
+  创建 -> 传输中每5秒/10%更新 -> 传输完成删除
+         -> 传输出错保留 (下次可续传)
+         -> 用户取消清理
+         -> 文件被修改时自动失效
+
+C.4 续传偏移量最终计算逻辑
+
+  发送方启动:
+    1. 读取本地 sender 续传状态 -> sender_offset
+    2. 读取本地 recv 续传状态 (之前可能做接收方) -> recv_offset
+    3. 如果双方都有记录: offset = min(sender_offset, recv_offset)
+       如果仅一方有记录: offset = 有记录方的 offset
+    4. 在线 QUERY_OFFSET 查询接收方实际文件大小 -> remote_offset
+    5. 如果 remote_offset > offset: 使用 remote_offset
+    6. 如果 remote_offset 与 total_size 不一致: 从头开始
+
+附录 D: Android 实现详解
+================================================================================
+
+D.1 Android 端必须实现的组件
+
+  1. NetworkMonitor (Service)
+     - 监听网络变化: ConnectivityManager.registerCallback()
+     - 网络可用时启动 UDP 监听
+     - 网络断开时清理连接
+  
+  2. DiscoveryService (ForegroundService)
+     - UDP 监听线程 (IPv4 + IPv6)
+     - UDP 广播线程 (注意: Android 对广播的限制, 需要 Wi-Fi Direct)
+     - 扫描监听线程
+     - 节点管理: HashMap<String, Node> 线程安全
+     - 心跳重试管理器
+
+  3. TransferServer (Service)
+     - ServerSocket.bind("0.0.0.0", 9999)
+     - accept() 循环 -> 每连接一个线程/协程
+     - handle_receive 协议解析
+     - 文件写入: FileOutputStream (使用 RandomAccessFile 支持续传)
+
+  4. TransferClient
+     - TCP 连接管理
+     - 文件发送: FileInputStream + socket.getOutputStream()
+     - zlib 压缩: java.util.zip.Deflater
+     - SHA256: java.security.MessageDigest.getInstance("SHA-256")
+
+  5. ResumeStateManager
+     - 存储: SharedPreferences 或 Room Database
+     - 操作: save, load, delete (与桌面端协议兼容)
+     - Android 端建议使用 SQLite 代替 JSON 文件
+
+D.2 Android 注意事项
+
+  - Android 10+ scoped storage: 使用 MediaStore / SAF
+  - Android 无法使用 os.sendfile(), 只能使用缓冲读写
+  - UDP 广播在移动数据下不可用, 仅 Wi-Fi 有效
+  - Wi-Fi Direct 需要独立的组主/客户端协商
+  - 后台 Service 必须显示 Notification (ForegroundService)
+  - 保活: 请求 Doze 模式豁免 + 设备休眠时唤醒锁
+  - Thread-pool 配置: 扫描用较大池 (1000), 传输用较小池
+  - ByteBuffer 代替 bytearray: android 不支持 Python 的 bytearray
+
+D.3 Kotlin 协程对应关系
+
+  Python             Kotlin
+  threading.Thread   launch(Dispatchers.IO)
+  ThreadPoolExecutor    CoroutineScope + runBlocking + coroutineContext
+  time.sleep()       delay()
+  queue.Queue        Channel
+  threading.Lock     Mutex()
+  recv_exact()       sock.inputStream.readExactly(buffer)
+
+D.4 必须注意的平台差异
+
+  | 特性           | Python 桌面端          | Android 端            |
+  |---------------|----------------------|----------------------|
+  | 广播 UDP       | 完整支持               | 受限 (需 Wi-Fi Direct)|
+  | 扫描           | 1000 线程             | 协程, 建议 100-200    |
+  | 零拷贝 sendfile | Linux 支持             | 不支持                 |
+  | 文件路径         | pathlib.Path          | ContentResolver/SAF  |
+  | 续传存储         | JSON 文件              | Room/SharedPreferences|
+  | GUI            | tkinter               | Android View/Compose|
+  | 后台运行         | 无限制                 | ForegroundService    |
+  | IPv6           | 完整支持               | 部分设备不支持         |
+  | socket SO_BROADCAST | 直接设              | 某些 ROM 可能阻止     |
+
+================================================================================
+                              文档结束
+================================================================================

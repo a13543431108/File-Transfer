@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -191,6 +192,9 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
     private val _saveDirDesc = MutableStateFlow("下载/P2PFileTransfer/")
     val saveDirDesc: StateFlow<String> = _saveDirDesc
 
+    private val _deviceName = MutableStateFlow("")
+    val deviceName: StateFlow<String> = _deviceName
+
     init {
         // 桥接 Service 的 DeviceRepository（Service 可能晚于 UI 启动，轮询等待）
         viewModelScope.launch {
@@ -225,6 +229,15 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
                 if (d.isNotEmpty()) _saveDirDesc.value = d
             }
         }
+        viewModelScope.launch {
+            P2PFileTransferService.deviceName.collect { n ->
+                if (n.isNotEmpty()) _deviceName.value = n
+            }
+        }
+    }
+
+    fun setDeviceName(newName: String) {
+        P2PFileTransferService.instance?.setDeviceName(newName)
     }
 
     fun respondIncoming(id: String, accept: Boolean) {
@@ -459,10 +472,41 @@ fun MainScreen(
     val incoming by vm.incoming.collectAsState()
     val resumeReminder by vm.resumeReminder.collectAsState()
     val saveDirDesc by vm.saveDirDesc.collectAsState()
+    val deviceName by vm.deviceName.collectAsState()
 
     var scanCidrDialog by remember { mutableStateOf(false) }
     var scanCidrText by remember { mutableStateOf("") }
     var saveDirDialog by remember { mutableStateOf(false) }
+    var deviceNameDialog by remember { mutableStateOf(false) }
+    var deviceNameText by remember { mutableStateOf("") }
+
+    // 设备名编辑弹窗
+    if (deviceNameDialog) {
+        AlertDialog(
+            onDismissRequest = { deviceNameDialog = false },
+            title = { Text("本机设备名") },
+            text = {
+                Column {
+                    Text("其他设备在搜索时会看到这个名字：")
+                    OutlinedTextField(
+                        value = deviceNameText,
+                        onValueChange = { deviceNameText = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.setDeviceName(deviceNameText)
+                    deviceNameDialog = false
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deviceNameDialog = false }) { Text("取消") }
+            }
+        )
+    }
 
     // 保存目录操作弹窗
     if (saveDirDialog) {
@@ -577,7 +621,7 @@ fun MainScreen(
                     Column {
                         Text("P2P 文件互传", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            text = "保存到: " + saveDirDesc,
+                            text = "设备名: " + deviceName + "   ·   保存到: " + saveDirDesc,
                             style = MaterialTheme.typography.labelSmall,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -585,6 +629,12 @@ fun MainScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = {
+                        deviceNameText = deviceName
+                        deviceNameDialog = true
+                    }) {
+                        Icon(Icons.Filled.Info, contentDescription = "修改设备名")
+                    }
                     IconButton(onClick = { saveDirDialog = true }) {
                         Icon(Icons.Filled.Settings, contentDescription = "设置保存目录")
                     }

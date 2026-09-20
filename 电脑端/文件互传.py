@@ -291,10 +291,15 @@ class Node(threading.Thread):
         self.my_ips = get_all_local_ips(ipv6=False)  # IPv4用于广播
         self.my_ips_v6 = get_all_local_ips(ipv6=True)
         self.broadcast_addrs = get_broadcast_addrs()
-        self.hostname = socket.gethostname()
+        # 设备名优先使用用户配置（GUI 从 ~/.p2p_config.json 读取），
+        # 未配置则用系统主机名
+        custom_name = getattr(gui, 'device_name', None)
+        self.hostname = custom_name if custom_name else socket.gethostname()
         self.nodes = {}
         self.lock = threading.Lock()
         self.broadcast_sockets = []
+        # 所有需要主动关闭的监听 socket（用于干净退出）
+        self.listen_sockets = []
         self.auto_scan_enabled = False
         self.scanning = False
         self.pausing_network = False  # 传输时暂停广播/扫描/心跳
@@ -536,11 +541,16 @@ class Node(threading.Thread):
         sock4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock4.bind(('', UDP_PORT))
+        # 1 秒超时，让循环能定期检查 self.running（Windows 关闭 socket 不一定唤醒阻塞的 recvfrom）
+        sock4.settimeout(1.0)
+        self.listen_sockets.append(sock4)
         # IPv6
         try:
             sock6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
             sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock6.bind(('::', UDP_PORT))
+            sock6.settimeout(1.0)
+            self.listen_sockets.append(sock6)
         except:
             sock6 = None
 
@@ -592,9 +602,16 @@ class Node(threading.Thread):
                     if not msg.get('reply'):
                         reply = json.dumps({'hostname': self.hostname, 'reply': True}).encode('utf-8')
                         sock.sendto(reply, (remote_ip, UDP_PORT))
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
                 except Exception:
                     pass
-            sock.close()
+            try:
+                sock.close()
+            except Exception:
+                pass
 
         threading.Thread(target=listen_sock, args=(sock4, False), daemon=True).start()
         if sock6:
@@ -608,7 +625,11 @@ class Node(threading.Thread):
                 del self.nodes[ip]
         self.gui.refresh_nodes()
         if self.running:
-            self.gui.root.after(2000, self.clean_nodes)
+            aid = self.gui.root.after(2000, self.clean_nodes)
+            try:
+                self.gui._after_ids.append(aid)
+            except Exception:
+                pass
 
     # ---------- 扫描监听（SCAN_PORT，与设备发现端口隔离） ----------
     def scan_listener(self):
@@ -618,6 +639,8 @@ class Node(threading.Thread):
             sock4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock4.bind(('', SCAN_PORT))
+            sock4.settimeout(1.0)
+            self.listen_sockets.append(sock4)
         except Exception as e:
             self.gui.log(f"[警告] 扫描监听 IPv4 端口 {SCAN_PORT} 绑定失败: {e}")
             sock4 = None
@@ -626,6 +649,8 @@ class Node(threading.Thread):
             sock6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
             sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock6.bind(('::', SCAN_PORT))
+            sock6.settimeout(1.0)
+            self.listen_sockets.append(sock6)
         except:
             sock6 = None
 
@@ -646,9 +671,16 @@ class Node(threading.Thread):
                             sock.sendto(reply, (remote_ip, port))
                         except:
                             pass
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
                 except Exception:
                     pass
-            sock.close()
+            try:
+                sock.close()
+            except Exception:
+                pass
 
         if sock4:
             threading.Thread(target=handle_scan_request, args=(sock4, False), daemon=True).start()
@@ -890,6 +922,9 @@ class Node(threading.Thread):
             except Exception as e2:
                 self.gui.log(f"[TCP] 所有端口绑定失败: {e2}")
                 return
+        # 加入注册表 + 1 秒超时，让 accept 能被关闭/running 标记唤醒
+        self.listen_sockets.append(sock)
+        sock.settimeout(1.0)
         # 每30秒最多记录一次连接日志，避免刷屏
         _last_log_time = [0.0]
         while self.running:
@@ -903,10 +938,17 @@ class Node(threading.Thread):
                     self.gui.log(f"[TCP] 收到连接: {addr[0]}:{addr[1]}")
                     _last_log_time[0] = now
                 threading.Thread(target=self.handle_receive, args=(conn, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
             except Exception as e:
                 if self.running:
                     self.gui.log(f"[TCP] 接受连接异常: {e}")
-        sock.close()
+        try:
+            sock.close()
+        except Exception:
+            pass
 
     def handle_receive(self, conn, addr):
         try:
@@ -1976,7 +2018,7 @@ class P2PApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("全环境极速传输 V14.0 - 断点续传+IPv6")
-        self.root.geometry("1100x700")
+        self.root.geometry("1200x700")
         self.root.resizable(True, True)
 
         self.send_items = []
@@ -1984,6 +2026,8 @@ class P2PApp:
         self.total_tasks = 0
         self.finished_tasks = 0
         self._items_lock = threading.Lock()
+        # 用于记录 Tk after() 返回的定时器 ID，退出时批量取消
+        self._after_ids = []
 
         self._build_ui()
 
@@ -2008,7 +2052,7 @@ class P2PApp:
         self.node.start_auto_scan()
         self.auto_scan_btn.config(text="后台扫描: 开")
 
-        self.log(f"本机 IPv4: {', '.join(self.node.my_ips)}，主机名: {self.node.hostname}")
+        self.log(f"本机 IPv4: {', '.join(self.node.my_ips)}，设备名: {self.node.hostname}")
         if self.node.my_ips_v6:
             self.log(f"本机 IPv6: {', '.join(self.node.my_ips_v6)}")
         self.log("提示: 点击『自动搜索』快速发现同网段设备，可开启『后台扫描』保持更新")
@@ -2033,6 +2077,7 @@ class P2PApp:
         ttk.Button(btn_frame_left, text="自动搜索", command=self.auto_search).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame_left, text="手动添加", command=self.manual_add_ip).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame_left, text="刷新在线", command=self.rescan).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame_left, text="设置设备名", command=self.choose_device_name).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame_left, text="设置保存路径", command=self.choose_save_dir).pack(side=tk.LEFT, padx=2)
         self.auto_scan_btn = ttk.Button(btn_frame_left, text="后台扫描: 关", command=self.toggle_auto_scan)
         self.auto_scan_btn.pack(side=tk.LEFT, padx=2)
@@ -2319,17 +2364,61 @@ class P2PApp:
         self.root.mainloop()
 
     def on_close(self):
-        self.node.running = False
-        for s in self.node.broadcast_sockets:
+        """干净退出：
+        1. 停止所有网络线程（设置 running=False，监听 socket 有 1s 超时会让循环自然退出）
+        2. 关闭所有监听/广播 socket（辅助唤醒阻塞的 recvfrom/accept）
+        3. 取消 Tk 的 after 定时任务
+        4. 销毁窗口
+        5. 1 秒后仍存活则强制 os._exit（兜底）
+        """
+        try:
+            self.node.running = False
+        except Exception:
+            pass
+
+        # 关闭所有 socket
+        for s in list(getattr(self.node, 'listen_sockets', [])) + \
+                 list(getattr(self.node, 'broadcast_sockets', [])):
             try:
                 s.close()
-            except:
+            except Exception:
                 pass
-        self.root.destroy()
+
+        # 取消所有已注册的 after 定时器
+        try:
+            for aid in list(getattr(self, '_after_ids', [])):
+                try:
+                    self.root.after_cancel(aid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 销毁窗口
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+        # 兜底：1 秒后若还有卡住的线程，直接强杀进程
+        def _force_exit():
+            time.sleep(1.0)
+            try:
+                os._exit(0)
+            except Exception:
+                pass
+
+        threading.Thread(target=_force_exit, daemon=True).start()
 
     def load_config(self):
-        """加载配置文件，恢复保存路径"""
+        """加载配置文件，恢复保存路径与设备名"""
         global SAVE_DIR
+        # 默认设备名 = 系统主机名
+        self.device_name = socket.gethostname()
         if CONFIG_FILE.exists():
             try:
                 with open(CONFIG_FILE, 'r') as f:
@@ -2337,6 +2426,9 @@ class P2PApp:
                     path = cfg.get('save_dir')
                     if path:
                         SAVE_DIR = Path(path)
+                    dev = cfg.get('device_name')
+                    if dev:
+                        self.device_name = dev
             except:
                 pass
         SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2344,7 +2436,10 @@ class P2PApp:
 
     def save_config(self):
         """保存当前配置到文件"""
-        cfg = {'save_dir': str(SAVE_DIR)}
+        cfg = {
+            'save_dir': str(SAVE_DIR),
+            'device_name': getattr(self, 'device_name', socket.gethostname()),
+        }
         with open(CONFIG_FILE, 'w') as f:
             json.dump(cfg, f)
 
@@ -2358,6 +2453,28 @@ class P2PApp:
             self.save_config()
             self.update_save_dir_label()
             self.log(f"保存路径已更改为: {SAVE_DIR}")
+
+    def choose_device_name(self):
+        """弹出对话框修改本机设备名，立即生效并保存到配置"""
+        current = getattr(self, 'device_name', socket.gethostname())
+        new_name = simpledialog.askstring(
+            "设置设备名",
+            f"当前设备名：{current}\n\n其他设备在搜索时会看到这个名字：",
+            initialvalue=current,
+            parent=self.root,
+        )
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showwarning("无效名称", "设备名不能为空")
+            return
+        self.device_name = new_name
+        # 立即生效：Node 后续广播/回复/心跳都使用新名字
+        if hasattr(self, 'node') and self.node:
+            self.node.hostname = new_name
+        self.save_config()
+        self.log(f"设备名已改为: {new_name}（下次广播/回复生效）")
 
     def update_save_dir_label(self):
         """更新GUI中显示保存路径的标签"""

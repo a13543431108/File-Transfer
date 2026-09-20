@@ -76,6 +76,15 @@ class P2PFileTransferService : Service() {
                 checkResumeOnOnline(ip, host)
             }
         )
+        // 应用已保存的设备名
+        val savedName = prefs.getString(KEY_DEVICE_NAME, null)
+        if (!savedName.isNullOrEmpty()) {
+            udp.setHostname(savedName)
+        } else {
+            // 首次运行：默认使用主机名并持久化
+            prefs.edit().putString(KEY_DEVICE_NAME, udp.currentHostname()).apply()
+        }
+        _deviceName.value = udp.currentHostname()
 
         tcp = TcpFileTransfer(
             publisher = { file, isFolder -> publishReceived(file, isFolder) },
@@ -93,7 +102,7 @@ class P2PFileTransferService : Service() {
 
         startForeground(NOTIFICATION_ID, buildOngoingNotification())
         emitLog("[服务] 启动，本机 IPv4: " + NetworkUtil.getLocalIPv4List().joinToString(", "))
-        emitLog("[服务] 主机名: " + NetworkUtil.hostname())
+        emitLog("[服务] 设备名: " + udp.currentHostname())
 
         udp.start(serviceScope)
         tcp.startServer(serviceScope)
@@ -232,6 +241,25 @@ class P2PFileTransferService : Service() {
         _saveDirPath.value = desc
         emitLog("[设置] 接收文件将保存到: " + desc)
     }
+
+    /**
+     * 修改本机设备名。
+     * 立即生效：下次广播/心跳/回复都使用新名字。
+     */
+    fun setDeviceName(newName: String) {
+        val trimmed = newName.trim()
+        if (trimmed.isEmpty()) {
+            emitLog("[设置] 设备名不能为空")
+            return
+        }
+        prefs.edit().putString(KEY_DEVICE_NAME, trimmed).apply()
+        udp.setHostname(trimmed)
+        _deviceName.value = trimmed
+        emitLog("[设置] 设备名已改为: " + trimmed)
+    }
+
+    /** 读取当前设备名 */
+    fun currentDeviceName(): String = udp.currentHostname()
 
     fun clearSaveTreeUri() {
         prefs.edit().remove(KEY_SAVE_TREE_URI).apply()
@@ -468,8 +496,12 @@ class P2PFileTransferService : Service() {
         private val _saveDirPath = MutableStateFlow("")
         val saveDirPath: StateFlow<String> = _saveDirPath
 
+        private val _deviceName = MutableStateFlow("")
+        val deviceName: StateFlow<String> = _deviceName
+
         const val PUBLIC_SAVE_DESC = "下载/P2PFileTransfer/"
         private const val KEY_SAVE_TREE_URI = "save_tree_uri"
+        private const val KEY_DEVICE_NAME = "device_name"
 
         /** UI 侧读取设备列表 */
         fun deviceFlow(): StateFlow<List<DeviceNode>>? = instance?.deviceRepo?.nodesFlow
