@@ -12,6 +12,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -42,17 +44,28 @@ class UdpDiscovery(
 ) {
 
     private val gson = Gson()
-    /** 当前设备名（可通过 setHostname 修改，立即生效于下次广播/心跳/回复） */
-    @Volatile private var hostname: String = NetworkUtil.hostname()
+
+    /**
+     * 本机设备名 —— **运行时唯一来源**。
+     *
+     * 所有出站报文（广播/回复/扫描探测/心跳）都从这里取值；
+     * 任何修改（如 setDeviceName）只需改动这里，不再有多处镜像同步。
+     * 持久化由上层 P2PFileTransferService 负责（prefs.KEY_DEVICE_NAME）。
+     */
+    private val _hostname = MutableStateFlow(NetworkUtil.hostname())
+    val hostnameFlow: StateFlow<String> = _hostname
+
+    private val hostname: String get() = _hostname.value
+
     private val myIps: Set<String> = (NetworkUtil.getLocalIPv4List() + NetworkUtil.getLocalIPv6List()).toSet()
 
-    /** 修改本机设备名（下次发送广播/回复时使用新名字） */
+    /** 修改本机设备名（唯一入口，立即生效于下次广播/心跳/回复） */
     fun setHostname(newName: String) {
-        if (newName.isNotEmpty()) hostname = newName
+        if (newName.isNotEmpty()) _hostname.value = newName
     }
 
     /** 读取当前设备名 */
-    fun currentHostname(): String = hostname
+    fun currentHostname(): String = _hostname.value
 
     private var scope: CoroutineScope? = null
     private var udpListenerJob: Job? = null

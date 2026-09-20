@@ -10,12 +10,11 @@ object Constants {
 
     // 时间/大小
     const val NODE_TIMEOUT_MS = 600_000L          // 节点 10 分钟无响应则移除
-    const val BUFFER_SIZE = 1 * 1024 * 1024       // 初始缓冲区 1MB
-    const val MAX_BUFFER_SIZE = 8 * 1024 * 1024   // 最大 8MB
-    const val SOCKET_BUFFER_SIZE = 16 * 1024 * 1024
+    const val BUFFER_SIZE = 3 * 1024 * 1024       // 初始缓冲区 3MB
+    const val MAX_BUFFER_SIZE = 16 * 1024 * 1024   // 最大 16MB
     const val AUTO_SCAN_INTERVAL_MS = 20_000L     // 后台扫描间隔
-    const val HEARTBEAT_MAX_FAIL = 3
-    const val MAX_RETRIES = 3
+    const val HEARTBEAT_MAX_FAIL = 3              // 心跳检测次数（如果超过该数会去除名字）
+    const val MAX_RETRIES = 3                     // 最大重试传输次数
 
     // 扫描
     const val SCAN_TIMEOUT_MS = 500               // 单次探测超时
@@ -31,7 +30,7 @@ object Constants {
     // 动态缓冲区下限 / 上限
     const val MIN_BUFFER_SIZE = 64 * 1024         // 最小 64KB
     const val MIN_ADAPTIVE_CHUNK = 256 * 1024     // 发送端最小块 256KB
-    const val MAX_ADAPTIVE_CHUNK = 4 * 1024 * 1024  // 发送端最大块 4MB
+    const val MAX_ADAPTIVE_CHUNK = 8 * 1024 * 1024  // 发送端最大块 8MB
 
     // 广播
     const val BROADCAST_BURST_INTERVAL_MS = 200L
@@ -63,11 +62,13 @@ object Constants {
 
     /**
      * 接收端：根据速度（字节/秒）计算接收缓冲区大小。
-     * 未使用（保留供未来扩展）。接收端现在固定使用 BUFFER_SIZE（1MB）。
+     *
+     * 仅供 [TcpFileTransfer.receiveData] 的"只扩不缩"逻辑使用：
+     * 起始 1MB，仅当实测速度更高时才扩大到 2MB / 4MB，
+     * 绝不因为速度慢而缩小（避免"慢 → 缓冲变小 → 系统调用更频繁 → 更慢"的负反馈）。
      */
     fun recvBufferSizeFor(speed: Double): Int = when {
-        speed < 1024.0 * 1024 -> 512 * 1024
-        speed < 5.0 * 1024 * 1024 -> 1024 * 1024
+        speed < 5.0 * 1024 * 1024 -> 1024 * 1024          // 起步 1MB
         speed < 20.0 * 1024 * 1024 -> 2 * 1024 * 1024
         else -> 4 * 1024 * 1024
     }.coerceIn(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE)

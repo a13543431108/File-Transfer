@@ -16,10 +16,22 @@ from datetime import datetime
 import zlib
 import logging
 
+# 跨程序拖拽支持（可选依赖）。
+# 未安装时程序照常运行，只是列表区域不支持拖拽，会在启动日志中提示安装。
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    DND_AVAILABLE = True
+except ImportError:
+    TkinterDnD = None
+    DND_FILES = None
+    DND_AVAILABLE = False
+
 # ================= 配置 =================
 UDP_PORT = 9998          # 设备发现（心跳、广播）
 TCP_PORT = 9999          # 文件传输
 SCAN_PORT = 9997         # 扫描探测端口（与设备发现隔离，防止扫描影响收发）
+IPC_PORT  = 59998        # 单实例转发端口（本地回环 127.0.0.1）：把拖到 .py/.exe 图标上的
+                         # 文件路径转给已运行实例；冷启动时由本进程作为服务器
 BROADCAST_INTERVAL = 1      # 正常广播间隔（1秒）
 BROADCAST_BURST_INTERVAL = 0.2  # 启动时爆发广播间隔（0.2秒）
 BROADCAST_BURST_DURATION = 5    # 爆发广播持续秒数
@@ -2016,8 +2028,15 @@ class Node(threading.Thread):
 # ================= 图形界面 =================
 class P2PApp:
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("全环境极速传输 V14.0 - 断点续传+IPv6")
+        # 优先使用带拖拽支持的 Tk 子类；未装 tkinterdnd2 时回退到普通 Tk
+        if DND_AVAILABLE:
+            try:
+                self.root = TkinterDnD.Tk()
+            except Exception:
+                self.root = tk.Tk()
+        else:
+            self.root = tk.Tk()
+        self.root.title("文件互传 V15.0 - 支持拖拽发送")
         self.root.geometry("1200x700")
         self.root.resizable(True, True)
 
@@ -2028,6 +2047,8 @@ class P2PApp:
         self._items_lock = threading.Lock()
         # 用于记录 Tk after() 返回的定时器 ID，退出时批量取消
         self._after_ids = []
+        # IPC 服务器运行标记（on_close 时置 False，让监听线程退出）
+        self._ipc_running = True
 
         self._build_ui()
 
@@ -2057,6 +2078,10 @@ class P2PApp:
             self.log(f"本机 IPv6: {', '.join(self.node.my_ips_v6)}")
         self.log("提示: 点击『自动搜索』快速发现同网段设备，可开启『后台扫描』保持更新")
         self.log("新功能: 断点续传(单文件) | IPv6支持 | 动态缓冲区 | zlib压缩")
+        if DND_AVAILABLE:
+            self.log("提示: 可将文件/文件夹直接拖到『待发送项目』列表")
+        else:
+            self.log("提示: 安装 tkinterdnd2 可启用拖拽功能（pip install tkinterdnd2）")
 
     def _build_ui(self):
         # 显示当前保存路径（置于最上方）
@@ -2105,6 +2130,15 @@ class P2PApp:
         item_scroll = ttk.Scrollbar(list_frame2, command=self.item_listbox.yview)
         item_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.item_listbox.config(yscrollcommand=item_scroll.set)
+
+        # 注册拖拽目标：把文件/文件夹从资源管理器拖到列表区域即可加入待发送。
+        if DND_AVAILABLE:
+            try:
+                for widget in (self.item_listbox, list_frame2, right_frame):
+                    widget.drop_target_register(DND_FILES)
+                    widget.dnd_bind('<<Drop>>', self._on_drop_files)
+            except Exception as e:
+                self.log(f"[拖拽] 注册失败: {e}")
 
         # 发送操作按钮行
         btn_frame = ttk.Frame(right_frame)
@@ -2179,6 +2213,47 @@ class P2PApp:
         for path, is_folder in items_copy:
             label = f"[文件夹] {os.path.basename(path)}" if is_folder else f"[文件] {os.path.basename(path)}"
             self.item_listbox.insert(tk.END, label)
+
+    def _on_drop_files(self, event):
+        """处理从资源管理器拖拽到待发送列表的文件/文件夹。
+
+        tkinterdnd2 的 event.data 是 Tcl 列表格式，含空格的路径会用 { } 包裹，
+        因此用 root.tk.splitlist 解析（不要自己 split）。
+        """
+        try:
+            raw_paths = self.root.tk.splitlist(event.data)
+        except Exception:
+            raw_paths = [event.data]
+
+        added = 0
+        skipped = 0
+        for p in raw_paths:
+            if not p:
+                continue
+            # 去掉可能的 {} 包裹与首尾空白
+            p = str(p).strip()
+            if p.startswith('{') and p.endswith('}'):
+                p = p[1:-1]
+            p = os.path.normpath(p)
+            if os.path.isdir(p):
+                with self._items_lock:
+                    self.send_items.append((p, True))
+                added += 1
+            elif os.path.isfile(p):
+                with self._items_lock:
+                    self.send_items.append((p, False))
+                added += 1
+            else:
+                skipped += 1
+
+        if added > 0:
+            self._refresh_item_listbox()
+            msg = f"[拖拽] 已添加 {added} 个项目到待发送列表"
+            if skipped:
+                msg += f"（{skipped} 个路径不存在，已忽略）"
+            self.log(msg)
+        elif skipped:
+            self.log(f"[拖拽] 未添加任何项目（{skipped} 个路径无效）")
 
     # ---------- 搜索相关 ----------
     def auto_search(self):
@@ -2361,6 +2436,8 @@ class P2PApp:
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # 启动 IPC 服务器：把后续拖到 .py/.exe 图标上的文件路径接收进来
+        self.start_ipc_server()
         self.root.mainloop()
 
     def on_close(self):
@@ -2375,6 +2452,8 @@ class P2PApp:
             self.node.running = False
         except Exception:
             pass
+        # 停止 IPC 服务器（daemon 线程，无需 join）
+        self._ipc_running = False
 
         # 关闭所有 socket
         for s in list(getattr(self.node, 'listen_sockets', [])) + \
@@ -2415,10 +2494,15 @@ class P2PApp:
         threading.Thread(target=_force_exit, daemon=True).start()
 
     def load_config(self):
-        """加载配置文件，恢复保存路径与设备名"""
+        """加载配置文件，恢复保存路径与设备名。
+
+        注意：本方法在 self.node 创建**之前**被调用，因此这里只把配置读入
+        self._device_name（临时备份）。真正的运行时设备名在 Node 内部维护，
+        通过 P2PApp.device_name 属性读取。
+        """
         global SAVE_DIR
-        # 默认设备名 = 系统主机名
-        self.device_name = socket.gethostname()
+        # 默认设备名 = 系统主机名（临时备份，Node 创建时从这里读）
+        self._device_name = socket.gethostname()
         if CONFIG_FILE.exists():
             try:
                 with open(CONFIG_FILE, 'r') as f:
@@ -2428,17 +2512,28 @@ class P2PApp:
                         SAVE_DIR = Path(path)
                     dev = cfg.get('device_name')
                     if dev:
-                        self.device_name = dev
+                        self._device_name = dev
             except:
                 pass
         SAVE_DIR.mkdir(parents=True, exist_ok=True)
         self.update_save_dir_label()
 
+    @property
+    def device_name(self):
+        """设备名（只读）。
+
+        单一来源：Node.hostname（运行时真源）。
+        Node 未创建时（load_config 阶段）回退到 _device_name。
+        """
+        if hasattr(self, 'node') and self.node is not None:
+            return self.node.hostname
+        return getattr(self, '_device_name', socket.gethostname())
+
     def save_config(self):
         """保存当前配置到文件"""
         cfg = {
             'save_dir': str(SAVE_DIR),
-            'device_name': getattr(self, 'device_name', socket.gethostname()),
+            'device_name': self.device_name,
         }
         with open(CONFIG_FILE, 'w') as f:
             json.dump(cfg, f)
@@ -2455,8 +2550,12 @@ class P2PApp:
             self.log(f"保存路径已更改为: {SAVE_DIR}")
 
     def choose_device_name(self):
-        """弹出对话框修改本机设备名，立即生效并保存到配置"""
-        current = getattr(self, 'device_name', socket.gethostname())
+        """弹出对话框修改本机设备名。
+
+        单一来源：Node.hostname 是运行时真源，这里只写它。
+        P2PApp.device_name 是只读属性，会自动跟随 Node.hostname。
+        """
+        current = self.device_name
         new_name = simpledialog.askstring(
             "设置设备名",
             f"当前设备名：{current}\n\n其他设备在搜索时会看到这个名字：",
@@ -2469,10 +2568,11 @@ class P2PApp:
         if not new_name:
             messagebox.showwarning("无效名称", "设备名不能为空")
             return
-        self.device_name = new_name
-        # 立即生效：Node 后续广播/回复/心跳都使用新名字
-        if hasattr(self, 'node') and self.node:
-            self.node.hostname = new_name
+        if not (hasattr(self, 'node') and self.node):
+            messagebox.showwarning("尚未就绪", "网络组件尚未启动，请稍后再试")
+            return
+        # 唯一写入点：直接改 Node.hostname
+        self.node.hostname = new_name
         self.save_config()
         self.log(f"设备名已改为: {new_name}（下次广播/回复生效）")
 
@@ -2481,6 +2581,149 @@ class P2PApp:
         if hasattr(self, 'save_dir_label'):
             self.save_dir_label.config(text=f"保存位置: {SAVE_DIR}")
 
+    # ---------- 单实例 IPC（外部拖到图标上的文件转发） ----------
+
+    def _bring_to_front(self):
+        """把窗口激活到前台（IPC 收到转发时调用）。"""
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes('-topmost', True)
+            self.root.after(200, lambda: self.root.attributes('-topmost', False))
+        except Exception:
+            pass
+
+    def _add_paths_from_ipc(self, paths):
+        """把从 IPC 收到的路径加入待发送列表（主线程调用）。"""
+        added = 0
+        skipped = 0
+        for p in paths:
+            try:
+                p = os.path.normpath(str(p).strip())
+            except Exception:
+                skipped += 1
+                continue
+            if p.startswith('{') and p.endswith('}'):
+                p = p[1:-1]
+            if os.path.isdir(p):
+                with self._items_lock:
+                    self.send_items.append((p, True))
+                added += 1
+            elif os.path.isfile(p):
+                with self._items_lock:
+                    self.send_items.append((p, False))
+                added += 1
+            else:
+                skipped += 1
+        if added > 0:
+            self._refresh_item_listbox()
+            msg = f"[拖拽] 从外部添加 {added} 个项目到待发送列表"
+            if skipped:
+                msg += f"（{skipped} 个路径无效，已忽略）"
+            self.log(msg)
+        elif skipped:
+            self.log(f"[拖拽] 收到 {skipped} 个无效路径")
+        self._bring_to_front()
+
+    def start_ipc_server(self):
+        """启动本地 IPC 服务器（后台线程，监听 127.0.0.1:IPC_PORT）。
+
+        外部进程（拖到 .py/.exe 图标上的新实例）会把路径以 UTF-8 JSON
+        `{"paths": [...]}` 通过这条回环 TCP 连接发过来。
+        """
+        def server():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(('127.0.0.1', IPC_PORT))
+                sock.listen(5)
+                self.log(f"[IPC] 单实例监听 127.0.0.1:{IPC_PORT}")
+            except OSError as e:
+                self.log(f"[IPC] 端口 {IPC_PORT} 绑定失败（可能另一实例在运行）: {e}")
+                return
+            sock.settimeout(1.0)
+            while self._ipc_running:
+                try:
+                    conn, _ = sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    conn.settimeout(2.0)
+                    buf = b''
+                    while True:
+                        try:
+                            chunk = conn.recv(65536)
+                        except socket.timeout:
+                            break
+                        if not chunk:
+                            break
+                        buf += chunk
+                        if len(buf) > 4 * 1024 * 1024:
+                            break  # 防御性：单条消息 ≤ 4MB
+                    if buf:
+                        try:
+                            msg = json.loads(buf.decode('utf-8'))
+                            paths = msg.get('paths', []) if isinstance(msg, dict) else []
+                            if paths:
+                                self.root.after(0, lambda ps=paths: self._add_paths_from_ipc(ps))
+                            else:
+                                # 无路径：仅把已有窗口前置
+                                self.root.after(0, self._bring_to_front)
+                        except Exception as e:
+                            self.log(f"[IPC] 解析消息失败: {e}")
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        threading.Thread(target=server, daemon=True).start()
+
+
+def try_send_to_running(files):
+    """尝试把文件路径转发给已运行的实例。
+
+    成功返回 True（说明已有实例接住了消息）；无实例或失败返回 False。
+
+    注意：即使 files 为空也做一次连接尝试 —— 这样用户"双击图标启动第二份"时
+    不会真的开出第二个进程，而是激活已有窗口。
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.8)
+        s.connect(('127.0.0.1', IPC_PORT))
+        payload = json.dumps({"paths": list(files)}).encode('utf-8')
+        s.sendall(payload)
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
 if __name__ == '__main__':
+    # 收集命令行参数里的文件/文件夹（Windows 把拖到图标上的路径作为 argv 传入，
+    # 含空格的路径系统会自动加引号，所以这里拿到的已是完整路径）
+    files = [a for a in sys.argv[1:] if a and not a.startswith('-')]
+
+    # 先尝试把参数转发给已运行的实例；成功则本进程直接退出
+    if try_send_to_running(files):
+        sys.exit(0)
+
+    # 没有已运行实例：本进程作为"主实例"启动
     app = P2PApp()
+    if files:
+        # 冷启动时把命令行参数里的文件/文件夹加入待发送列表（等 GUI 就绪）
+        app.root.after(300, lambda ps=files: app._add_paths_from_ipc(ps))
     app.run()

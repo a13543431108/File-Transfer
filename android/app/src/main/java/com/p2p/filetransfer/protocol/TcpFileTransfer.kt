@@ -231,12 +231,6 @@ class TcpFileTransfer(
                 (if (resume) " [续传]" else "") + (if (compressed) " [压缩]" else "") +
                 " 来自 " + peerIp)
 
-        // 初始化哈希：续传时先读取已有部分
-        val hashPrefix = if (offset > 0 && savePath.exists()) {
-            val h = HashUtil.sha256(savePath, 0, offset)
-            h
-        } else null
-
         resumeRepo.saveState(peerIp, savePath.absolutePath, offset, fileSize, 0.0, "recv")
 
         val startTime = System.currentTimeMillis()
@@ -244,12 +238,10 @@ class TcpFileTransfer(
         val lastPercentBucket = intArrayOf(-1)
         val result = receiveData(
             socket = socket,
-            reader = reader,
             destFile = savePath,
             fileSize = fileSize,
             startOffset = offset,
             compressed = compressed,
-            hashPrefix = hashPrefix,
             progressCallback = { received ->
                 val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
                 val speed = if (elapsed > 0) (received - offset) / elapsed else 0.0
@@ -321,12 +313,10 @@ class TcpFileTransfer(
      */
     private suspend fun receiveData(
         socket: Socket,
-        reader: ProtoReader,
         destFile: File,
         fileSize: Long,
         startOffset: Long,
         compressed: Boolean,
-        hashPrefix: String?,
         progressCallback: (Long) -> Unit
     ): ReceiveResult = withContext(Dispatchers.IO) {
         var received = startOffset
@@ -354,19 +344,26 @@ class TcpFileTransfer(
         }
 
         val input = socket.getInputStream()
-        // 固定 1MB 读缓冲 + 1MB 写缓冲（用固定数组，避免 ByteArrayOutputStream
-        // 的扩容与 toByteArray() 每次拷贝）
-        val readBuf = ByteArray(Constants.BUFFER_SIZE)
+        // 读缓冲：动态"只扩不缩"（起始 1MB，高速时扩到 2MB/4MB）
+        //   - 小缓冲 → 更多 read() 系统调用；大缓冲在高带宽链路上能一次排空内核队列
+        //   - 只扩不缩，避免慢速网络陷入"缓冲变小 → 更慢"的负反馈
+        // 写缓冲：固定 1MB（用固定数组，避免 ByteArrayOutputStream 的拷贝）
+        var dynamicReadSize = Constants.BUFFER_SIZE
+        var readBuf = ByteArray(dynamicReadSize)
         val writeBuf = ByteArray(Constants.WRITE_BATCH_SIZE)
         var writeOff = 0
         val inflater = if (compressed) Inflater() else null
-        var lastActivity = System.currentTimeMillis()
+        // lastActivity 在循环内首次读取前必定被赋值（见 while 循环体的首行），
+        // 因此声明时不设初值（避免冗余初始化警告）
+        var lastActivity: Long
         var lastProgress = System.currentTimeMillis()
         var lastProgressBytes = received
-        // 速度采样（每 1 秒一次，保留最近 5 个），仅用于静默超时判断，不再缩小缓冲区
+        // 速度采样（每 1 秒一次，保留最近 5 个）——用于静默超时判断和缓冲扩容
         var lastSampleTime = System.currentTimeMillis()
         var lastSampleBytes = received
         val speedSamples = ArrayDeque<Double>()
+        // 上次扩容时间，避免频繁重分配（至少间隔 2 秒）
+        var lastGrowTime = System.currentTimeMillis()
 
         try {
             while (received < fileSize) {
@@ -410,7 +407,7 @@ class TcpFileTransfer(
                     lastProgress = now
                     lastProgressBytes = received
                 }
-                // 速度采样（仅用于静默超时判断）
+                // 速度采样（用于静默超时判断 + 缓冲扩容）
                 val sampleElapsed = (now - lastSampleTime) / 1000.0
                 if (sampleElapsed >= 1.0) {
                     val speed = (received - lastSampleBytes) / sampleElapsed
@@ -418,6 +415,21 @@ class TcpFileTransfer(
                     if (speedSamples.size > 5) speedSamples.removeFirst()
                     lastSampleTime = now
                     lastSampleBytes = received
+
+                    // 动态扩容（只扩不缩）：实测平均速度高于当前缓冲档位，且距上次扩容 ≥ 2 秒
+                    val avgSpeed = speedSamples.average()
+                    val idealSize = Constants.recvBufferSizeFor(avgSpeed)
+                    if (idealSize > dynamicReadSize &&
+                        now - lastGrowTime >= 2000L &&
+                        received + idealSize < fileSize) {
+                        // 仅在还有较多数据要接收时扩容，避免临近结束时无谓分配
+                        dynamicReadSize = idealSize
+                        readBuf = ByteArray(dynamicReadSize)
+                        lastGrowTime = now
+                        log("[接收] 读缓冲扩容至 " +
+                                com.p2p.filetransfer.util.SizeFormatter.humanSize(dynamicReadSize.toLong()) +
+                                "（速度 " + com.p2p.filetransfer.util.SizeFormatter.formatSpeed(avgSpeed) + "）")
+                    }
                 }
                 // 静默超时（仅低网络下生效）
                 val currentSpeed = if (speedSamples.isEmpty()) Double.MAX_VALUE else speedSamples.average()
@@ -520,7 +532,8 @@ class TcpFileTransfer(
         val totalSize = file.length()
         val filename = file.name
         val compressRequested = Constants.isTextFile(filename)
-        var offset = 0L
+        // offset 在下面必定被赋值（min/max 计算），故声明时不设初值
+        var offset: Long
 
         // 加载双方续传状态
         val senderState = resumeRepo.loadState(targetIp, file.absolutePath, "sender")
@@ -735,7 +748,8 @@ class TcpFileTransfer(
         var lastSampleTime = System.currentTimeMillis()
         var lastBytes = sent
         var avgSpeed = Double.MAX_VALUE
-        var lastActivity = System.currentTimeMillis()
+        // lastActivity 在循环内首次读取前必定被赋值（见 while 循环体的首行）
+        var lastActivity: Long
         val speedSamples = ArrayDeque<Double>()
 
         try {
@@ -861,7 +875,6 @@ class TcpFileTransfer(
                 act = "resume"
                 offset = effectiveOffset
             } else {
-                effectiveOffset = 0
                 offset = 0
             }
 
@@ -1089,12 +1102,10 @@ class TcpFileTransfer(
                     val lastPercentBucket = intArrayOf(-1)
                     val result = receiveData(
                         socket = socket,
-                        reader = reader,
                         destFile = destPath,
                         fileSize = fileSize,
                         startOffset = offset,
                         compressed = compressed,
-                        hashPrefix = null,
                         progressCallback = { received ->
                             val total = receivedGlobal + received
                             onRecvProgress(TransferProgress(

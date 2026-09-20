@@ -76,7 +76,7 @@ class P2PFileTransferService : Service() {
                 checkResumeOnOnline(ip, host)
             }
         )
-        // 应用已保存的设备名
+        // 应用已保存的设备名（prefs 是持久化真源；udp.hostnameFlow 是运行时真源）
         val savedName = prefs.getString(KEY_DEVICE_NAME, null)
         if (!savedName.isNullOrEmpty()) {
             udp.setHostname(savedName)
@@ -84,7 +84,10 @@ class P2PFileTransferService : Service() {
             // 首次运行：默认使用主机名并持久化
             prefs.edit().putString(KEY_DEVICE_NAME, udp.currentHostname()).apply()
         }
-        _deviceName.value = udp.currentHostname()
+        // UI 状态镜像：单向跟随 udp.hostnameFlow
+        serviceScope.launch {
+            udp.hostnameFlow.collect { _deviceName.value = it }
+        }
 
         tcp = TcpFileTransfer(
             publisher = { file, isFolder -> publishReceived(file, isFolder) },
@@ -204,9 +207,13 @@ class P2PFileTransferService : Service() {
         }
     }
 
+    /**
+     * 中间接收目录：始终是应用私有目录（网络层写入这里，接收完成后由
+     * [publishReceived] 分发到用户选择的位置或默认公共 Downloads）。
+     * 不对外暴露为"可配置项"，避免与 [KEY_SAVE_TREE_URI] 语义重叠。
+     */
     fun currentSaveDir(): File {
-        val path = prefs.getString(KEY_SAVE_DIR, null)
-        val dir = if (path != null) File(path) else File(getExternalFilesDir(null) ?: filesDir, "Received")
+        val dir = File(getExternalFilesDir(null) ?: filesDir, "Received")
         if (!dir.exists()) dir.mkdirs()
         return dir
     }
@@ -243,8 +250,14 @@ class P2PFileTransferService : Service() {
     }
 
     /**
-     * 修改本机设备名。
-     * 立即生效：下次广播/心跳/回复都使用新名字。
+     * 修改本机设备名（唯一写入入口）。
+     *
+     * 单一来源设计：
+     *   1. prefs.KEY_DEVICE_NAME —— 持久化真源（跨重启）
+     *   2. udp.hostnameFlow     —— 运行时真源（出站报文取值处）
+     *   3. _deviceName          —— 只读镜像，由 hostnameFlow.collect 自动同步
+     *
+     * 这里只需要写 1 和 2，3 自动跟上。
      */
     fun setDeviceName(newName: String) {
         val trimmed = newName.trim()
@@ -254,7 +267,6 @@ class P2PFileTransferService : Service() {
         }
         prefs.edit().putString(KEY_DEVICE_NAME, trimmed).apply()
         udp.setHostname(trimmed)
-        _deviceName.value = trimmed
         emitLog("[设置] 设备名已改为: " + trimmed)
     }
 
@@ -461,7 +473,6 @@ class P2PFileTransferService : Service() {
 
     companion object {
         private const val NOTIFICATION_ID = 1001
-        private const val KEY_SAVE_DIR = "save_dir"
 
         @Volatile
         var instance: P2PFileTransferService? = null
@@ -499,7 +510,9 @@ class P2PFileTransferService : Service() {
         private val _deviceName = MutableStateFlow("")
         val deviceName: StateFlow<String> = _deviceName
 
-        const val PUBLIC_SAVE_DESC = "下载/P2PFileTransfer/"
+        /** 默认保存目录的显示描述，由 PublicStorage.SUBDIR 拼接，避免字符串重复 */
+        val PUBLIC_SAVE_DESC: String
+            get() = "下载/" + com.p2p.filetransfer.util.PublicStorage.SUBDIR + "/"
         private const val KEY_SAVE_TREE_URI = "save_tree_uri"
         private const val KEY_DEVICE_NAME = "device_name"
 

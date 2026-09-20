@@ -34,7 +34,7 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -106,6 +106,9 @@ class MainActivity : ComponentActivity() {
         requestIgnoreBatteryOptimizations()
         startTransferService()
 
+        // 处理"分享到" / "用其他应用打开" 传入的文件
+        handleIncomingIntent(intent)
+
         setContent {
             P2PFileTransferTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -119,6 +122,67 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * singleTask 模式下，再次被分享时不会再走 onCreate，而是走 onNewIntent。
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    /**
+     * 处理外部传入的文件 URI：
+     *   - ACTION_SEND       单个 URI
+     *   - ACTION_SEND_MULTIPLE  多个 URI
+     *   - ACTION_VIEW       单个 URI（"用其他应用打开"）
+     *
+     * 关键点：Android 对 content:// 的临时读权限只在**本次 Intent** 有效，
+     * 一旦 Activity 退到后台就可能失效。因此必须立即把 URI 复制到应用缓存
+     * （由 ViewModel.addUriAsFile 完成），不能延迟处理。
+     */
+    private fun handleIncomingIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action ?: return
+        val uris = mutableListOf<Uri>()
+        when (action) {
+            Intent.ACTION_SEND -> {
+                val u = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                else
+                    @Suppress("DEPRECATION") intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                u?.let { uris.add(it) }
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                    intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                else
+                    @Suppress("DEPRECATION") intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+                list?.let { uris.addAll(it) }
+            }
+            Intent.ACTION_VIEW -> {
+                intent.data?.let { uris.add(it) }
+            }
+        }
+        if (uris.isEmpty()) return
+
+        // 持久化读权限（尽力而为；部分 provider 不支持）
+        for (u in uris) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    u, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
+        }
+
+        // 交给 ViewModel：把 URI 复制到应用缓存，加入待发送列表
+        for (u in uris) {
+            vm.addUriAsFile(u)
+        }
+        vm.appendLog("[分享] 收到 " + uris.size + " 个文件，已加入待发送列表")
     }
 
     private fun startTransferService() {
@@ -198,11 +262,13 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
     init {
         // 桥接 Service 的 DeviceRepository（Service 可能晚于 UI 启动，轮询等待）
         viewModelScope.launch {
+            // 轮询等待 Service 就绪，然后订阅设备列表。
+            // 注意：nodesFlow.collect{} 是永久挂起的（不会返回），
+            // 因此它后面不能有 break —— 那会是不可达代码。
             while (true) {
                 val repo = P2PFileTransferService.instance?.deviceRepo
                 if (repo != null) {
                     repo.nodesFlow.collect { _devices.value = it }
-                    break
                 }
                 kotlinx.coroutines.delay(200)
             }
@@ -272,17 +338,67 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
         val ctx = getApplication<android.app.Application>()
         viewModelScope.launch {
             try {
-                val name = queryDisplayName(ctx, uri) ?: ("file_" + UUID.randomUUID())
+                // 尽量拿到真实文件名；拿不到时用 MIME + 时间戳拼一个
+                val displayName = queryDisplayName(ctx, uri)
+                val name = if (!displayName.isNullOrBlank()) {
+                    displayName
+                } else {
+                    val mime = try { ctx.contentResolver.getType(uri) } catch (_: Exception) { null }
+                    val ext = guessExtensionFromMime(mime)
+                    "file_" + System.currentTimeMillis() + ext
+                }
+                // 文件名可能含路径分隔符（极少数 provider 会返回），清理掉
+                val safeName = name.replace('/', '_').replace('\\', '_').ifBlank {
+                    "file_" + System.currentTimeMillis()
+                }
                 val cacheDir = File(ctx.cacheDir, "to_send")
                 if (!cacheDir.exists()) cacheDir.mkdirs()
-                val out = File(cacheDir, name)
+                // 同名冲突时追加序号，避免相互覆盖
+                var out = File(cacheDir, safeName)
+                var n = 1
+                while (out.exists()) {
+                    val dot = safeName.lastIndexOf('.')
+                    val stem = if (dot > 0) safeName.substring(0, dot) else safeName
+                    val ext = if (dot > 0) safeName.substring(dot) else ""
+                    out = File(cacheDir, stem + "_" + n + ext)
+                    n++
+                }
                 ctx.contentResolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(out).use { fos -> input.copyTo(fos) }
                 }
-                _items.value = _items.value + TransferItem(path = out.absolutePath, isFolder = false, uriString = uri.toString())
+                _items.value = _items.value + TransferItem(
+                    path = out.absolutePath,
+                    isFolder = false,
+                    uriString = uri.toString()
+                )
+                appendLog("[UI] 已添加: " + out.name)
             } catch (e: Exception) {
                 appendLog("[UI] 添加文件失败: " + e.message)
             }
+        }
+    }
+
+    /** MIME -> 常见后缀（用于 provider 不返回文件名时的兜底） */
+    private fun guessExtensionFromMime(mime: String?): String {
+        if (mime.isNullOrEmpty()) return ""
+        return when {
+            mime == "text/plain" -> ".txt"
+            mime == "text/html" -> ".html"
+            mime == "application/json" -> ".json"
+            mime == "application/xml" || mime == "text/xml" -> ".xml"
+            mime == "application/pdf" -> ".pdf"
+            mime == "application/zip" -> ".zip"
+            mime == "application/x-7z-compressed" -> ".7z"
+            mime == "application/x-rar-compressed" -> ".rar"
+            mime == "application/vnd.android.package-archive" -> ".apk"
+            mime == "application/vnd.ms-excel" -> ".xls"
+            mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" -> ".xlsx"
+            mime == "application/msword" -> ".doc"
+            mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> ".docx"
+            mime.startsWith("image/") -> "." + mime.substringAfter("image/").substringBefore("+").replace("jpeg", "jpg")
+            mime.startsWith("audio/") -> "." + mime.substringAfter("audio/").substringBefore("+")
+            mime.startsWith("video/") -> "." + mime.substringAfter("video/").substringBefore("+")
+            else -> ""
         }
     }
 
@@ -619,7 +735,7 @@ fun MainScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text("P2P 文件互传", style = MaterialTheme.typography.titleMedium)
+                        Text("文件互传 V15.0", style = MaterialTheme.typography.titleMedium)
                         Text(
                             text = "设备名: " + deviceName + "   ·   保存到: " + saveDirDesc,
                             style = MaterialTheme.typography.labelSmall,
@@ -827,7 +943,7 @@ fun MainScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
-                                    imageVector = if (it.isFolder) Icons.Filled.Folder else Icons.Filled.InsertDriveFile,
+                                    imageVector = if (it.isFolder) Icons.Filled.Folder else Icons.AutoMirrored.Filled.InsertDriveFile,
                                     contentDescription = null,
                                     modifier = Modifier.size(20.dp),
                                     tint = MaterialTheme.colorScheme.primary
