@@ -11,8 +11,8 @@ android {
         applicationId = "com.p2p.filetransfer"
         minSdk = 24
         targetSdk = 35
-        versionCode = 15
-        versionName = "15.0"
+        versionCode = 17
+        versionName = "15.2"
         vectorDrawables { useSupportLibrary = true }
     }
 

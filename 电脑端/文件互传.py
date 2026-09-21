@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import zlib
 import logging
+import uuid
 
 # 跨程序拖拽支持（可选依赖）。
 # 未安装时程序照常运行，只是列表区域不支持拖拽，会在启动日志中提示安装。
@@ -68,6 +69,52 @@ RESUME_DIR.mkdir(exist_ok=True)
 # 默认保存目录
 SAVE_DIR = Path("Received")
 CONFIG_FILE = Path.home() / '.p2p_config.json'
+
+
+def get_or_create_device_id():
+    """获取或生成持久化的设备 UUID（稳定标识，跨重启不变）。
+
+    存在 ~/.p2p_config.json 的 device_id 字段里。
+    用途：
+      · 跨设备识别同一台机器（IP 变化不影响识别）
+      · 去重：同一设备多网卡/多 IP 只显示一个条目
+    """
+    cfg = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                cfg = json.load(f) or {}
+        except Exception:
+            cfg = {}
+    did = cfg.get('device_id')
+    if did:
+        return did
+    did = str(uuid.uuid4())
+    cfg['device_id'] = did
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(cfg, f)
+    except Exception:
+        pass
+    return did
+
+
+def get_mac_address():
+    """尽力获取本机 MAC 地址。
+
+    注意：这是**参考信息**（展示用），不作为识别主键。
+    原因：Windows 多网卡时 uuid.getnode() 只返回一个；
+    虚拟网卡/VPN 下 MAC 常变。
+    """
+    try:
+        node = uuid.getnode()
+        # uuid.getnode() 第 41 位为 1 表示随机生成（拿不到真实 MAC）
+        if (node >> 40) & 1:
+            return ""
+        hexs = '%012X' % node
+        return ':'.join(hexs[i:i+2] for i in range(0, 12, 2))
+    except Exception:
+        return ""
 
 # ================= 通用工具 =================
 def get_all_local_ips(ipv6=False):
@@ -178,6 +225,55 @@ def format_speed(bytes_per_sec):
         return f"{bytes_per_sec/1024**2:.1f} MB/s"
     else:
         return f"{bytes_per_sec/1024**3:.1f} GB/s"
+
+
+class SpeedTracker:
+    """滑动窗口瞬时速度追踪器。
+
+    背景：进度回调里如果直接用「累计字节 / 累计时间」，得到的是**平均速度**。
+    传输长时间任务（562 个文件、19GB）时，速度波动大，平均值会严重滞后，
+    用户看到的"速度"其实是历史平均，不符合直觉。
+
+    本类维护最近 WINDOW 秒内的 (时间戳, 字节) 采样，用「窗口内字节差 / 时间差」
+    计算**瞬时速度**，更接近任务管理器/下载器显示的效果。
+
+    用法：
+        tracker = SpeedTracker()
+        ...
+        speed = tracker.update(current_bytes)   # 返回字节/秒
+    """
+
+    def __init__(self, window=2.0, min_interval=0.3):
+        self.window = window
+        self.min_interval = min_interval
+        self._samples = []   # [(t, bytes), ...]
+
+    def update(self, current_bytes):
+        """传入累计字节数，返回近期瞬时速度（字节/秒）。"""
+        now = time.time()
+        # 采样节流：距离上次采样太近就跳过，避免高频抖动
+        if self._samples and (now - self._samples[-1][0]) < self.min_interval:
+            # 但仍要返回当前估算值
+            return self._compute()
+        self._samples.append((now, current_bytes))
+        # 丢弃窗口外的旧样本，至少保留 2 个
+        cutoff = now - self.window
+        while len(self._samples) > 2 and self._samples[0][0] < cutoff:
+            self._samples.pop(0)
+        return self._compute()
+
+    def _compute(self):
+        if len(self._samples) < 2:
+            return 0.0
+        t0, b0 = self._samples[0]
+        t1, b1 = self._samples[-1]
+        dt = t1 - t0
+        if dt <= 0:
+            return 0.0
+        return max(0.0, (b1 - b0) / dt)
+
+    def reset(self):
+        self._samples.clear()
 
 def format_time(seconds):
     if seconds < 60:
@@ -307,6 +403,9 @@ class Node(threading.Thread):
         # 未配置则用系统主机名
         custom_name = getattr(gui, 'device_name', None)
         self.hostname = custom_name if custom_name else socket.gethostname()
+        # 稳定设备标识（跨重启不变）+ 参考 MAC
+        self.device_id = get_or_create_device_id()
+        self.mac = get_mac_address()
         self.nodes = {}
         self.lock = threading.Lock()
         self.broadcast_sockets = []
@@ -341,7 +440,7 @@ class Node(threading.Thread):
     def broadcast_discovery(self):
         """广播搜索：向所有广播地址发送爆发式探测包，等待设备回复（比逐IP扫描快得多）"""
         self.gui.log("[广播搜索] 发送广播探测，等待设备回复...")
-        msg = json.dumps({'hostname': self.hostname, 'discovery': True}).encode('utf-8')
+        msg = self._build_msg(discovery=True)
         # 向所有广播地址爆发发送 3 次
         for _ in range(3):
             for bcast_addr in self.broadcast_addrs:
@@ -380,19 +479,27 @@ class Node(threading.Thread):
             self.gui.log(f"[警告] 全局广播 socket 创建失败: {e}")
 
     def _udp_broadcaster_on_sock(self, sock, bind_ip):
+        """周期性广播搜索（替代原来的每秒 announce）。
+
+        统一设备发现机制：
+          · 启动后前 5 秒：每 0.2 秒发一次搜索（快速发现）
+          · 之后：每 20 秒发一次搜索（低成本维持）
+          · 接收方收到 {discovery:true} 会立刻回 {reply:true}
+        这样"发现"完全依赖"请求→响应"，不再依赖对方是否在广播窗口。
+        """
         start_time = time.time()
         while self.running:
             try:
-                # 传输中暂停广播，避免干扰
                 if not self.pausing_network:
-                    msg = json.dumps({'hostname': self.hostname}).encode('utf-8')
+                    # 广播搜索包（带 device_id/mac，接收方回 reply）
+                    msg = self._build_msg(discovery=True)
                     if bind_ip:
                         cidr = get_subnet_for_ip(bind_ip)
                         if cidr:
                             try:
                                 net = ipaddress.IPv4Network(cidr, strict=False)
                                 bcast = str(net.broadcast_address)
-                            except:
+                            except Exception:
                                 bcast = '255.255.255.255'
                         else:
                             bcast = '255.255.255.255'
@@ -401,14 +508,64 @@ class Node(threading.Thread):
                         sock.sendto(msg, ('255.255.255.255', UDP_PORT))
             except Exception:
                 pass
-            # 前5秒爆发广播（0.2秒间隔），之后恢复1秒间隔
+            # 前 5 秒：爆发搜索（0.2s）；之后：常规（20s）
             if time.time() - start_time < BROADCAST_BURST_DURATION:
                 time.sleep(BROADCAST_BURST_INTERVAL)
             else:
-                time.sleep(BROADCAST_INTERVAL)
+                time.sleep(AUTO_SCAN_INTERVAL)  # 20 秒
         sock.close()
 
     # ---------- 节点管理 ----------
+    def _build_msg(self, **extra):
+        """构造出站 JSON 消息，自动带上 hostname / device_id / mac。"""
+        msg = {
+            'hostname': self.hostname,
+            'device_id': self.device_id,
+            'mac': self.mac,
+        }
+        msg.update(extra)
+        return json.dumps(msg).encode('utf-8')
+
+    def _upsert_node(self, remote_ip, msg, source='udp'):
+        """按 device_id 去重地插入/更新节点。
+
+        返回 True 表示是**新节点**（此前不存在）。
+        逻辑：
+          1. 若消息里带 device_id，且本机已有同一 device_id 的条目（IP 不同）
+             → 视为同一设备 IP 变化，删除旧 IP 条目
+          2. 按 remote_ip 插入/更新
+        """
+        device_id = msg.get('device_id', '') or ''
+        hostname = msg.get('hostname', remote_ip) or remote_ip
+        mac = msg.get('mac', '') or ''
+        is_new = False
+        with self.lock:
+            # 1) 同 device_id 但 IP 变了 → 迁移条目
+            if device_id:
+                for old_ip in list(self.nodes.keys()):
+                    if old_ip == remote_ip:
+                        continue
+                    if self.nodes[old_ip].get('device_id') == device_id:
+                        del self.nodes[old_ip]
+            # 2) 按 IP upsert
+            if remote_ip in self.nodes:
+                self.nodes[remote_ip]['hostname'] = hostname
+                self.nodes[remote_ip]['device_id'] = device_id
+                self.nodes[remote_ip]['mac'] = mac
+                self.nodes[remote_ip]['last_seen'] = time.time()
+                self.nodes[remote_ip]['heartbeat_fail'] = 0
+            else:
+                self.nodes[remote_ip] = {
+                    'hostname': hostname,
+                    'device_id': device_id,
+                    'mac': mac,
+                    'last_seen': time.time(),
+                    'source': source,
+                    'heartbeat_fail': 0,
+                }
+                is_new = True
+        return is_new
+
     def add_manual_node(self, ip, source='manual', hostname=None):
         with self.lock:
             self.nodes[ip] = {
@@ -429,12 +586,12 @@ class Node(threading.Thread):
             family = socket.AF_INET6 if ':' in ip else socket.AF_INET
             s = socket.socket(family, socket.SOCK_DGRAM)
             s.settimeout(2)
-            msg = json.dumps({'hostname': self.hostname}).encode('utf-8')
+            msg = self._build_msg()
             s.sendto(msg, (ip, UDP_PORT))
             # 也向SCAN_PORT发一份，覆盖扫描端口的监听
             try:
-                s.sendto(json.dumps({'hostname': self.hostname, 'scan_reply': True}).encode(), (ip, SCAN_PORT))
-            except:
+                s.sendto(self._build_msg(scan_reply=True), (ip, SCAN_PORT))
+            except Exception:
                 pass
             s.close()
             self.gui.log(f"[手动添加] 已向 {ip} 发送探测")
@@ -577,43 +734,43 @@ class Node(threading.Thread):
                     # 过滤所有本机回环地址和通配地址，绝不可能搜索到自己
                     if remote_ip in ('127.0.0.1', '::1', '0.0.0.0'):
                         continue
+                    # 处理"正常下线"通知：立即从设备列表移除（不等待心跳超时）
+                    if msg.get('bye'):
+                        with self.lock:
+                            if remote_ip in self.nodes:
+                                del self.nodes[remote_ip]
+                                removed = True
+                            else:
+                                removed = False
+                        if removed:
+                            self.gui.root.after(0, self.gui.refresh_nodes)
+                            self.gui.root.after(0, lambda ip=remote_ip, hn=msg.get('hostname', remote_ip):
+                                                self.gui.log(f"[发现] 设备 {hn} ({ip}) 已下线"))
+                        continue
                     # 处理心跳包，只更新时间不触发GUI刷新
                     if msg.get('heartbeat'):
                         with self.lock:
                             if remote_ip in self.nodes:
                                 self.nodes[remote_ip]['last_seen'] = time.time()
-                        reply = json.dumps({'heartbeat': True, 'ack': True}).encode('utf-8')
+                        reply = self._build_msg(heartbeat=True, ack=True)
                         sock.sendto(reply, (remote_ip, UDP_PORT))
                         continue
                     # 扫描回复或普通回复，收到即添加/更新节点
                     if msg.get('scan_reply') or msg.get('reply'):
-                        with self.lock:
-                            if remote_ip in self.nodes:
-                                self.nodes[remote_ip]['last_seen'] = time.time()
-                            else:
-                                self.nodes[remote_ip] = {
-                                    'hostname': msg.get('hostname', remote_ip),
-                                    'last_seen': time.time(),
-                                    'source': 'udp',
-                                    'heartbeat_fail': 0
-                                }
-                                self.gui.root.after(0, self.gui.refresh_nodes)
-                                # 新节点上线，检查续传
-                                threading.Thread(target=self.check_resume_on_online, args=(remote_ip, msg.get('hostname', remote_ip)), daemon=True).start()
+                        is_new = self._upsert_node(remote_ip, msg, source='udp')
+                        if is_new:
+                            self.gui.root.after(0, self.gui.refresh_nodes)
+                            hn = msg.get('hostname', remote_ip)
+                            threading.Thread(target=self.check_resume_on_online, args=(remote_ip, hn), daemon=True).start()
                         continue
-                    with self.lock:
-                        self.nodes[remote_ip] = {
-                            'hostname': msg.get('hostname', remote_ip),
-                            'last_seen': time.time(),
-                            'source': 'udp',
-                            'heartbeat_fail': 0
-                        }
-                    self.gui.root.after(0, self.gui.refresh_nodes)
-                    # 新节点上线，检查续传
-                    threading.Thread(target=self.check_resume_on_online, args=(remote_ip, msg.get('hostname', remote_ip)), daemon=True).start()
+                    # 普通广播：upsert + 回 reply
+                    is_new = self._upsert_node(remote_ip, msg, source='udp')
+                    if is_new:
+                        self.gui.root.after(0, self.gui.refresh_nodes)
+                        hn = msg.get('hostname', remote_ip)
+                        threading.Thread(target=self.check_resume_on_online, args=(remote_ip, hn), daemon=True).start()
                     if not msg.get('reply'):
-                        reply = json.dumps({'hostname': self.hostname, 'reply': True}).encode('utf-8')
-                        sock.sendto(reply, (remote_ip, UDP_PORT))
+                        sock.sendto(self._build_msg(reply=True), (remote_ip, UDP_PORT))
                 except socket.timeout:
                     continue
                 except OSError:
@@ -677,7 +834,7 @@ class Node(threading.Thread):
                     if remote_ip in ('127.0.0.1', '::1', '0.0.0.0'):
                         continue
                     # 回复主机名，同时向 SCAN_PORT 和 UDP_PORT 回复，确保对方能收到
-                    reply = json.dumps({'hostname': self.hostname, 'scan_reply': True}).encode('utf-8')
+                    reply = self._build_msg(scan_reply=True)
                     for port in (SCAN_PORT, UDP_PORT):
                         try:
                             sock.sendto(reply, (remote_ip, port))
@@ -1211,10 +1368,11 @@ class Node(threading.Thread):
         # 保存接收方初始续传状态（从当前偏移量开始）
         save_resume_state(addr[0], str(save_path), offset, file_size, 0, role='recv')
         last_progress_save = [0.0]  # 上次实时保存进度的时间
+        _tracker = SpeedTracker()    # 瞬时速度追踪器
 
-        def progress_cb(received, total, start):
-            elapsed = time.time() - start
-            speed = (received - offset) / elapsed if elapsed > 0 else 0
+        def progress_cb(received, total, start, _tracker=_tracker):
+            # 瞬时速度（滑动窗口 2 秒），比累计平均更贴合实际
+            speed = _tracker.update(received)
             remaining = (total - received) / speed if speed > 0 else 0
             percent = (received / total) * 100
             speed_str = format_speed(speed)
@@ -1439,21 +1597,35 @@ class Node(threading.Thread):
                 # 保存接收方文件夹续传初始状态
                 save_folder_resume_state(addr[0], folder_name, recv_rel_path, cur_offset, file_size, 0)
 
-                # 使用列表作为可变容器来追踪累计接收量
-                received_counter = [received_global]
+                # 修正：progress_cb 的 received 是「当前文件的累计接收量」（含续传起点 cur_offset），
+                # 全局进度应 = 已完成文件总字节（received_global） + 当前文件本次实际接收量（received - cur_offset）。
+                # 之前直接 += received 会导致重复累加（曾出现 908% 的 bug）。
+                _file_off = cur_offset if resume else 0
+                _base = received_global
+                _tracker = SpeedTracker()   # 瞬时速度追踪器
                 def make_progress_cb():
                     _rel_path = recv_rel_path  # 闭包捕获当前文件路径
-                    def progress_cb(received, total, start):
-                        received_counter[0] += received
-                        total_received = received_counter[0]
-                        elapsed = time.time() - start_time
-                        speed = total_received / elapsed if elapsed > 0 else 0
-                        remaining = (total_bytes - total_received) / speed if speed > 0 else 0
-                        percent = (total_received / total_bytes) * 100 if total_bytes else 0
+                    _size = file_size
+                    def progress_cb(received, total, start, _tracker=_tracker):
+                        # 当前文件本次已收字节（去掉续传起点）
+                        file_received = max(0, received - _file_off)
+                        # 全局累计 = 已完成文件总字节 + 当前文件本次已收
+                        total_received = _base + file_received
+                        # 瞬时速度（用全局累计追踪，反映当前网络状况）
+                        speed = _tracker.update(total_received)
                         speed_str = format_speed(speed)
-                        remain_str = format_time(remaining)
-                        self.gui.root.after(0, lambda p=percent, s=speed_str, r=remain_str: self.gui.update_recv_progress(p, s, r))
-                        self.gui.root.after(0, lambda: self.gui.set_status(f"接收文件夹 {folder_name}: {human_size(total_received)} / {human_size(total_bytes)}  {speed_str}  剩余 {remain_str}"))
+
+                        # ---------- 接收进度：当前**文件**的进度 ----------
+                        file_percent = min(100.0, (file_received / _size) * 100) if _size > 0 else 0.0
+                        file_remain = (_size - file_received) / speed if speed > 0 else 0
+                        self.gui.root.after(0, lambda p=file_percent, s=speed_str, r=format_time(file_remain):
+                                            self.gui.update_recv_progress(p, s, r))
+
+                        # ---------- 状态栏：全局字节进度 ----------
+                        global_remain = (total_bytes - total_received) / speed if speed > 0 else 0
+                        self.gui.root.after(0, lambda tr=total_received, s=speed_str, r=format_time(global_remain):
+                                            self.gui.set_status(f"接收文件夹 {folder_name}: {human_size(tr)} / {human_size(total_bytes)}  {s}  剩余 {r}"))
+
                         # 实时保存每个文件的进度
                         save_folder_resume_state(addr[0], folder_name, _rel_path, received, total, 0)
                     return progress_cb
@@ -1501,7 +1673,10 @@ class Node(threading.Thread):
             if not file_ok:
                 self.gui.log(f"[接收]   ✗ {rel_path} 重试{MAX_RETRIES}次均失败，放弃")
                 failed += 1
-            received_global += size
+            else:
+                # 只有成功的文件才计入"已完成总量"（与发送端 sent_counter 对齐），
+                # 否则失败文件会污染进度基准和最终平均速度统计。
+                received_global += size
 
         self.gui.root.after(0, lambda: self.gui.update_recv_progress(0))
         elapsed = time.time() - start_time
@@ -1585,8 +1760,12 @@ class Node(threading.Thread):
         start_time = time.time()
         MAX_RETRIES = 3
         failed_items = []
-        # 使用列表作为可变容器来追踪累计发送量
-        sent_counter = [sent_global]
+        # sent_counter[0] 表示「已成功完成的文件总字节数」。
+        # 注意：当前文件的实时进度不累加到这里，而是每次回调时用
+        # 「已完成文件总和 + 当前文件相对进度」现算 —— 因为 progress_cb
+        # 的 sent 参数是**当前文件的累计发送量**（含续传起点），
+        # 直接 += 会导致重复累加（曾出现 908% 的 bug）。
+        sent_counter = [0]
 
         for idx in range(file_count):
             rel_path, size, mtime = manifest[idx]
@@ -1616,6 +1795,11 @@ class Node(threading.Thread):
 
             # 保存发送方文件夹续传状态
             save_folder_resume_state(target_ip, folder_name, rel_path, offset, size, mtime)
+
+            # 进入本文件发送前的全局累计（已完成文件总字节）
+            file_base = sent_counter[0]
+            # 本文件的续传起点（若为 resume 则从 offset 处开始，否则 0）
+            file_start_offset = offset if act == 'resume' else 0
 
             file_ok = False
             for attempt in range(MAX_RETRIES):
@@ -1663,19 +1847,48 @@ class Node(threading.Thread):
                     return
 
                 # 发送数据
-                def progress_cb(sent, total, start):
-                    sent_counter[0] += sent
-                    total_sent = sent_counter[0]
-                    elapsed = time.time() - start_time
-                    speed = total_sent / elapsed if elapsed > 0 else 0
-                    remaining = (total_bytes - total_sent) / speed if speed > 0 else 0
-                    percent = (total_sent / total_bytes) * 100 if total_bytes else 0
+                # progress_cb 的 sent 参数是「当前文件的累计发送量」（含续传起点 offset），
+                # 因此：
+                #   本地文件进度 = file_base + (sent - file_start_offset)
+                #   全局字节增量 = 本次 sent 与上次上报值的差
+                # 用闭包默认参数固化可变值，避免循环延迟绑定陷阱。
+                _last_sent = [file_start_offset]   # 上次上报的 sent（用于算增量）
+                _speed_tracker = SpeedTracker()    # 瞬时速度追踪器（滑动窗口 2 秒）
+
+                def progress_cb(sent, total, start,
+                                _base=file_base,
+                                _file_off=file_start_offset,
+                                _rel_path=rel_path,
+                                _size=size,
+                                _mtime=mtime,
+                                _last=_last_sent,
+                                _tracker=_speed_tracker):
+                    # 当前文件本次已传字节（去掉续传起点）
+                    file_sent = max(0, sent - _file_off)
+                    # 全局累计 = 已完成文件总字节 + 当前文件本次已传
+                    total_sent = _base + file_sent
+                    # 瞬时速度（用全局累计追踪，反映当前网络状况）
+                    speed = _tracker.update(total_sent)
                     speed_str = format_speed(speed)
-                    remain_str = format_time(remaining)
-                    self.gui.root.after(0, lambda p=percent, s=speed_str, r=remain_str: self.gui.update_send_progress(p, s, r))
-                    self.gui.root.after(0, lambda: self.gui.set_status(f"发送文件夹 {folder_name}: {human_size(total_sent)} / {human_size(total_bytes)}  {speed_str}  剩余 {remain_str}"))
+
+                    # ---------- 当前发送：当前**文件**的进度 ----------
+                    file_percent = min(100.0, (file_sent / _size) * 100) if _size > 0 else 0.0
+                    file_remain = (_size - file_sent) / speed if speed > 0 else 0
+                    self.gui.root.after(0, lambda p=file_percent, s=speed_str, r=format_time(file_remain):
+                                        self.gui.update_send_progress(p, s, r))
+
+                    # ---------- 状态栏：全局字节进度 ----------
+                    global_remain = (total_bytes - total_sent) / speed if speed > 0 else 0
+                    self.gui.root.after(0, lambda ts=total_sent, s=speed_str, r=format_time(global_remain):
+                                        self.gui.set_status(f"发送文件夹 {folder_name}: {human_size(ts)} / {human_size(total_bytes)}  {s}  剩余 {r}"))
+
+                    # 全局字节增量（线程安全）
+                    delta = sent - _last[0]
+                    if delta > 0:
+                        _last[0] = sent
+                        self.gui.add_global_sent_bytes(delta)
                     # 实时保存每个文件的进度
-                    save_folder_resume_state(target_ip, folder_name, rel_path, sent, size, mtime)
+                    save_folder_resume_state(target_ip, folder_name, _rel_path, sent, _size, _mtime)
 
                 try:
                     if compress and temp_data is not None:
@@ -1693,6 +1906,7 @@ class Node(threading.Thread):
                     if result == b'MATCH':
                         self.gui.log(f"[发送]   ✓ {rel_path} 校验通过")
                         sent_global += size
+                        sent_counter[0] += size   # 当前文件完成，累加到「已完成总量」
                         file_ok = True
                         # 删除该文件的续传状态
                         delete_folder_resume_state(target_ip, folder_name, rel_path)
@@ -1919,15 +2133,22 @@ class Node(threading.Thread):
         self.gui.set_status(f"发送 {filename} ...")
         start_time = time.time()
         last_progress_save = [0.0]  # 上次实时保存进度的时间
-        def progress_cb(sent, total, start):
-            elapsed = time.time() - start
-            speed = (sent - offset) / elapsed if elapsed > 0 else 0
+        _last_sent = [offset]        # 上次上报的 sent（用于算全局增量）
+        _tracker = SpeedTracker()    # 瞬时速度追踪器
+        def progress_cb(sent, total, start, _last=_last_sent, _tracker=_tracker):
+            # 瞬时速度（滑动窗口）；用 sent 直接追踪（含续传起点也 OK）
+            speed = _tracker.update(sent)
             remaining = (total - sent) / speed if speed > 0 else 0
             percent = (sent / total) * 100
             speed_str = format_speed(speed)
             remain_str = format_time(remaining)
             self.gui.root.after(0, lambda p=percent, s=speed_str, r=remain_str: self.gui.update_send_progress(p, s, r))
             self.gui.root.after(0, lambda: self.gui.set_status(f"发送 {filename}: {human_size(sent)} / {human_size(total)}  {speed_str}  剩余 {remain_str}"))
+            # 全局字节增量（线程安全）
+            delta = sent - _last[0]
+            if delta > 0:
+                _last[0] = sent
+                self.gui.add_global_sent_bytes(delta)
             # 每5秒或每10%实时保存进度
             now = time.time()
             if now - last_progress_save[0] >= 5 or (sent - offset) % max(1, total // 10) < 1024*1024:
@@ -2036,7 +2257,7 @@ class P2PApp:
                 self.root = tk.Tk()
         else:
             self.root = tk.Tk()
-        self.root.title("文件互传 V15.0 - 支持拖拽发送")
+        self.root.title("文件互传 V15.2 - 支持拖拽发送")
         self.root.geometry("1200x700")
         self.root.resizable(True, True)
 
@@ -2047,24 +2268,107 @@ class P2PApp:
         self._items_lock = threading.Lock()
         # 用于记录 Tk after() 返回的定时器 ID，退出时批量取消
         self._after_ids = []
+        # 发送进行中标志（防止重复点"极速发送"导致文件发多遍）
+        self._sending = False
+
+        # ===== 全局进度（字节级） =====
+        # global_total_bytes: 本次发送的总字节数 = 单 IP 项目总字节 × 目标 IP 数
+        # global_sent_bytes:  所有 IP 线程已发送字节之和（受 _global_progress_lock 保护）
+        # 语义：跨设备、跨文件的"整体完成度"，与"当前发送"（当前文件）互补。
+        self.global_total_bytes = 0
+        self.global_sent_bytes = 0
+        self._global_progress_lock = threading.Lock()
+        # UI 更新节流：上次刷新全局进度条的时间戳
+        self._last_global_ui_update = 0.0
         # IPC 服务器运行标记（on_close 时置 False，让监听线程退出）
         self._ipc_running = True
 
         self._build_ui()
 
-        # 加载图标
-        try:
-            # 如果是打包后的 exe，资源路径在 sys._MEIPASS
-            if getattr(sys, 'frozen', False):
-                base_path = sys._MEIPASS
-            else:
-                base_path = os.path.dirname(os.path.abspath(__file__))
-            icon_path = os.path.join(base_path, 'icon.ico')
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(default=icon_path)
+        # 加载图标（多重尝试，兼容 exe 打包 / 脚本运行 / 多网卡场景）
+        self._apply_icon()
 
-        except Exception as e:
-            self.log(f"加载图标失败: {e}")
+    def _apply_icon(self):
+        r"""为窗口设置图标。
+
+        关键：**把 ico 复制到纯 ASCII 路径后再设置**。
+        Windows 下 Tk 的 iconbitmap() 底层调用 Win32 LoadImage，
+        它把 Python str 用**系统 ANSI 代码页**编码为字节传给 API。
+        当路径含中文（如 C:Users...文件互传电脑端icon.ico）时，
+        ANSI 编码可能损坏路径 -> LoadImage 找不到文件 -> 静默失败（返回默认图标）。
+        Tk 不会抛异常，所以现象是"代码执行了但图标还是羽毛"。
+
+        解决：把 ico 复制到 %TEMP%p2p_file_transfer.ico（纯 ASCII），
+        用这个临时副本设置图标。TEMP 通常都是纯 ASCII 路径。
+        """
+        import shutil
+        import tempfile
+
+        # 1) 收集候选路径
+        candidates = []
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            candidates.append(os.path.join(meipass, 'icon.ico'))
+        if getattr(sys, 'frozen', False):
+            candidates.append(os.path.join(os.path.dirname(sys.executable), 'icon.ico'))
+        else:
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico'))
+        candidates.append(os.path.join(os.getcwd(), 'icon.ico'))
+
+        src = None
+        for p in candidates:
+            try:
+                if p and os.path.isfile(p):
+                    src = p
+                    break
+            except Exception:
+                continue
+
+        if not src:
+            return
+
+        # 2) 复制到纯 ASCII 临时路径
+        target = os.path.join(tempfile.gettempdir(), "p2p_file_transfer.ico")
+        try:
+            if os.path.abspath(src).lower() != os.path.abspath(target).lower():
+                shutil.copyfile(src, target)
+            chosen = target
+        except Exception:
+            chosen = src
+
+        # 3) 更新 idle 任务，确保窗口已创建
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+        # 4) 多重方式尝试设置
+        ok = False
+        try:
+            self.root.iconbitmap(default=chosen)
+            ok = True
+        except Exception:
+            pass
+        if not ok:
+            try:
+                self.root.iconbitmap(chosen)
+                ok = True
+            except Exception:
+                pass
+        if not ok:
+            try:
+                self.root.wm_iconbitmap(chosen)
+                ok = True
+            except Exception:
+                pass
+        if not ok:
+            try:
+                self.root.tk.call('wm', 'iconbitmap', self.root._w, chosen)
+                ok = True
+            except Exception:
+                pass
+
+        # 静默处理：图标加载成功与否不影响功能，不记录日志
 
         self.load_config()
         self.node = Node(self)
@@ -2148,7 +2452,8 @@ class P2PApp:
         ttk.Button(btn_frame, text="上移", command=self.move_up).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="下移", command=self.move_down).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="清空列表", command=self.clear_items).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="极速发送", command=self.send_items_action).pack(side=tk.RIGHT, padx=5)
+        self.send_btn = ttk.Button(btn_frame, text="极速发送", command=self.send_items_action)
+        self.send_btn.pack(side=tk.RIGHT, padx=5)
 
         # ---- 进度条（位于主框架下方） ----
         prog_frame = ttk.LabelFrame(self.root, text="传输进度", padding=10)
@@ -2298,12 +2603,7 @@ class P2PApp:
         with self.node.lock:
             items = sorted(self.node.nodes.items(), key=lambda x: x[1]['last_seen'], reverse=True)
         for ip, node in items:
-            if node['source'] == 'manual':
-                display = f"手动添加 ({ip})"
-            elif node['source'] == 'scan':
-                display = f"{node['hostname']} ({ip})"
-            else:
-                display = f"{node['hostname']} ({ip})"
+            display = f"{node['hostname']} ({ip})"
             self.node_listbox.insert(tk.END, display)
         new_selection = set()
         for i in range(self.node_listbox.size()):
@@ -2347,6 +2647,11 @@ class P2PApp:
 
     # ---------- 进度更新 ----------
     def update_send_progress(self, percent, speed_str=None, remain_str=None):
+        # 防御性夹紧：任何调用方传越界值都夹到 0~100，避免出现 908% 这类显示
+        try:
+            percent = max(0.0, min(100.0, float(percent)))
+        except (TypeError, ValueError):
+            percent = 0.0
         self.send_progress['value'] = percent
         if speed_str is not None and remain_str is not None:
             self.send_info_label.config(text=f"{percent:.1f}% ({speed_str}, {remain_str})")
@@ -2354,6 +2659,10 @@ class P2PApp:
             self.send_info_label.config(text=f"{percent:.1f}%")
 
     def update_recv_progress(self, percent, speed_str=None, remain_str=None):
+        try:
+            percent = max(0.0, min(100.0, float(percent)))
+        except (TypeError, ValueError):
+            percent = 0.0
         self.recv_progress['value'] = percent
         if speed_str is not None and remain_str is not None:
             self.recv_info_label.config(text=f"{percent:.1f}% ({speed_str}, {remain_str})")
@@ -2361,6 +2670,7 @@ class P2PApp:
             self.recv_info_label.config(text=f"{percent:.1f}%")
 
     def increment_global_progress(self):
+        """（旧接口）按"完成项目数"推进全局进度。保留以兼容，仅用于项目结束时的兜底。"""
         self.finished_tasks += 1
         if self.total_tasks > 0:
             percent = (self.finished_tasks / self.total_tasks) * 100
@@ -2368,6 +2678,61 @@ class P2PApp:
             self.global_info_label.config(text=f"{percent:.1f}%")
         else:
             self.global_info_label.config(text="0.0%")
+
+    # ---------- 全局字节进度 ----------
+
+    def add_global_sent_bytes(self, delta):
+        """线程安全地累加"已发送字节"，并按需刷新全局进度条。
+
+        调用点：所有发送线程的 progress_cb 里，传入"本次新增的字节数"（增量）。
+        注意 delta 必须是**增量**而不是累计值，否则会重复累加（曾出现 908% bug）。
+        """
+        if delta <= 0:
+            return
+        with self._global_progress_lock:
+            self.global_sent_bytes += delta
+            sent = self.global_sent_bytes
+            total = self.global_total_bytes
+
+        # UI 节流：最快每 100ms 刷一次（避免每个 chunk 都刷导致卡顿）
+        now = time.time()
+        if now - self._last_global_ui_update < 0.1 and sent < total:
+            return
+        self._last_global_ui_update = now
+
+        percent = min(100.0, (sent / total) * 100) if total > 0 else 0.0
+        self.root.after(0, lambda p=percent, s=sent, t=total: self._update_global_progress_ui(p, s, t))
+
+    def _update_global_progress_ui(self, percent, sent, total):
+        try:
+            percent = max(0.0, min(100.0, float(percent)))
+        except (TypeError, ValueError):
+            percent = 0.0
+        try:
+            self.global_progress['value'] = percent
+            if total > 0:
+                self.global_info_label.config(
+                    text=f"{percent:.1f}% ({human_size(sent)} / {human_size(total)})"
+                )
+            else:
+                self.global_info_label.config(text=f"{percent:.1f}%")
+            # 每 5% 变化记一次日志（便于诊断进度是否在动）
+            bucket = int(percent // 5)
+            last_bucket = getattr(self, '_global_log_bucket', -1)
+            if bucket != last_bucket:
+                self._global_log_bucket = bucket
+                if bucket % 2 == 0:  # 每 10% 记一次，避免刷屏
+                    self.log(f"[进度] 全局: {percent:.1f}%  ({human_size(sent)} / {human_size(total)})")
+        except Exception:
+            pass
+
+    def _reset_global_progress(self, total_bytes):
+        """开始新一轮发送前重置全局进度状态。"""
+        with self._global_progress_lock:
+            self.global_total_bytes = total_bytes
+            self.global_sent_bytes = 0
+        self._last_global_ui_update = 0.0
+        self.root.after(0, lambda: self._update_global_progress_ui(0.0, 0, total_bytes))
 
     # ---------- 文件选择 ----------
     def add_files(self):
@@ -2390,6 +2755,10 @@ class P2PApp:
         self._refresh_item_listbox()
 
     def send_items_action(self):
+        # 防重：正在发送中则忽略（避免用户连点导致同一批文件发多遍）
+        if self._sending:
+            self.log("[发送] 正在发送中，请等待当前任务完成")
+            return
         if not self.selected_ips:
             messagebox.showwarning("未选择设备", "请先在设备列表中选中至少一台设备")
             return
@@ -2400,16 +2769,50 @@ class P2PApp:
             messagebox.showwarning("列表为空", "请添加要发送的文件或文件夹")
             return
 
-        target_ips = list(self.selected_ips)
+        # 去重 IP（防御性）
+        target_ips = list(set(self.selected_ips))
         self.total_tasks = len(target_ips) * len(items)
         self.finished_tasks = 0
-        self.global_progress['value'] = 0
-        self.global_info_label.config(text="0.0%")
-
         self._send_lock = threading.Lock()
+        self._sending = True
+        # 禁用发送按钮（视觉上明确"发送中"）
+        try:
+            self.send_btn.config(text="发送中...", state='disabled')
+        except Exception:
+            pass
+
+        # 全局进度的初始状态：先置 0%，异步计算总字节后再更新（大文件夹遍历较慢）
+        self.root.after(0, lambda: self._update_global_progress_ui(0.0, 0, 0))
+        self.global_info_label.config(text="计算中...")
 
         # 在后台线程中执行发送，避免阻塞UI
         def do_send():
+            # 1) 预计算单 IP 视角的总字节（文件大小 + 文件夹递归）
+            single_ip_bytes = 0
+            for path, is_folder in items:
+                if is_folder:
+                    try:
+                        for root, _dirs, files in os.walk(path):
+                            for f in files:
+                                try:
+                                    single_ip_bytes += os.path.getsize(os.path.join(root, f))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        single_ip_bytes += os.path.getsize(path)
+                    except Exception:
+                        pass
+            # 全局总字节 = 单 IP 字节 × 目标设备数（每台设备都要完整传一遍）
+            total_bytes = single_ip_bytes * len(target_ips)
+            self._reset_global_progress(total_bytes)
+            self.root.after(0, lambda: self.log(
+                f"[发送] 全局进度基准: {human_size(single_ip_bytes)} × {len(target_ips)} 台设备 = {human_size(total_bytes)}"
+            ))
+
+            # 2) 每台设备一个线程，串行发送该项目列表
             threads = []
             for ip in target_ips:
                 t = threading.Thread(target=self._send_to_one_ip, args=(ip, items), daemon=True)
@@ -2417,8 +2820,20 @@ class P2PApp:
                 threads.append(t)
             for t in threads:
                 t.join()
+
+            # 3) 全部完成：强制置 100%（避免浮点误差或跳过文件的残留偏差）
+            with self._global_progress_lock:
+                self.global_sent_bytes = self.global_total_bytes
+            self.root.after(0, lambda: self._update_global_progress_ui(100.0, self.global_total_bytes, self.global_total_bytes))
             self.root.after(0, self.clear_items)
             self.root.after(0, lambda: self.log("[发送] 所有项目发送完成"))
+            # 解除"发送中"状态（无论成功/失败）
+            self._sending = False
+            # 恢复按钮（在主线程执行）
+            try:
+                self.root.after(0, lambda: self.send_btn.config(text="极速发送", state='normal'))
+            except Exception:
+                pass
 
         threading.Thread(target=do_send, daemon=True).start()
 
@@ -2428,9 +2843,7 @@ class P2PApp:
         def on_item_done(path, success):
             with self._send_lock:
                 self.finished_tasks += 1
-                percent = (self.finished_tasks / self.total_tasks) * 100
-                self.root.after(0, lambda p=percent: self.global_progress.configure(value=p))
-                self.root.after(0, lambda p=percent: self.global_info_label.config(text=f"{p:.1f}%"))
+                # 日志：每个项目完成后的结果
                 self.root.after(0, lambda s=success, pt=path: self.log(f"[发送] {'✓' if s else '✗'} {pt}"))
         self.node.send_files(ip, items, callback=on_item_done)
 
@@ -2440,14 +2853,118 @@ class P2PApp:
         self.start_ipc_server()
         self.root.mainloop()
 
+    def _broadcast_bye(self):
+        """发送"正常下线"通知，让其他设备立即从列表中移除本机。
+
+        双重投递策略：
+          1. 单播 —— 向已知节点列表里的每个 IP:UDP_PORT 各发一份
+             （最可靠，可穿透路由器/跨网段，不依赖广播能力）
+          2. 广播 —— 向本机所有网卡的广播地址 + 255.255.255.255 各发一份
+             （覆盖那些尚未进入 nodes 列表或刚上线的设备）
+
+        必须在关闭 socket 之前调用（on_close 第 0 步）。
+        尽力而为：单次发送 0.3s 超时，任何失败都不阻塞退出。
+        """
+        try:
+            hostname = getattr(self.node, 'hostname', 'unknown')
+        except Exception:
+            hostname = 'unknown'
+        bye = json.dumps({'hostname': hostname, 'bye': True}).encode('utf-8')
+
+        # ---------- 1) 单播：向已知节点 ----------
+        # 加锁快照，避免遍历时其它线程修改 dict
+        try:
+            with self.node.lock:
+                peer_ips = list(self.node.nodes.keys())
+        except Exception:
+            peer_ips = []
+
+        unicast_v4 = [ip for ip in peer_ips if ':' not in ip]
+        unicast_v6 = [ip for ip in peer_ips if ':' in ip]
+        unicast_ok = 0
+        unicast_fail = 0
+
+        # IPv4 单播（一个 socket 复用，减少创建开销）
+        if unicast_v4:
+            try:
+                s4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s4.settimeout(0.3)
+                for ip in unicast_v4:
+                    try:
+                        s4.sendto(bye, (ip, UDP_PORT))
+                        unicast_ok += 1
+                    except Exception:
+                        unicast_fail += 1
+                try:
+                    s4.close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # IPv6 单播
+        if unicast_v6:
+            try:
+                s6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+                s6.settimeout(0.3)
+                for ip in unicast_v6:
+                    try:
+                        s6.sendto(bye, (ip, UDP_PORT))
+                        unicast_ok += 1
+                    except Exception:
+                        unicast_fail += 1
+                try:
+                    s6.close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # ---------- 2) 广播：兜底 ----------
+        targets = list(getattr(self.node, 'broadcast_addrs', []) or [])
+        if '255.255.255.255' not in targets:
+            targets.append('255.255.255.255')
+
+        bcast_ok = 0
+        for bcast in targets:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.settimeout(0.3)
+                s.sendto(bye, (bcast, UDP_PORT))
+                s.close()
+                bcast_ok += 1
+            except Exception:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+        # ---------- 日志 ----------
+        try:
+            msg = f"[退出] 已发送下线通知：单播 {unicast_ok} 台设备"
+            if unicast_fail:
+                msg += f"（{unicast_fail} 台失败）"
+            msg += f"，广播 {bcast_ok} 个地址"
+            self.log(msg)
+        except Exception:
+            pass
+
     def on_close(self):
         """干净退出：
+        0. 广播"下线通知"，让其他设备立即从列表移除本机
         1. 停止所有网络线程（设置 running=False，监听 socket 有 1s 超时会让循环自然退出）
         2. 关闭所有监听/广播 socket（辅助唤醒阻塞的 recvfrom/accept）
         3. 取消 Tk 的 after 定时任务
         4. 销毁窗口
         5. 1 秒后仍存活则强制 os._exit（兜底）
         """
+        # 0) 先广播下线通知（必须在关闭 socket 之前）
+        try:
+            self._broadcast_bye()
+        except Exception:
+            pass
+
         try:
             self.node.running = False
         except Exception:

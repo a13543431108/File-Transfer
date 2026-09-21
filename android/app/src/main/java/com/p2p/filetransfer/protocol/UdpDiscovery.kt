@@ -40,6 +40,10 @@ import java.net.InetSocketAddress
 class UdpDiscovery(
     private val deviceRepo: DeviceRepository,
     private val log: (String) -> Unit,
+    /** 持久化设备 UUID（识别主键，跨重启不变） */
+    private val deviceId: String,
+    /** 参考 MAC（可为空） */
+    private val mac: String,
     private val onNewDevice: (String, String) -> Unit
 ) {
 
@@ -58,6 +62,17 @@ class UdpDiscovery(
     private val hostname: String get() = _hostname.value
 
     private val myIps: Set<String> = (NetworkUtil.getLocalIPv4List() + NetworkUtil.getLocalIPv6List()).toSet()
+
+    /** 构造出站消息（自动带 hostname / device_id / mac） */
+    private fun buildMsg(vararg extra: Pair<String, Any?>): String {
+        val m = mutableMapOf<String, Any?>(
+            "hostname" to hostname,
+            "device_id" to deviceId,
+            "mac" to mac,
+        )
+        for ((k, v) in extra) m[k] = v
+        return gson.toJson(m)
+    }
 
     /** 修改本机设备名（唯一入口，立即生效于下次广播/心跳/回复） */
     fun setHostname(newName: String) {
@@ -99,6 +114,10 @@ class UdpDiscovery(
     }
 
     fun stop() {
+        // 先广播"正常下线"通知，让其他设备立即从列表移除本机。
+        // 注意：必须在关闭 socket / 停止 running 之前执行（发送是同步的、尽力而为）。
+        try { sendByeBroadcast() } catch (_: Exception) {}
+
         running = false
         udpListenerJob?.cancel()
         udpListenerV6Job?.cancel()
@@ -107,6 +126,78 @@ class UdpDiscovery(
         broadcasterJob?.cancel()
         autoScanJob?.cancel()
         cleanJob?.cancel()
+    }
+
+    /**
+     * 发送"正常下线"通知：`{"hostname":"xxx","bye":true}`
+     *
+     * 双重投递：
+     *   1. 单播 —— 向已知节点列表里的每个 IP:UDP_PORT 各发一份（最可靠）
+     *   2. 广播 —— 向本机所有网卡的广播地址 + 255.255.255.255 各发一份（兜底）
+     *
+     * 同步执行（不挂起），因为调用方 UdpDiscovery.stop() 是普通函数。
+     * UDP 发送不阻塞，总共几十毫秒；发送失败也不影响退出。
+     */
+    private fun sendByeBroadcast() {
+        val msg = buildMsg("bye" to true)
+        val bytes = msg.toByteArray(Charsets.UTF_8)
+
+        // ---------- 1) 单播：向已知节点 ----------
+        val peerIps = try {
+            deviceRepo.snapshot().map { it.ip }
+        } catch (_: Exception) {
+            emptyList()
+        }
+        var unicastOk = 0
+        var unicastFail = 0
+        if (peerIps.isNotEmpty()) {
+            val socket = try { DatagramSocket() } catch (_: Exception) { null }
+            if (socket != null) {
+                try {
+                    socket.broadcast = true
+                    for (ip in peerIps) {
+                        try {
+                            socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(ip), Constants.UDP_PORT))
+                            unicastOk++
+                        } catch (_: Exception) {
+                            unicastFail++
+                        }
+                    }
+                } finally {
+                    try { socket.close() } catch (_: Exception) {}
+                }
+            }
+        }
+
+        // ---------- 2) 广播：兜底 ----------
+        var bcastOk = 0
+        val socket = try {
+            DatagramSocket().apply { broadcast = true }
+        } catch (_: Exception) {
+            null
+        }
+        if (socket != null) {
+            try {
+                for (ip in NetworkUtil.getLocalIPv4List()) {
+                    try {
+                        socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(broadcastAddressFor(ip)), Constants.UDP_PORT))
+                        bcastOk++
+                    } catch (_: Exception) {}
+                }
+                try {
+                    socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName("255.255.255.255"), Constants.UDP_PORT))
+                    bcastOk++
+                } catch (_: Exception) {}
+            } finally {
+                try { socket.close() } catch (_: Exception) {}
+            }
+        }
+
+        // ---------- 日志 ----------
+        var logMsg = "[退出] 已发送下线通知：单播 " + unicastOk + " 台设备"
+        if (unicastFail > 0) logMsg += "（" + unicastFail + " 台失败）"
+        logMsg += "，广播 " + bcastOk + " 个地址"
+        log(logMsg)
     }
 
     fun startAutoScan(parentScope: CoroutineScope) {
@@ -173,11 +264,22 @@ class UdpDiscovery(
             return
         }
 
+        // 正常下线通知：立即移除该设备，不等待心跳/超时
+        if (msg["bye"] == true) {
+            val existed = deviceRepo.has(remoteIp)
+            deviceRepo.remove(remoteIp)
+            if (existed) {
+                val hn = (msg["hostname"] as? String) ?: remoteIp
+                log("[发现] 设备 " + hn + " (" + remoteIp + ") 已下线")
+            }
+            return
+        }
+
         // 心跳包
         if (msg["heartbeat"] == true) {
             deviceRepo.touch(remoteIp)
             try {
-                val reply = gson.toJson(mapOf("heartbeat" to true, "ack" to true))
+                val reply = buildMsg("heartbeat" to true, "ack" to true)
                 val bytes = reply.toByteArray(Charsets.UTF_8)
                 socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(remoteIp), Constants.UDP_PORT))
             } catch (_: Exception) {}
@@ -185,10 +287,31 @@ class UdpDiscovery(
         }
 
         val remoteHost = (msg["hostname"] as? String) ?: remoteIp
+        val remoteDeviceId = (msg["device_id"] as? String) ?: ""
+        val remoteMac = (msg["mac"] as? String) ?: ""
         val isScanReply = msg["scan_reply"] == true
         val isReply = msg["reply"] == true
 
-        val isNew = deviceRepo.upsert(remoteIp, remoteHost, if (isScanReply || isReply) "udp" else "udp")
+        // 按 device_id 去重：同一台设备的旧 IP 条目要迁移到新 IP
+        if (remoteDeviceId.isNotEmpty()) {
+            try {
+                val stale = deviceRepo.snapshot().filter {
+                    it.ip != remoteIp && it.deviceId == remoteDeviceId
+                }
+                for (old in stale) {
+                    deviceRepo.remove(old.ip)
+                    log("[发现] 设备 " + remoteHost + " IP 变化: " + old.ip + " → " + remoteIp)
+                }
+            } catch (_: Exception) {}
+        }
+
+        val isNew = deviceRepo.upsert(
+            ip = remoteIp,
+            hostname = remoteHost,
+            source = if (isScanReply) "scan" else "udp",
+            deviceId = remoteDeviceId,
+            mac = remoteMac
+        )
         if (isNew) {
             onNewDevice(remoteIp, remoteHost)
         }
@@ -196,7 +319,7 @@ class UdpDiscovery(
         // 普通广播（非回复）需回一个 reply 让对端也发现本机
         if (!isReply && !isScanReply) {
             try {
-                val reply = gson.toJson(mapOf("hostname" to hostname, "reply" to true))
+                val reply = buildMsg("reply" to true)
                 val bytes = reply.toByteArray(Charsets.UTF_8)
                 socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(remoteIp), Constants.UDP_PORT))
             } catch (_: Exception) {}
@@ -255,7 +378,7 @@ class UdpDiscovery(
                 socket.receive(packet)
                 val remoteIp = packet.address.hostAddress?.substringBefore('%') ?: continue
                 if (shouldIgnore(remoteIp)) continue
-                val reply = gson.toJson(mapOf("hostname" to hostname, "scan_reply" to true))
+                val reply = buildMsg("scan_reply" to true)
                 val bytes = reply.toByteArray(Charsets.UTF_8)
                 // 同时回复 SCAN_PORT 和 UDP_PORT，确保对方能收到
                 for (port in intArrayOf(Constants.SCAN_PORT, Constants.UDP_PORT)) {
@@ -291,7 +414,7 @@ class UdpDiscovery(
                 if (packet.address is java.net.Inet6Address) {
                     val remoteIp = packet.address.hostAddress?.substringBefore('%') ?: continue
                     if (shouldIgnore(remoteIp)) continue
-                    val reply = gson.toJson(mapOf("hostname" to hostname, "scan_reply" to true))
+                    val reply = buildMsg("scan_reply" to true)
                     val bytes = reply.toByteArray(Charsets.UTF_8)
                     for (port in intArrayOf(Constants.SCAN_PORT, Constants.UDP_PORT)) {
                         try {
@@ -309,27 +432,34 @@ class UdpDiscovery(
     // ================= 广播 =================
 
     private suspend fun broadcasterLoop() {
-        // 只在启动后 BROADCAST_BURST_DURATION_MS 内做爆发式广播，之后停止。
+        // 统一设备发现机制：周期广播搜索（替代原来"启动 5 秒后停止"）。
         //
-        // 原因：桌面端 Python 的 UDP 监听在收到“普通广播”（无 reply/scan_reply）时，
-        // 会无条件触发一次续传检查，导致每隔一秒弹窗。Android 端不再周期性广播，
-        // 通过“回复桌面端广播 + 心跳 + 手动广播搜索”维持被发现。
+        // 为什么改：
+        //   · 原来是"启动 5 秒内爆发广播，之后完全停"，导致晚启动的对端错过窗口
+        //   · 现在改为：
+        //       - 启动后前 5 秒：每 0.2 秒发一次"广播搜索"（快速发现）
+        //       - 5 秒后：每 20 秒发一次"广播搜索"（低成本维持）
+        //   · 接收方收到 {discovery:true} 会立刻回 {reply:true}
+        //   · 这样"发现"完全依赖"请求→响应"，不再依赖对方是否在广播窗口
+        //
+        // 副作用：因为发的是 discovery（不是普通 announce），桌面端的续传弹窗
+        // 只在首次发现设备时才触发，不会每秒刷屏。
         val startTime = System.currentTimeMillis()
         while (running) {
-            if (System.currentTimeMillis() - startTime >= Constants.BROADCAST_BURST_DURATION_MS) {
-                return
-            }
             try {
                 if (!pausingNetwork) {
                     sendBroadcastOnce()
                 }
             } catch (_: Exception) {}
-            delay(Constants.BROADCAST_BURST_INTERVAL_MS)
+            val burst = System.currentTimeMillis() - startTime < Constants.BROADCAST_BURST_DURATION_MS
+            delay(if (burst) Constants.BROADCAST_BURST_INTERVAL_MS else Constants.AUTO_SCAN_INTERVAL_MS)
         }
     }
 
     private fun sendBroadcastOnce() {
-        val msg = gson.toJson(mapOf("hostname" to hostname))
+        // 发"广播搜索"包（discovery=true），接收方会回 reply=true。
+        // 这比"普通广播"更明确——请求-响应模式，对端必须回应。
+        val msg = buildMsg("discovery" to true)
         val bytes = msg.toByteArray(Charsets.UTF_8)
         val socket = DatagramSocket().apply {
             broadcast = true
@@ -362,7 +492,7 @@ class UdpDiscovery(
      */
     suspend fun broadcastDiscovery() = withContext(Dispatchers.IO) {
         log("[广播搜索] 发送广播探测，等待设备回复...")
-        val msg = gson.toJson(mapOf("hostname" to hostname, "discovery" to true))
+        val msg = buildMsg("discovery" to true)
         val bytes = msg.toByteArray(Charsets.UTF_8)
         repeat(3) {
             val socket = try {
@@ -455,7 +585,7 @@ class UdpDiscovery(
 
     /** 探测单个 IP：先试 SCAN_PORT，再试 UDP_PORT */
     private fun scanOne(ip: String): Pair<String, String>? {
-        val msg = gson.toJson(mapOf("hostname" to hostname))
+        val msg = buildMsg()
         val bytes = msg.toByteArray(Charsets.UTF_8)
         for (port in intArrayOf(Constants.SCAN_PORT, Constants.UDP_PORT)) {
             try {
@@ -484,13 +614,13 @@ class UdpDiscovery(
         try {
             val socket = DatagramSocket().apply { soTimeout = 2000 }
             val addr = InetAddress.getByName(ip)
-            val msg = gson.toJson(mapOf("hostname" to hostname))
+            val msg = buildMsg()
             val bytes = msg.toByteArray(Charsets.UTF_8)
             try {
                 socket.send(DatagramPacket(bytes, bytes.size, addr, Constants.UDP_PORT))
             } catch (_: Exception) {}
             try {
-                val scanMsg = gson.toJson(mapOf("hostname" to hostname, "scan_reply" to true))
+                val scanMsg = buildMsg("scan_reply" to true)
                 val scanBytes = scanMsg.toByteArray(Charsets.UTF_8)
                 socket.send(DatagramPacket(scanBytes, scanBytes.size, addr, Constants.SCAN_PORT))
             } catch (_: Exception) {}
@@ -533,7 +663,7 @@ class UdpDiscovery(
         return try {
             val s = DatagramSocket().apply { soTimeout = 1000 }
             socket = s
-            val msg = gson.toJson(mapOf("heartbeat" to true))
+            val msg = buildMsg("heartbeat" to true)
             val bytes = msg.toByteArray(Charsets.UTF_8)
             s.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(ip), Constants.UDP_PORT))
             val resp = ByteArray(2048)

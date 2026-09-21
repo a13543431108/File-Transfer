@@ -256,6 +256,10 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
     private val _saveDirDesc = MutableStateFlow("下载/P2PFileTransfer/")
     val saveDirDesc: StateFlow<String> = _saveDirDesc
 
+    /** 是否正在发送（防止重复点击"极速发送"导致文件发两遍） */
+    private val _sending = MutableStateFlow(false)
+    val sending: StateFlow<Boolean> = _sending
+
     private val _deviceName = MutableStateFlow("")
     val deviceName: StateFlow<String> = _deviceName
 
@@ -539,6 +543,11 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
     }
 
     fun send() {
+        // 防重：正在进行中则忽略（避免用户连点导致同一批文件发多遍）
+        if (_sending.value) {
+            appendLog("[UI] 正在发送中，请等待当前任务完成")
+            return
+        }
         val svc = P2PFileTransferService.instance ?: return
         val targets = _selected.value.toList()
         if (targets.isEmpty()) {
@@ -549,18 +558,32 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
             appendLog("[UI] 请先添加文件或文件夹")
             return
         }
+        // 去重 IP（防止 devices 列表里同一 IP 出现两次，或 selected set 异常）
+        val uniqueTargets = targets.distinct()
+        if (uniqueTargets.size != targets.size) {
+            appendLog("[UI] 目标设备去重: " + targets.size + " → " + uniqueTargets.size)
+        }
+
+        _sending.value = true
         val itemsToSend = _items.value
-        svc.sendItems(targets, itemsToSend) { successPaths ->
-            // 从待发送列表中移除所有 IP 都发送成功的项目
-            if (successPaths.isEmpty()) {
-                appendLog("[UI] 所有项目发送失败，待发送列表保持不变")
-            } else {
-                val remain = _items.value.filter { it.path !in successPaths }
-                val removedCount = _items.value.size - remain.size
-                _items.value = remain
-                appendLog("[UI] 已从待发送列表移除 " + removedCount + " 个成功项目" +
-                        if (remain.isNotEmpty()) "，剩余 " + remain.size + " 个未成功" else "")
+        appendLog("[UI] 开始发送: " + uniqueTargets.size + " 台设备 × " + itemsToSend.size + " 个项目")
+        try {
+            svc.sendItems(uniqueTargets, itemsToSend) { successPaths ->
+                // 从待发送列表中移除所有 IP 都发送成功的项目
+                if (successPaths.isEmpty()) {
+                    appendLog("[UI] 所有项目发送失败，待发送列表保持不变")
+                } else {
+                    val remain = _items.value.filter { it.path !in successPaths }
+                    val removedCount = _items.value.size - remain.size
+                    _items.value = remain
+                    appendLog("[UI] 已从待发送列表移除 " + removedCount + " 个成功项目" +
+                            if (remain.isNotEmpty()) "，剩余 " + remain.size + " 个未成功" else "")
+                }
+                _sending.value = false
             }
+        } catch (e: Exception) {
+            _sending.value = false
+            appendLog("[UI] 发送异常: " + e.message)
         }
     }
 }
@@ -735,7 +758,7 @@ fun MainScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text("文件互传 V15.0", style = MaterialTheme.typography.titleMedium)
+                        Text("文件互传 V15.2", style = MaterialTheme.typography.titleMedium)
                         Text(
                             text = "设备名: " + deviceName + "   ·   保存到: " + saveDirDesc,
                             style = MaterialTheme.typography.labelSmall,
@@ -763,7 +786,9 @@ fun MainScreen(
         },
         bottomBar = {
             Surface(color = MaterialTheme.colorScheme.surface, shadowElevation = 8.dp) {
-                val canSend = selected.isNotEmpty() && items.isNotEmpty()
+                val ready = selected.isNotEmpty() && items.isNotEmpty()
+                val sending by vm.sending.collectAsState()
+                val canSend = ready && !sending
                 Button(
                     onClick = { vm.send() },
                     enabled = canSend,
@@ -773,10 +798,11 @@ fun MainScreen(
                         .height(52.dp)
                 ) {
                     Text(
-                        text = if (canSend)
-                            "极速发送  ·  " + selected.size + " 台设备 / " + items.size + " 个文件"
-                        else
-                            "请选择设备和文件后发送",
+                        text = when {
+                            sending -> "发送中，请稍候…"
+                            ready -> "极速发送  ·  " + selected.size + " 台设备 / " + items.size + " 个文件"
+                            else -> "请选择设备和文件后发送"
+                        },
                         style = MaterialTheme.typography.titleMedium
                     )
                 }
@@ -869,7 +895,7 @@ fun MainScreen(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        node.ip + "   [" + node.source + "]",
+                                        node.ip,
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )

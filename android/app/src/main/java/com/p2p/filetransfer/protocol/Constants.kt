@@ -10,8 +10,16 @@ object Constants {
 
     // 时间/大小
     const val NODE_TIMEOUT_MS = 600_000L          // 节点 10 分钟无响应则移除
-    const val BUFFER_SIZE = 3 * 1024 * 1024       // 初始缓冲区 3MB
+    const val BUFFER_SIZE = 4 * 1024 * 1024       // 初始缓冲区 4MB（提升高带宽链路上的吞吐）
     const val MAX_BUFFER_SIZE = 16 * 1024 * 1024   // 最大 16MB
+    /**
+     * Socket 收发缓冲区（SO_SNDBUF / SO_RCVBUF）期望值。
+     *
+     * 重要：监听 socket 的 RCVBUF **必须在 bind() 之前设置**，
+     * 因为 TCP window scale 在三次握手时按当时的缓冲区大小协商，
+     * accept 之后再改对已建立的连接无效。
+     */
+    const val SOCKET_BUFFER_SIZE = 16 * 1024 * 1024
     const val AUTO_SCAN_INTERVAL_MS = 20_000L     // 后台扫描间隔
     const val HEARTBEAT_MAX_FAIL = 3              // 心跳检测次数（如果超过该数会去除名字）
     const val MAX_RETRIES = 3                     // 最大重试传输次数

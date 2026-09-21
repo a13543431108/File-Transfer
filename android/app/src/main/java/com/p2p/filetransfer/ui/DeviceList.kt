@@ -50,7 +50,7 @@ fun DeviceList(
                     Column(modifier = Modifier.padding(start = 8.dp)) {
                         Text(text = node.hostname, style = MaterialTheme.typography.titleMedium)
                         Text(
-                            text = node.ip + "  [" + node.source + "]",
+                            text = node.ip,
                             style = MaterialTheme.typography.bodySmall
                         )
                     }

@@ -18,7 +18,13 @@ class DeviceRepository {
     val nodesFlow: StateFlow<List<DeviceNode>> = _nodesFlow.asStateFlow()
 
     /** 添加或更新节点；返回是否为新增节点 */
-    fun upsert(ip: String, hostname: String, source: String): Boolean {
+    fun upsert(
+        ip: String,
+        hostname: String,
+        source: String,
+        deviceId: String = "",
+        mac: String = ""
+    ): Boolean {
         var isNew = false
         synchronized(lock) {
             val existing = nodes[ip]
@@ -28,7 +34,9 @@ class DeviceRepository {
                     hostname = hostname,
                     lastSeen = System.currentTimeMillis(),
                     source = source,
-                    heartbeatFail = 0
+                    heartbeatFail = 0,
+                    deviceId = deviceId,
+                    mac = mac
                 )
                 isNew = true
             } else {
@@ -36,7 +44,9 @@ class DeviceRepository {
                     hostname = if (hostname.isNotEmpty()) hostname else existing.hostname,
                     lastSeen = System.currentTimeMillis(),
                     source = source,
-                    heartbeatFail = 0
+                    heartbeatFail = 0,
+                    deviceId = if (deviceId.isNotEmpty()) deviceId else existing.deviceId,
+                    mac = if (mac.isNotEmpty()) mac else existing.mac
                 )
             }
         }

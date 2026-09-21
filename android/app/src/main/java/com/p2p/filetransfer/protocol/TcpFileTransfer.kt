@@ -66,10 +66,24 @@ class TcpFileTransfer(
         running = true
         serverJob = parentScope.launch(Dispatchers.IO) {
             try {
-                serverSocket = ServerSocket().apply {
-                    reuseAddress = true
-                    bind(InetSocketAddress(Constants.TCP_PORT), 50)
+                val ss = ServerSocket()
+                // 关键：SO_RCVBUF 必须在 bind 之前设置。
+                // TCP window scale 在三次握手时按当时的缓冲区大小协商，
+                // accept 之后再设置对已建立连接无效 —— 这就是之前接收速度
+                // 只有 ~0.9MB/s 而电脑发送端显示 10MB/s 的根本原因。
+                try {
+                    ss.receiveBufferSize = Constants.SOCKET_BUFFER_SIZE
+                    log("[TCP] 监听 socket RCVBUF 设为 " +
+                            com.p2p.filetransfer.util.SizeFormatter.humanSize(
+                                ss.receiveBufferSize.toLong()) +
+                            "（期望 " + com.p2p.filetransfer.util.SizeFormatter.humanSize(
+                                Constants.SOCKET_BUFFER_SIZE.toLong()) + "）")
+                } catch (e: Exception) {
+                    log("[TCP] 设置监听 socket RCVBUF 失败: " + e.message)
                 }
+                ss.reuseAddress = true
+                ss.bind(InetSocketAddress(Constants.TCP_PORT), 50)
+                serverSocket = ss
                 log("[TCP] 监听端口 " + Constants.TCP_PORT + " 成功")
             } catch (e: Exception) {
                 log("[TCP] 端口绑定失败: " + e.message)
@@ -344,20 +358,24 @@ class TcpFileTransfer(
         }
 
         val input = socket.getInputStream()
-        // 读缓冲：动态"只扩不缩"（起始 1MB，高速时扩到 2MB/4MB）
+        // 读缓冲：动态"只扩不缩"（起始 3MB，高速时扩到 6MB/12MB）
         //   - 小缓冲 → 更多 read() 系统调用；大缓冲在高带宽链路上能一次排空内核队列
         //   - 只扩不缩，避免慢速网络陷入"缓冲变小 → 更慢"的负反馈
-        // 写缓冲：固定 1MB（用固定数组，避免 ByteArrayOutputStream 的拷贝）
+        //
+        // 优化（v15.3）：**移除中间的 writeBuf**。
+        //   旧流程：read → readBuf → arraycopy → writeBuf → raf.write  ← 多一次 3MB memcpy
+        //   新流程：read → readBuf → raf.write                          ← 直接落盘
+        // 由于 readBuf 本身就有 3MB，每次读到的数据量通常 ≥1MB，
+        // 分批凑 1MB 写盘的收益微乎其微，反而多了一次 memcpy 和多次小 write。
         var dynamicReadSize = Constants.BUFFER_SIZE
         var readBuf = ByteArray(dynamicReadSize)
-        val writeBuf = ByteArray(Constants.WRITE_BATCH_SIZE)
-        var writeOff = 0
+        // 压缩文件才需要独立的解压输出缓冲（提前分配，避免循环内 null 检查）
+        val inflateWorkBuf: ByteArray? = if (compressed) ByteArray(256 * 1024) else null
         val inflater = if (compressed) Inflater() else null
         // lastActivity 在循环内首次读取前必定被赋值（见 while 循环体的首行），
         // 因此声明时不设初值（避免冗余初始化警告）
         var lastActivity: Long
         var lastProgress = System.currentTimeMillis()
-        var lastProgressBytes = received
         // 速度采样（每 1 秒一次，保留最近 5 个）——用于静默超时判断和缓冲扩容
         var lastSampleTime = System.currentTimeMillis()
         var lastSampleBytes = received
@@ -372,40 +390,29 @@ class TcpFileTransfer(
                 if (n < 0) throw IOException("接收中断")
                 lastActivity = System.currentTimeMillis()
 
-                if (inflater != null) {
+                if (inflater != null && inflateWorkBuf != null) {
+                    // 压缩：解压后直接落盘（复用同一个 256KB 缓冲，跨外层循环不重新分配）
                     inflater.setInput(readBuf, 0, n)
                     while (!inflater.needsInput()) {
-                        val got = inflater.inflate(writeBuf, writeOff, writeBuf.size - writeOff)
+                        val got = inflater.inflate(inflateWorkBuf)
                         if (got <= 0) break
-                        md.update(writeBuf, writeOff, got)
-                        writeOff += got
-                        if (writeOff >= writeBuf.size) {
-                            raf.write(writeBuf, 0, writeOff)
-                            writeOff = 0
-                        }
+                        md.update(inflateWorkBuf, 0, got)
+                        raf.write(inflateWorkBuf, 0, got)
                     }
                 } else {
+                    // 非压缩：直接写 readBuf（零中间拷贝）
                     md.update(readBuf, 0, n)
-                    // 直接把 readBuf 填到 writeBuf，满了就一次落盘
-                    var srcOff = 0
-                    while (srcOff < n) {
-                        val copyLen = minOf(n - srcOff, writeBuf.size - writeOff)
-                        System.arraycopy(readBuf, srcOff, writeBuf, writeOff, copyLen)
-                        writeOff += copyLen
-                        srcOff += copyLen
-                        if (writeOff >= writeBuf.size) {
-                            raf.write(writeBuf, 0, writeOff)
-                            writeOff = 0
-                        }
-                    }
+                    raf.write(readBuf, 0, n)
                 }
                 received += n
 
                 val now = System.currentTimeMillis()
-                if (now - lastProgress >= 500 || (received - lastProgressBytes) >= 1024 * 1024) {
+                // 进度回调节流：仅按时间（500ms 一次），
+                // 去掉原来的 "或 1MB 触发" —— 高速传输时每秒几十次 UI 更新
+                // 会引发大量 Compose 重组，反而拖慢接收线程。
+                if (now - lastProgress >= 500) {
                     progressCallback(received)
                     lastProgress = now
-                    lastProgressBytes = received
                 }
                 // 速度采样（用于静默超时判断 + 缓冲扩容）
                 val sampleElapsed = (now - lastSampleTime) / 1000.0
@@ -438,20 +445,13 @@ class TcpFileTransfer(
                     throw IOException("接收静默超时")
                 }
             }
-            if (inflater != null) {
+            if (inflater != null && inflateWorkBuf != null) {
                 while (!inflater.finished()) {
-                    val got = inflater.inflate(writeBuf, writeOff, writeBuf.size - writeOff)
+                    val got = inflater.inflate(inflateWorkBuf)
                     if (got <= 0) break
-                    md.update(writeBuf, writeOff, got)
-                    writeOff += got
-                    if (writeOff >= writeBuf.size) {
-                        raf.write(writeBuf, 0, writeOff)
-                        writeOff = 0
-                    }
+                    md.update(inflateWorkBuf, 0, got)
+                    raf.write(inflateWorkBuf, 0, got)
                 }
-            }
-            if (writeOff > 0) {
-                raf.write(writeBuf, 0, writeOff)
             }
         } catch (e: Exception) {
             log("[接收] 数据接收异常: " + e.message)
@@ -916,11 +916,21 @@ class TcpFileTransfer(
                         out.write(compressedBytes)
                         out.flush()
                     } else {
+                        // 进度条 = **当前文件**的进度（sent 含续传起点 useOffset）
+                        // statusText 同时显示当前文件 + 全局字节进度
+                        val globalBase = sentTotal
                         sendFileDataFast(socket, fullFile, entry.size, useOffset) { sent ->
+                            val filePercent = if (entry.size > 0)
+                                (sent * 100f / entry.size).coerceIn(0f, 100f) else 0f
+                            val globalSent = globalBase + sent
+                            val globalPercent = if (totalBytes > 0)
+                                (globalSent * 100f / totalBytes).coerceIn(0f, 100f) else 0f
                             onSendProgress(TransferProgress(
-                                percent = if (totalBytes > 0) (sentTotal + sent) * 100f / totalBytes else 0f,
-                                statusText = "发送文件夹 " + folderName + ": " +
-                                        SizeFormatter.humanSize(sentTotal + sent) + " / " + SizeFormatter.humanSize(totalBytes)
+                                percent = filePercent,
+                                statusText = "当前: " + entry.relPath + "  (" +
+                                        SizeFormatter.humanSize(sent) + " / " + SizeFormatter.humanSize(entry.size) + ")  ·  " +
+                                        "整体: " + String.format("%.1f%%", globalPercent) + "  (" +
+                                        SizeFormatter.humanSize(globalSent) + " / " + SizeFormatter.humanSize(totalBytes) + ")"
                             ))
                         }
                     }
@@ -1107,11 +1117,20 @@ class TcpFileTransfer(
                         startOffset = offset,
                         compressed = compressed,
                         progressCallback = { received ->
-                            val total = receivedGlobal + received
+                            // 进度条 = **当前文件**的进度（received 含续传起点 offset）
+                            // statusText 同时显示当前文件 + 全局字节进度
+                            val globalBase = receivedGlobal
+                            val filePercent = if (fileSize > 0)
+                                (received * 100f / fileSize).coerceIn(0f, 100f) else 0f
+                            val globalRecv = globalBase + received
+                            val globalPercent = if (totalBytes > 0)
+                                (globalRecv * 100f / totalBytes).coerceIn(0f, 100f) else 0f
                             onRecvProgress(TransferProgress(
-                                percent = if (totalBytes > 0) total * 100f / totalBytes else 0f,
-                                statusText = "接收文件夹 " + folderName + ": " +
-                                        SizeFormatter.humanSize(total) + " / " + SizeFormatter.humanSize(totalBytes)
+                                percent = filePercent,
+                                statusText = "当前: " + relPath + "  (" +
+                                        SizeFormatter.humanSize(received) + " / " + SizeFormatter.humanSize(fileSize) + ")  ·  " +
+                                        "整体: " + String.format("%.1f%%", globalPercent) + "  (" +
+                                        SizeFormatter.humanSize(globalRecv) + " / " + SizeFormatter.humanSize(totalBytes) + ")"
                             ))
                             val now = System.currentTimeMillis()
                             val bucket = if (fileSize > 0) ((received * 10) / fileSize).toInt() else 0

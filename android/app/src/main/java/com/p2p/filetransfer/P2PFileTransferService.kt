@@ -60,17 +60,71 @@ class P2PFileTransferService : Service() {
         getSharedPreferences("p2p_config", Context.MODE_PRIVATE)
     }
 
+    /**
+     * 网络变化监听：Wi-Fi 上线/切换时重新绑定进程到 Wi-Fi，
+     * 确保后续新创建的 socket 走 Wi-Fi 接口。
+     */
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+
+    private fun registerWifiNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                ?: return
+            val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    // 可能是 Wi-Fi 或其它网络。统一重新绑定到当前 Wi-Fi（如存在）
+                    val ok = com.p2p.filetransfer.util.NetworkUtil.bindProcessToWifi(applicationContext)
+                    emitLog("[网络] 网络变化，已重新绑定: " + (if (ok) "Wi-Fi" else "默认"))
+                }
+                override fun onLost(network: android.net.Network) {
+                    // 网络断开时也重新评估（可能仍有 Wi-Fi 只是某条路由掉了）
+                    com.p2p.filetransfer.util.NetworkUtil.bindProcessToWifi(applicationContext)
+                }
+            }
+            cm.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+        } catch (e: Exception) {
+            emitLog("[网络] 注册监听失败: " + e.message)
+        }
+    }
+
+    private fun unregisterWifiNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+            networkCallback?.let { cm?.unregisterNetworkCallback(it) }
+        } catch (_: Exception) {
+        }
+        networkCallback = null
+    }
+
     override fun onCreate() {
         super.onCreate()
         instance = this
         deviceRepo = DeviceRepository()
         resumeRepo = ResumeRepository(this)
 
+        // 关键：强制把进程绑定到 Wi-Fi，避免"Wi-Fi + 移动数据"双开时
+        // socket 从移动数据接口发出（导致局域网 IP 无法访问）
+        com.p2p.filetransfer.util.NetworkUtil.registerWifiTracker(applicationContext)
+        com.p2p.filetransfer.util.NetworkUtil.bindProcessToWifi(applicationContext)
+        registerWifiNetworkCallback()
+
         val saveDirProvider = { currentSaveDir() }
+
+        // 稳定设备标识：UUID（生成一次，永久保存）
+        val deviceId = prefs.getString(KEY_DEVICE_ID, null) ?: run {
+            val newId = java.util.UUID.randomUUID().toString()
+            prefs.edit().putString(KEY_DEVICE_ID, newId).apply()
+            newId
+        }
+        // MAC（尽力而为；Android 10+ 通常拿不到真实 MAC，返回空串）
+        val mac = com.p2p.filetransfer.util.NetworkUtil.getWifiMacAddress() ?: ""
 
         udp = UdpDiscovery(
             deviceRepo = deviceRepo,
             log = ::emitLog,
+            deviceId = deviceId,
+            mac = mac,
             onNewDevice = { ip, host ->
                 emitLog("[发现] 新设备 " + host + " (" + ip + ")")
                 checkResumeOnOnline(ip, host)
@@ -123,6 +177,9 @@ class P2PFileTransferService : Service() {
 
     override fun onDestroy() {
         _isRunning.value = false
+        // 注销网络监听
+        unregisterWifiNetworkCallback()
+        com.p2p.filetransfer.util.NetworkUtil.unregisterWifiTracker(applicationContext)
         // 未决的来件确认统一拒绝
         for ((_, d) in pendingConfirms) {
             try { d.complete(false) } catch (_: Exception) {}
@@ -177,7 +234,10 @@ class P2PFileTransferService : Service() {
         items: List<TransferItem>,
         onFinished: ((Set<String>) -> Unit)? = null
     ) {
-        if (targetIps.isEmpty() || items.isEmpty()) return
+        if (targetIps.isEmpty() || items.isEmpty()) {
+            onFinished?.invoke(emptySet())
+            return
+        }
         serviceScope.launch {
             // 传输期间暂停广播/扫描/心跳
             udp.pausingNetwork = true
@@ -186,7 +246,10 @@ class P2PFileTransferService : Service() {
                 val allSuccess = HashMap<String, Boolean>()
                 for (item in items) allSuccess[item.path] = true
 
-                for (ip in targetIps) {
+                // 去重：防止同一 IP 被发两次（防御性）
+                val uniqueIps = targetIps.distinct()
+
+                for (ip in uniqueIps) {
                     // 发送前离线检查
                     if (!deviceRepo.has(ip)) {
                         emitLog("[发送] 设备 " + ip + " 已离线，跳过")
@@ -201,6 +264,10 @@ class P2PFileTransferService : Service() {
 
                 val okPaths = allSuccess.filterValues { it }.keys
                 onFinished?.invoke(okPaths)
+            } catch (e: Exception) {
+                emitLog("[发送] 异常: " + e.message)
+                // 异常时也要通知 UI 解除"发送中"状态
+                onFinished?.invoke(emptySet())
             } finally {
                 udp.pausingNetwork = false
             }
@@ -515,6 +582,7 @@ class P2PFileTransferService : Service() {
             get() = "下载/" + com.p2p.filetransfer.util.PublicStorage.SUBDIR + "/"
         private const val KEY_SAVE_TREE_URI = "save_tree_uri"
         private const val KEY_DEVICE_NAME = "device_name"
+        private const val KEY_DEVICE_ID = "device_id"
 
         /** UI 侧读取设备列表 */
         fun deviceFlow(): StateFlow<List<DeviceNode>>? = instance?.deviceRepo?.nodesFlow
