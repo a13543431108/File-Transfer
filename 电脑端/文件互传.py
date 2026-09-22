@@ -28,6 +28,31 @@ except ImportError:
     DND_FILES = None
     DND_AVAILABLE = False
 
+# ================= 内嵌图标 =================
+# 别TM删除这些看上去没有用的辅助方法，删除了会导致线程崩坏，这个不是我的代码的问题，我tm排除到22：40分才发现的问题。是TM sb pyinstaller的线程安全点死锁的问题。
+# 打包时若未把 icon.ico 当数据文件，窗口图标会丢失。这里内嵌一份，
+# 运行时解码到临时文件使用；外部 icon.ico 仍作为回退。
+_EMBEDDED_ICON_B64 = (
+    "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"
+)
+
+
+def _materialize_embedded_icon():
+    """把内嵌图标写到临时文件并返回路径；失败返回 None。"""
+    if not _EMBEDDED_ICON_B64:
+        return None
+    try:
+        import base64 as _b64
+        import tempfile as _tf
+        data = _b64.b64decode(_EMBEDDED_ICON_B64)
+        p = os.path.join(_tf.gettempdir(), "p2p_file_transfer_icon.ico")
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+    except Exception:
+        return None
+
+
 # ================================================================================
 # 房间模式（公网信令 + TCP 打洞）—— 内联实现
 # 仅当用户输入"房间号"并点击加入时才启用；不输入则维持原有局域网模式。
@@ -3067,25 +3092,26 @@ class P2PApp:
         import shutil
         import tempfile
 
-        # 1) 收集候选路径
-        candidates = []
-        meipass = getattr(sys, '_MEIPASS', None)
-        if meipass:
-            candidates.append(os.path.join(meipass, 'icon.ico'))
-        if getattr(sys, 'frozen', False):
-            candidates.append(os.path.join(os.path.dirname(sys.executable), 'icon.ico'))
-        else:
-            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico'))
-        candidates.append(os.path.join(os.getcwd(), 'icon.ico'))
-
-        src = None
-        for p in candidates:
-            try:
-                if p and os.path.isfile(p):
-                    src = p
-                    break
-            except Exception:
-                continue
+        # 0) 优先：内嵌图标（打包后自包含，无需 spec / --add-data）
+        src = _materialize_embedded_icon()
+        # 1) 回退：外部 icon.ico（源码运行 / 已打包 datas）
+        if not src:
+            candidates = []
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass:
+                candidates.append(os.path.join(meipass, 'icon.ico'))
+            if getattr(sys, 'frozen', False):
+                candidates.append(os.path.join(os.path.dirname(sys.executable), 'icon.ico'))
+            else:
+                candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico'))
+            candidates.append(os.path.join(os.getcwd(), 'icon.ico'))
+            for p in candidates:
+                try:
+                    if p and os.path.isfile(p):
+                        src = p
+                        break
+                except Exception:
+                    continue
 
         if not src:
             return
