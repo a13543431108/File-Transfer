@@ -3720,15 +3720,48 @@ class P2PApp:
         threading.Thread(target=self.node.remove_offline_nodes, daemon=True).start()
 
     def log(self, msg):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.config(state='normal')
-        self.log_text.insert(tk.END, f"[{timestamp}] {msg}\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state='disabled')
+        """写事件日志（线程安全）。
+
+        tkinter 不是线程安全的：后台线程直接操作控件会与主线程 mainloop
+        争锁，打包成 exe 后时序变化极易死锁（表现为界面卡死）。
+        故：主线程直接写；后台线程用 root.after(0, ...) 派发到主线程。
+        """
         logging.info(msg)
+        # 已在主线程：直接更新
+        if threading.current_thread() is threading.main_thread():
+            self._append_log_ui(msg)
+        else:
+            # 后台线程：派发到主线程执行
+            try:
+                self.root.after(0, lambda m=msg: self._append_log_ui(m))
+            except Exception:
+                pass
+
+    def _append_log_ui(self, msg):
+        """真正操作控件（只允许主线程调用）。"""
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.log_text.config(state='normal')
+            self.log_text.insert(tk.END, f"[{timestamp}] {msg}\n")
+            self.log_text.see(tk.END)
+            self.log_text.config(state='disabled')
+        except Exception:
+            pass
 
     def set_status(self, msg):
-        self.status.config(text=msg)
+        """更新状态栏（线程安全）。"""
+        def _do():
+            try:
+                self.status.config(text=msg)
+            except Exception:
+                pass
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            try:
+                self.root.after(0, _do)
+            except Exception:
+                pass
 
     # ---------- 进度更新 ----------
     def update_send_progress(self, percent, speed_str=None, remain_str=None):
