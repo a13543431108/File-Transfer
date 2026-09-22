@@ -1,0 +1,27 @@
+# ===== 构建产物 / 依赖 =====
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/.idea/
+*.apk
+*.aab
+电脑端/__pycache__/
+服务器/__pycache__/
+*.pyc
+__pycache__/
+
+# ===== IDE =====
+.idea/
+*.iml
+.vscode/
+
+# ===== 运行时产物 =====
+服务器/server_state.json
+电脑端/transfer.log
+*.log
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini

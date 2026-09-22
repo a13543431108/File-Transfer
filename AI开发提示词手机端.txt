@@ -1,0 +1,690 @@
+# P2P文件互传Android应用开发提示词
+
+请将以下内容直接复制发送给AI代码生成工具（如Cursor/Copilot/Qwen等），即可生成完整可运行的Android应用。
+
+---
+
+## 复制起点
+
+你是一名资深Android Kotlin开发专家。请基于以下完整技术规格，创建一个P2P局域网文件传输Android应用，要求代码完整、可编译、可运行。
+
+## 一、项目基本信息
+
+- 应用名称: P2P文件互传
+- 包名: com.p2p.filetransfer
+- 最低SDK: 24 (Android 7.0)
+- 目标SDK: 35 (Android 15)
+- 语言: Kotlin
+- 架构: MVVM
+- 构建: Gradle (Kotlin DSL)
+- 最小化使用第三方库，核心网络功能使用原生Java Socket
+
+## 二、功能需求
+
+### 核心功能
+1. 设备自动发现（Wi-Fi子网扫描 + 手动添加IP）
+2. 单文件/文件夹发送与接收
+3. 断点续传（崩溃或网络断开后可恢复）
+4. 文本文件zlib压缩传输
+5. IPv4/IPv6双栈支持
+6. 动态缓冲区适配（根据速度自动调整）
+7. SHA256完整性校验
+8. 多设备并发发送
+
+### UI界面
+1. 主界面：左侧设备列表 + 右侧待发送文件列表
+2. 传输进度：发送进度条 + 接收进度条
+3. 底部日志区：实时事件日志
+4. 状态栏：当前操作状态
+5. 设置项：保存路径、应用名称
+
+## 三、网络协议规范（必须严格实现）
+
+### 端口定义
+- UDP 9998: 设备发现（心跳/广播/回复）
+- TCP 9999: 文件传输通道
+- UDP 9997: 扫描探测（与设备发现隔离）
+
+### 关键常量
+- NODE_TIMEOUT = 600秒（节点10分钟未响应则移除）
+- BUFFER_SIZE = 1MB（初始缓冲，动态调整至最大8MB）
+- SOCKET_BUFFER_SIZE = 16MB
+- AUTO_SCAN_INTERVAL = 20秒（后台扫描间隔）
+- HEARTBEAT_MAX_FAIL = 3（连续3次心跳失败判定离线）
+- MAX_RETRIES = 3（文件传输最大重试次数）
+- SCAN_TIMEOUT = 0.5秒（扫描探测超时）
+- LOW_NETWORK_THRESHOLD = 512KB/s（低网络阈值）
+- WRITE_BATCH_SIZE = 1MB（磁盘写入批量）
+- RECV_ACTIVITY_TIMEOUT = 60秒（接收静默超时）
+- ACTIVITY_TIMEOUT = 30秒（发送静默超时）
+
+### 标志位
+- FLAG_FILE = 0x00（单文件）
+- FLAG_FOLDER = 0x01（文件夹）
+- FLAG_COMPRESS = 0x01（bit0，压缩标志）
+- FLAG_RESUME = 0x02（bit1，续传标志）
+- FLAG_QUERY_OFFSET = 0x02（作为TCP首个字节时，续传偏移量查询）
+
+### 文本文件压缩白名单
+.txt, .log, .json, .xml, .py, .js, .html, .htm, .css, .csv, .yaml, .yml, .toml, .ini, .cfg, .conf, .md, .rst, .sh, .bat, .ps1, .vbs
+
+## 四、协议详解（Wire Format）
+
+### 4.1 UDP 消息（JSON格式）
+
+所有UDP消息均为UTF-8编码的JSON字符串：
+
+1. 广播包: `{"hostname": "设备名"}`
+2. 发现回复: `{"hostname": "设备名", "reply": true}`
+3. 扫描回复: `{"hostname": "设备名", "scan_reply": true}`
+4. 心跳包: `{"heartbeat": true}`
+5. 心跳确认: `{"heartbeat": true, "ack": true}`
+
+### 4.2 TCP 文件传输协议（二进制）
+
+所有多字节整数均为大端序（Big-Endian）。
+
+#### 连接建立后首个字节（消息类型）
+- `0x00` → 单文件传输
+- `0x01` → 文件夹传输
+- `0x02` → 续传偏移量查询
+
+#### 单文件传输流程
+
+**发送方 → 接收方（文件头）：**
+```
+[1B] 0x00 (FLAG_FILE)
+[4B] filename_len (Int32, Big-Endian)
+[NB] filename (UTF-8)
+[1B] flags (byte: bit0=compress, bit1=resume)
+[8B] file_size (Int64, Big-Endian)
+[8B] offset (仅当 flags & FLAG_RESUME 时存在, Int64)
+```
+
+**接收方 → 发送方（确认）：**
+```
+[2B] "OK" (接收成功) 或 "NO" (拒绝)
+```
+
+**发送方 → 接收方（数据）：**
+```
+[NB] file_data (原始数据或zlib压缩数据)
+[64B] sha256_hash (SHA256完整文件的hex字符串, UTF-8)
+```
+
+**接收方 → 发送方（校验结果）：**
+```
+[10B] "MATCH     " (校验通过) 或 "MISMATCH  " (校验失败)
+```
+
+注意：MATCH和MISMATCH固定10字节，不足补空格。
+
+#### 文件夹传输流程
+
+**Step 1: 发送文件夹头**
+```
+[1B] 0x01 (FLAG_FOLDER)
+[4B] folder_name_len (Int32)
+[NB] folder_name (UTF-8)
+[4B] file_count (Int32)
+[8B] total_bytes (Int64)
+```
+
+**Step 2: 接收方确认**
+```
+[2B] "OK" 或 "NO"
+```
+
+**Step 3: 发送文件清单（每个文件）：**
+```
+[4B] rel_path_len (Int32)
+[NB] rel_path (UTF-8, 相对于文件夹根的路径)
+[8B] size (Int64)
+[8B] mtime (IEEE 754 Double64, 文件修改时间)
+```
+
+**Step 4: 接收方清单确认：**
+```
+[1B] 0x01 (清单处理成功) 或 0x00 (失败)
+```
+
+**Step 5: 接收方发送每个文件的处理指令（每个文件）：**
+```
+[1B] 0x00 (skip) 或 0x01 (full) 或 0x02 (resume)
+[8B] offset (仅当 0x02 时存在, Int64)
+```
+
+**Step 6: 逐文件传输（同单文件协议，但文件头用 rel_path）：**
+```
+[4B] rel_path_len (Int32)
+[NB] rel_path (UTF-8)
+[1B] flags
+[8B] file_size (Int64)
+[8B] offset (仅当 FLAG_RESUME)
+[2B] "OK" 或 "NO"
+[NB] data
+[64B] sha256
+[10B] "MATCH     " 或 "MISMATCH  "
+```
+
+#### 续传偏移量查询
+
+**发送方 → 接收方：**
+```
+[1B] 0x02 (FLAG_QUERY_OFFSET)
+[8B] total_size (Int64)
+[4B] filename_len (Int32)
+[NB] filename (UTF-8)
+```
+
+**接收方 → 发送方：**
+```
+[8B] local_offset (Int64, 0表示无此文件)
+```
+
+## 五、完整流程实现
+
+### 5.1 设备发现
+
+Android不支持UDP广播到达网关，所以使用以下方案：
+
+1. 获取本机Wi-Fi IP地址
+2. 计算子网（通常是/24）
+3. 主动UDP扫描子网内的所有IP，发送JSON `{"hostname": "本机名"}` 到9997和9998端口
+4. 监听9997和9998端口接收回复
+5. 心跳：每20秒对所有已知节点UDP发送{"heartbeat": true}，1秒超时，连续3次失败移除
+6. 节点10分钟(TIMEOUT=600秒)无任何响应自动清理
+
+启动时需要：
+- 立即执行一次快速子网扫描
+- 开启20秒循环后台扫描 + 心跳检测
+
+### 5.2 单文件发送
+
+```
+1. 获取文件信息: 路径, 文件名, 大小, mtime
+2. 判断是否压缩: 文件扩展名在文本白名单内则compress=true
+3. 加载续传状态:
+   - sender_state = readResumeState(ip, filepath, "sender")
+   - recv_state = readResumeState(ip, filepath, "recv")
+   - 双方都有: offset = min(sender, recv)
+   - 仅一方: offset = max(sender, recv)
+   - 都没有: offset = 0
+   - offset > 0 -> flags |= FLAG_RESUME
+4. 如果compress为真:
+   - 读取整个文件 -> zlib.compress(level=6)
+   - 注意：压缩不支持续传，如果offset>0则重置offset=0
+5. 保存发送方续传状态: writeResumeState(ip, filepath, offset, totalSize, mtime, "sender")
+6. 在线协商续传偏移量（仅非压缩文件）:
+   - 建立TCP连接 -> connect(ip, 9999)
+   - 发送0x02 + totalSize(8B) + filename
+   - 接收对方回复localOffset(8B)
+   - 如果 localOffset > offset，更新offset = localOffset, 设置FLAG_RESUME
+   - 断开此查询连接，重新连接发送数据
+7. 发送文件头 -> 等待"OK"确认
+8. 发送数据
+9. 发送SHA256哈希(64字节hex) -> 等待"MATCH"
+10. 删除续传状态
+```
+
+### 5.3 接收方监听
+
+```
+1. 绑定 0.0.0.0:9999 (ServerSocket)
+2. accept() -> 新连接线程:
+   a. read(1 byte) -> flag
+   b. 根据flag分发:
+      0x00 -> receiveSingleFile()
+      0x01 -> receiveFolder()
+      0x02 -> handleQueryOffset()
+```
+
+### 5.4 续传状态管理
+
+存储结构：应用私有目录下的 `.p2p_resume/` 文件夹。
+
+文件格式：JSON，命名规则：`resume_{role}_{ip}_{safe_filename}.json`
+
+JSON内容：
+```json
+{
+  "filepath": "/abs/path/to/file",
+  "offset": 123456,
+  "total_size": 789012,
+  "mtime": 1234567890.0,
+  "target_ip": "192.168.1.100",
+  "role": "sender",
+  "timestamp": 1234567890.0
+}
+```
+
+续传触发：
+- 文件传输中断后保存的状态文件
+- 设备重新上线时检查续传记录
+- 弹窗询问用户是否继续
+
+保存频率：每5秒或每10%进度保存一次。
+
+文件夹续传状态命名：`folder_resume_{ip}_{folder}_{safepath}.json`
+
+### 5.5 数据校验
+
+发送端：发送完整文件的SHA256哈希（64字符hex字符串）。
+接收端：接收过程中实时计算SHA256，完成后与远程哈希对比。
+- 续传时：先读取已有文件计算哈希，再接收新数据追加计算。
+- HASH MISMATCH：接收端清理文件，最多重试3次。
+
+### 5.6 Socket优化
+
+所有TCP连接需设置：
+```java
+socket.setTcpNoDelay(true);           // 禁用Nagle
+socket.setKeepAlive(true);
+socket.setSoTimeout(0);               // 大文件无超时
+socket.setSendBufferSize(16 * 1024 * 1024);   // 16MB
+socket.setReceiveBufferSize(16 * 1024 * 1024); // 16MB
+```
+
+### 5.7 动态缓冲区
+
+根据速度动态调整BUFFER_SIZE（接收方调整）：
+- 速度 < 1MB/s -> 256KB
+- 1-5MB/s -> 512KB
+- 5-20MB/s -> 1MB
+- 20-50MB/s -> 2MB
+- > 50MB/s -> 4MB
+- 最大8MB
+
+发送端自适应块大小（_send_file_data_fast）：
+- < 128KB/s -> 16KB
+- < 512KB/s -> 64KB
+- < 1MB/s -> 128KB
+- < 5MB/s -> 256KB
+- < 20MB/s -> 512KB
+- < 50MB/s -> 1MB
+- > 50MB/s -> 2MB
+
+### 5.8 连接失败重试
+
+指数退避：等待 2^retry 秒，最大64秒。
+- 第1次失败等2秒
+- 第2次失败等4秒
+- 第3次失败等8秒（最终放弃）
+
+### 5.9 静默超时
+
+接收端：当速度 < 512KB/s 且60秒无数据到达，抛出异常触发续传。
+发送端：当速度 < 512KB/s 且30秒无发送，触发重试。
+
+### 5.10 文件夹增量传输
+
+接收方收到清单后，对每个文件判断：
+- 本地文件存在且 size + mtime 完全匹配（mtime误差<0.1秒）→ skip
+- 本地文件存在但 size < 清单size → resume（offset = 本地size）
+- 本地文件存在但 size > 清单size 或 mtime不匹配 → full
+- 文件不存在 → full
+
+## 六、Android特定实现
+
+### 6.1 前台服务（Foreground Service）
+
+应用启动后需要创建一个前台服务（Notification持续显示），用于：
+- UDP监听线程（9998 + 9997端口）
+- TCP服务监听（9999端口）
+- 定时扫描和心跳
+
+通知渠道：
+- TRANSFER_PROGRESS: 传输进度（ongoing notification）
+- RECEIVER_REQUEST: 接收请求（通知用户有新文件传入）
+- APP_STATUS: 应用运行状态
+
+Android 8.0+ 必须使用前台服务，否则后台网络会被杀死。
+
+### 6.2 权限要求
+
+```xml
+<uses-permission android:name="android.permission.INTERNET"/>
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+<uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+<uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+<uses-permission android:name="android.permission.WAKE_LOCK"/>
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+<!-- Android 13+ -->
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+<uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"/>
+<!-- 存储权限 -->
+<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+    android:maxSdkVersion="32"/>
+<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+    android:maxSdkVersion="29"/>
+```
+
+### 6.3 文件存储
+
+Android 10+ (API 29+) 使用分区存储（Scoped Storage）：
+- 发送文件：使用 Storage Access Framework (Intent.ACTION_OPEN_DOCUMENT)
+- 接收目录：应用的私有目录或 Download目录（MediaStore）
+- 续传状态：应用私有目录 `.p2p_resume/`
+
+### 6.4 线程模型
+
+```
+主线程 (MainLooper):
+  �── UI 更新 (View果真/recyclerView)
+
+IO线程池 (Dispatchers.IO):
+  ├── UDP广播线程（单线程定时发送）
+  ├── UDP监听线程（9998端口）
+  ├── 扫描监听线程（9997端口）
+  ├── UDP扫描线程（扫描子网）
+  ├── TCP Server accept循环
+  └── 文件传输线程（每个连接一个）
+
+定时任务:
+  ├── 每20秒：扫描所有子网 + 心跳检测
+  └── 每2秒：清理超时节点
+```
+
+具体实现：
+- 使用 Kotlin Coroutines 管理所有异步操作
+- UDP监听使用 whileIsActive 循环
+- TCP accept 使用 launch(Dispatchers.IO)
+- 文件传输使用独立 coroutine scope
+
+### 6.5 Wi-Fi唤醒锁
+
+传输过程中需要保持Wi-Fi唤醒：
+```kotlin
+val wakeLock = (context.getSystemService(Context.POWER_SERVICE) as PowerManager)
+    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "P2PFileTransfer::TransferLock")
+wakeLock.acquire(60000) // 最多保持1分钟
+```
+
+传输期间也需要防止Wi-Fi睡眠：
+- 使用 WifiManager.WifiLock 保持Wi-Fi活跃
+
+### 6.6 电池优化豁免
+
+对于传输任务，请求忽略电池优化（否则Doze模式会暂停网络）：
+```kotlin
+val pm = context.getSystemService(PowerManager::class.java)
+if (!pm.isIgnoringBatteryOptimizations(context.packageName)) {
+    val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+    intent.data = Uri.parse("package:${context.packageName}")
+    startActivityForResult(intent, REQUEST_CODE)
+}
+```
+
+### 6.7 UI设计
+
+主界面使用 Jetpack Compose：
+- 顶部状态栏：本机IP + 状态文字
+- 中间分两列：
+  - 左列：设备列表（Recycler/ LazyColumn），支持多选
+  - 右列：待发送文件列表（LazyColumn），支持上移/下移/删除
+- 底部：进度区域
+  - 发送进度条（百分比 + 速度 + 剩余时间）
+  - 接收进度条
+  - 日志区域（自动滚动，最多500行）
+- 操作按钮：
+  - 扫描设备
+  - 手动添加IP
+  - 添加文件
+  - 添加文件夹
+  - 清空列表
+  - 发送按钮（极速发送）
+  - 设置保存路径
+
+显示信息：
+- 设备列表项：主机名 (IP地址) [在线图标]
+- 文件列表项：[文件图标/文件夹图标] 文件名 (大小)
+
+发送按钮流程：
+1. 检查是否选中设备（至少1个）
+2. 检查发送列表是否为空
+3. 计算总任务数 = 设备数 × 文件数
+4. 对每个设备启动独立协程发送所有文件（串行）
+5. 多设备之间并行，单设备内部串行
+6. 更新全局进度
+
+接收流程：
+- 收到文件传输时弹出Notification
+- 用户点击Notification查看接收详情
+- 自动保存或询问用户确认
+
+### 6.8 网络状态监听
+
+使用 BroadcastReceiver 监听网络变化：
+```kotlin
+val filter = IntentFilter().apply {
+    addAction(ConnectivityManager.CONNECTIVITY_ACTION)
+    addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION)
+}
+registerReceiver(networkReceiver, filter)
+```
+
+网络断开时：
+- 暂停当前传输
+- 保存续传状态
+- 等待网络恢复后提醒用户续传
+
+## 七、项目结构
+
+```
+app/
+├── src/main/java/com/p2p/filetransfer/
+│   ├── MainActivity.kt              # 主界面（Compose）
+│   ├── P2PFileTransferService.kt    # 前台服务（核心网络层）
+│   ├── ui/
+│   │   ├── theme/
+│   │   │   ├── Color.kt
+│   │   │   ├── Theme.kt
+│   │   │   └── Type.kt
+│   │   ├── DeviceList.kt            # 设备列表组件
+│   │   ├── FileList.kt              # 待发送文件列表组件
+│   │   ├── ProgressView.kt          # 进度组件
+│   │   └── LogView.kt               # 日志组件
+│   ├── protocol/
+│   │   ├── Constants.kt             # 协议常量和端口定义
+│   │   ├── UdpDiscovery.kt          # UDP设备发现
+│   │   ├── TcpFileTransfer.kt       # 文件传输实现
+│   │   ├── ProtoWriter.kt           # 二进制协议写入工具
+│   │   └── ProtoReader.kt           # 二进制协议读取工具
+│   ├── model/
+│   │   ├── DeviceNode.kt            # 节点数据模型
+│   │   ├── ResumeState.kt           # 续传状态模型
+│   │   └── TransferItem.kt          # 传输项目模型
+│   ├── repository/
+│   │   ├── ResumeRepository.kt      # 续传状态持久化
+│   │   └── DeviceRepository.kt      # 设备信息管理
+│   └── util/
+│       ├── SocketOptimizer.kt       # Socket优化
+│       ├── HashUtil.kt              # SHA256计算
+│       ├── SubnetUtil.kt            # 子网计算工具
+│       ├── NetworkUtil.kt           # 网络工具（获取IP等）
+│       └── SizeFormatter.kt         # 大小/速度格式化
+├── src/main/res/
+│   └── values/
+│       �── strings.xml
+└── build.gradle.kts
+```
+
+## 八、关键实现细节
+
+### 8.1 精确接收指定字节数（必须保证）
+
+```kotlin
+fun InputStream.recvExact(size: Int): ByteArray {
+    if (size <= 0) return ByteArray(0)
+    val buf = ByteArray(size)
+    var offset = 0
+    while (offset < size) {
+        val n = this.read(buf, offset, size - offset)
+        if (n == -1) throw IOException("连接中断")
+        offset += n
+    }
+    return buf
+}
+```
+
+### 8.2 字节工具函数
+
+```kotlin
+fun Int.toBigEndian32(): ByteArray = BigInteger(value.toString()).toByteArray(4) { getData order: Big-Endian }
+fun Long.toBigEndian64(): ByteArray = BigInteger(value.toString()).toByteArray(8)
+fun ByteArray.readBigEndian32(offset: Int = 0): Int = /* 解析4字节大端Int */
+fun ByteArray.readBigEndian64(offset: Int = 0): Long = /* 解析8字节大端Long */
+fun ByteArray.readDouble(offset: Int = 0): Double = /* IEEE 754 double, Big-Endian */
+```
+
+或者使用 ByteBuffer:
+```kotlin
+fun ByteArray.readBigEndian32(offset: Int = 0): Int {
+    return ByteBuffer.wrap(this, offset, 4).order(ByteOrder.BIG_ENDIAN).int
+}
+fun ByteArray.readBigEndian64(offset: Int = 0): Long {
+    return ByteBuffer.wrap(this, offset, 8).order(ByteOrder.BIG_ENDIAN).long
+}
+fun Int.toBigEndian4(): ByteArray {
+    return ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(this).array()
+}
+fun Long.toBigEndian8(): ByteArray {
+    return ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(this).array()
+}
+```
+
+### 8.3 压缩实现
+
+```kotlin
+fun compressData(data: ByteArray): ByteArray {
+    val CosmosStream = ByteArrayOutputStream()
+    CosmosStream.use { out ->
+        java.util.zip.DeflaterOutputStream(out, java.util.zip.Deflater(6)).use {
+            it.write(data)
+        }
+    }
+    return CosmosStream.toByteArray()
+}
+
+fun decompressStream(is: InputStream): InputStream {
+    return java.util.zip.InflaterInputStream(is)
+}
+```
+
+### 8.4 SHA256计算
+
+```kotlin
+fun computeSha256(file: File): String {
+    val sha = MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { is ->
+        val buf = ByteArray(1024 * 1024) // 1MB buffer
+        var read = is.read(buf)
+        while (read > 0) {
+            sha.update(buf, 0, read)
+            read = is.read(buf)
+        }
+    }
+    return sha.digest().joinToString("") { "%02x".format(it) }
+}
+```
+
+### 8.5 续传状态读写
+
+使用应用私有目录的 `.p2p_resume/` 子目录：
+
+保存续传状态到 JSON:
+```kotlin
+fun saveResumeState(ip: String, filepath: String, offset: Long, 
+                    totalSize: Long, mtime: Double, role: String) {
+    val dir = context.filesDir.resolve(".p2p_resume")
+    dir.mkdirs()
+    val safeName = filepath.substringAfterLast('/')
+        .replace('/', '_').replace('\\', '_')
+    val file = dir.resolve("resume_${role}_${ip}_${safeName}.json")
+    val gson = Gson()
+    val data = mapOf(
+        "filepath" to filepath,
+        "offset" to offset,
+        "total_size" to totalSize,
+        "mtime" to mtime,
+        "target_ip" to ip,
+        "role" to role,
+        "timestamp" to System.currentTimeMillis() / 1000.0
+    )
+    file.writeText(gson.toJson(data))
+}
+```
+
+### 8.6 本机IP获取
+
+```kotlin
+fun getLocalIPv4(): String? {
+    val en = NetworkInterface.getNetworkInterfaces()
+    while (en.hasMoreElements()) {
+        val iface = en.nextElement()
+        if (!iface.isUp || iface.isLoopback || !iface.isInterface) continue
+        val addr = iface.inetAddresses
+        while (addr.hasMoreElements()) {
+            val inet = addr.nextElement()
+            if (inet is java.net.Inet4Address && !inet.isLoopbackAddress) {
+                return inet.hostAddress
+            }
+        }
+    }
+    return null
+}
+
+fun getSubnet(ip: String): String {
+    // Android没有直接获取子网掩码的方便API
+    // 对于Wi-Fi网络，通常为/24
+    // 实现：解析IP，返回前缀 + ".0/24"
+    val parts = ip.split('.')
+    return "${parts[0]}.${parts[1]}.${parts[2]}.0/24"
+}
+```
+
+### 8.7 Subnet扫描
+
+```kotlin
+fun scanSubnet(cidr: String, callback: (ip: String, hostname: String) -> Unit) {
+    // 解析CIDR，遍历所有IP
+    // 使用协程并行发送UDP探测包
+    // 先试9997端口，再试9998端口
+    // 收到回复 -> callback(ip, hostname)
+}
+```
+
+### 8.8 Service与Activity通信
+
+使用 LiveData/StateFlow 进行Service到Activity的数据传递：
+- 设备列表变化：`MutableStateFlow<List<DeviceNode>>`
+- 日志消息：`MutableSharedFlow<String>`
+- 传输进度：`MutableStateFlow<TransferProgress>`
+- 发回请求：`MutableSharedFlow<ReceiveRequest>`
+
+## 九、生成要求
+
+1. 生成完整项目文件
+2. 包含 build.gradle.kts 依赖配置
+3. 包含 AndroidManifest.xml（权限 + 服务声明）
+4. 所有代码需要完整可编译
+5. 遵循Kotlin最佳实践
+6. 关键注释说明协议逻辑
+7. protobuf/OkHttp库不强制第三方库依赖，优先使用原生Java Socket
+8. 使用 Gson 进行JSON解析（添加`com.google.code.gson:gson:2.10.1`）
+9. 使用 Jetpack Compose 构建UI
+10. 使用 Dagger/Koin 或简单的直接依赖
+
+## 十、测试步骤
+
+1. 安装应用到手机
+2. 连接与电脑同一Wi-Fi
+3. 启动电脑端程序
+4. 点击"自动搜索"或设备应自动发现
+5. 选择一个设备，添加文件，发送
+6. 电脑端会显示接收请求/确认
+7. 验证文件完整性
+
+---
+
+## 复制终点

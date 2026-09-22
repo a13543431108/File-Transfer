@@ -1,0 +1,1301 @@
+package com.p2p.filetransfer
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.p2p.filetransfer.model.TransferItem
+import com.p2p.filetransfer.room.RoomConnState
+import com.p2p.filetransfer.room.RoomMemberStatus
+import com.p2p.filetransfer.ui.LogView
+import com.p2p.filetransfer.ui.ProgressView
+import com.p2p.filetransfer.ui.theme.P2PFileTransferTheme
+import com.p2p.filetransfer.util.SizeFormatter
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
+
+class MainActivity : ComponentActivity() {
+
+    private val vm: MainViewModel by viewModels()
+
+    private val pickFiles = registerForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> uris.forEach { vm.addUriAsFile(it) } }
+
+    private val pickFolder = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri -> uri?.let { vm.addUriAsFolder(it) } }
+
+    private val pickSaveDir = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri -> uri?.let { vm.setSaveTreeUri(it) } }
+
+    private val requestPerms = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        requestPermissionsIfNeeded()
+        requestIgnoreBatteryOptimizations()
+        startTransferService()
+
+        // 处理"分享到" / "用其他应用打开" 传入的文件
+        handleIncomingIntent(intent)
+
+        setContent {
+            P2PFileTransferTheme {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                    MainScreen(
+                        vm = vm,
+                        onAddFiles = { pickFiles.launch(arrayOf("*/*")) },
+                        onAddFolder = { pickFolder.launch(null) },
+                        onPickSaveDir = { pickSaveDir.launch(null) },
+                        onResetSaveDir = { vm.resetSaveDir() }
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * singleTask 模式下，再次被分享时不会再走 onCreate，而是走 onNewIntent。
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    /**
+     * 处理外部传入的文件 URI：
+     *   - ACTION_SEND       单个 URI
+     *   - ACTION_SEND_MULTIPLE  多个 URI
+     *   - ACTION_VIEW       单个 URI（"用其他应用打开"）
+     *
+     * 关键点：Android 对 content:// 的临时读权限只在**本次 Intent** 有效，
+     * 一旦 Activity 退到后台就可能失效。因此必须立即把 URI 复制到应用缓存
+     * （由 ViewModel.addUriAsFile 完成），不能延迟处理。
+     */
+    private fun handleIncomingIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action ?: return
+        val uris = mutableListOf<Uri>()
+        when (action) {
+            Intent.ACTION_SEND -> {
+                val u = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                else
+                    @Suppress("DEPRECATION") intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                u?.let { uris.add(it) }
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                    intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                else
+                    @Suppress("DEPRECATION") intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+                list?.let { uris.addAll(it) }
+            }
+            Intent.ACTION_VIEW -> {
+                intent.data?.let { uris.add(it) }
+            }
+        }
+        if (uris.isEmpty()) return
+
+        // 持久化读权限（尽力而为；部分 provider 不支持）
+        for (u in uris) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    u, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
+        }
+
+        // 交给 ViewModel：把 URI 复制到应用缓存，加入待发送列表
+        for (u in uris) {
+            vm.addUriAsFile(u)
+        }
+        vm.appendLog("[分享] 收到 " + uris.size + " 个文件，已加入待发送列表")
+    }
+
+    private fun startTransferService() {
+        val intent = Intent(this, P2PFileTransferService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+    }
+
+    private fun requestPermissionsIfNeeded() {
+        val perms = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+            perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+        perms.add(Manifest.permission.ACCESS_WIFI_STATE)
+        perms.add(Manifest.permission.CHANGE_WIFI_STATE)
+
+        val missing = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            requestPerms.launch(missing.toTypedArray())
+        }
+    }
+
+    private fun requestIgnoreBatteryOptimizations() {
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                intent.data = Uri.parse("package:" + packageName)
+                startActivity(intent)
+            }
+        } catch (_: Exception) {
+        }
+    }
+}
+
+// ================= ViewModel =================
+
+class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
+
+    private val _items = MutableStateFlow<List<TransferItem>>(emptyList())
+    val items: StateFlow<List<TransferItem>> = _items
+
+    private val _selected = MutableStateFlow<Set<String>>(emptySet())
+    val selected: StateFlow<Set<String>> = _selected
+
+    private val _logs = MutableStateFlow<List<String>>(emptyList())
+    val logs: StateFlow<List<String>> = _logs
+
+    private val _devices = MutableStateFlow<List<com.p2p.filetransfer.model.DeviceNode>>(emptyList())
+    val devices: StateFlow<List<com.p2p.filetransfer.model.DeviceNode>> = _devices
+
+    private val _incoming = MutableStateFlow<com.p2p.filetransfer.model.IncomingRequest?>(null)
+    val incoming: StateFlow<com.p2p.filetransfer.model.IncomingRequest?> = _incoming
+
+    private val _resumeReminder = MutableStateFlow<com.p2p.filetransfer.model.ResumeReminder?>(null)
+    val resumeReminder: StateFlow<com.p2p.filetransfer.model.ResumeReminder?> = _resumeReminder
+
+    private val _saveDirDesc = MutableStateFlow("下载/P2PFileTransfer/")
+    val saveDirDesc: StateFlow<String> = _saveDirDesc
+
+    /** 是否正在发送（防止重复点击"极速发送"导致文件发两遍） */
+    private val _sending = MutableStateFlow(false)
+    val sending: StateFlow<Boolean> = _sending
+
+    private val _deviceName = MutableStateFlow("")
+    val deviceName: StateFlow<String> = _deviceName
+
+    // ===== 房间模式 =====
+    private val _roomJoined = MutableStateFlow(false)
+    val roomJoined: StateFlow<Boolean> = _roomJoined
+    private val _roomName = MutableStateFlow("")
+    val roomName: StateFlow<String> = _roomName
+    private val _roomServer = MutableStateFlow("")
+    val roomServer: StateFlow<String> = _roomServer
+    private val _roomMembers = MutableStateFlow<List<RoomMemberStatus>>(emptyList())
+    val roomMembers: StateFlow<List<RoomMemberStatus>> = _roomMembers
+    private val _selectedRoomPeers = MutableStateFlow<Set<String>>(emptySet())
+    val selectedRoomPeers: StateFlow<Set<String>> = _selectedRoomPeers
+    private val _serverHistory = MutableStateFlow<List<String>>(emptyList())
+    val serverHistory: StateFlow<List<String>> = _serverHistory
+
+    init {
+        // 桥接 Service 的 DeviceRepository（Service 可能晚于 UI 启动，轮询等待）
+        viewModelScope.launch {
+            // 轮询等待 Service 就绪，然后订阅设备列表。
+            // 注意：nodesFlow.collect{} 是永久挂起的（不会返回），
+            // 因此它后面不能有 break —— 那会是不可达代码。
+            while (true) {
+                val repo = P2PFileTransferService.instance?.deviceRepo
+                if (repo != null) {
+                    repo.nodesFlow.collect { _devices.value = it }
+                }
+                kotlinx.coroutines.delay(200)
+            }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.logs.collect { msg ->
+                val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+                val newList = (_logs.value + ("[" + stamp + "] " + msg)).takeLast(500)
+                _logs.value = newList
+            }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.incomingRequest.collect { req ->
+                _incoming.value = req
+            }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.resumeReminder.collect { r ->
+                _resumeReminder.value = r
+            }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.saveDirPath.collect { d ->
+                if (d.isNotEmpty()) _saveDirDesc.value = d
+            }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.deviceName.collect { n ->
+                if (n.isNotEmpty()) _deviceName.value = n
+            }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.roomJoined.collect { _roomJoined.value = it }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.roomNameFlow.collect { _roomName.value = it }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.roomServerFlow.collect { _roomServer.value = it }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.roomMembers.collect { _roomMembers.value = it }
+        }
+        viewModelScope.launch {
+            P2PFileTransferService.serverHistoryFlow.collect { _serverHistory.value = it }
+        }
+    }
+
+    // ===== 房间模式方法 =====
+    fun joinRoom(server: String, room: String) {
+        P2PFileTransferService.instance?.joinRoom(server, room)
+    }
+
+    fun leaveRoom() {
+        P2PFileTransferService.instance?.leaveRoom()
+    }
+
+    fun toggleRoomPeer(peerId: String) {
+        val cur = _selectedRoomPeers.value
+        _selectedRoomPeers.value = if (cur.contains(peerId)) cur - peerId else cur + peerId
+    }
+
+    fun sendToRoom() {
+        if (_sending.value) { appendLog("[UI] 正在发送中"); return }
+        val targets = _selectedRoomPeers.value.toList()
+        if (targets.isEmpty()) { appendLog("[UI] 请先选择房间成员"); return }
+        if (_items.value.isEmpty()) { appendLog("[UI] 请先添加文件或文件夹"); return }
+        val svc = P2PFileTransferService.instance ?: return
+        _sending.value = true
+        val itemsToSend = _items.value
+        appendLog("[UI] 房间发送: " + targets.size + " 个成员 × " + itemsToSend.size + " 个项目")
+        svc.sendToRoomMembers(targets, itemsToSend) { okPaths ->
+            val remain = _items.value.filter { it.path !in okPaths }
+            _items.value = remain
+            _sending.value = false
+        }
+    }
+
+    fun setDeviceName(newName: String) {
+        P2PFileTransferService.instance?.setDeviceName(newName)
+    }
+
+    fun respondIncoming(id: String, accept: Boolean) {
+        P2PFileTransferService.instance?.respondIncoming(id, accept)
+        _incoming.value = null
+    }
+
+    fun respondResumeReminder(id: String, accept: Boolean) {
+        P2PFileTransferService.instance?.respondResumeReminder(id, accept)
+        _resumeReminder.value = null
+    }
+
+    fun setSaveTreeUri(uri: Uri) {
+        val svc = P2PFileTransferService.instance
+        if (svc != null) {
+            svc.setSaveTreeUri(uri)
+        } else {
+            appendLog("[UI] 服务未就绪，无法设置保存目录")
+        }
+    }
+
+    fun resetSaveDir() {
+        P2PFileTransferService.instance?.clearSaveTreeUri()
+    }
+
+    fun toggleSelected(ip: String) {
+        val cur = _selected.value
+        _selected.value = if (cur.contains(ip)) cur - ip else cur + ip
+    }
+
+    fun addUriAsFile(uri: Uri) {
+        val ctx = getApplication<android.app.Application>()
+        viewModelScope.launch {
+            try {
+                // 尽量拿到真实文件名；拿不到时用 MIME + 时间戳拼一个
+                val displayName = queryDisplayName(ctx, uri)
+                val name = if (!displayName.isNullOrBlank()) {
+                    displayName
+                } else {
+                    val mime = try { ctx.contentResolver.getType(uri) } catch (_: Exception) { null }
+                    val ext = guessExtensionFromMime(mime)
+                    "file_" + System.currentTimeMillis() + ext
+                }
+                // 文件名可能含路径分隔符（极少数 provider 会返回），清理掉
+                val safeName = name.replace('/', '_').replace('\\', '_').ifBlank {
+                    "file_" + System.currentTimeMillis()
+                }
+                val cacheDir = File(ctx.cacheDir, "to_send")
+                if (!cacheDir.exists()) cacheDir.mkdirs()
+                // 同名冲突时追加序号，避免相互覆盖
+                var out = File(cacheDir, safeName)
+                var n = 1
+                while (out.exists()) {
+                    val dot = safeName.lastIndexOf('.')
+                    val stem = if (dot > 0) safeName.substring(0, dot) else safeName
+                    val ext = if (dot > 0) safeName.substring(dot) else ""
+                    out = File(cacheDir, stem + "_" + n + ext)
+                    n++
+                }
+                ctx.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(out).use { fos -> input.copyTo(fos) }
+                }
+                _items.value = _items.value + TransferItem(
+                    path = out.absolutePath,
+                    isFolder = false,
+                    uriString = uri.toString()
+                )
+                appendLog("[UI] 已添加: " + out.name)
+            } catch (e: Exception) {
+                appendLog("[UI] 添加文件失败: " + e.message)
+            }
+        }
+    }
+
+    /** MIME -> 常见后缀（用于 provider 不返回文件名时的兜底） */
+    private fun guessExtensionFromMime(mime: String?): String {
+        if (mime.isNullOrEmpty()) return ""
+        return when {
+            mime == "text/plain" -> ".txt"
+            mime == "text/html" -> ".html"
+            mime == "application/json" -> ".json"
+            mime == "application/xml" || mime == "text/xml" -> ".xml"
+            mime == "application/pdf" -> ".pdf"
+            mime == "application/zip" -> ".zip"
+            mime == "application/x-7z-compressed" -> ".7z"
+            mime == "application/x-rar-compressed" -> ".rar"
+            mime == "application/vnd.android.package-archive" -> ".apk"
+            mime == "application/vnd.ms-excel" -> ".xls"
+            mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" -> ".xlsx"
+            mime == "application/msword" -> ".doc"
+            mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> ".docx"
+            mime.startsWith("image/") -> "." + mime.substringAfter("image/").substringBefore("+").replace("jpeg", "jpg")
+            mime.startsWith("audio/") -> "." + mime.substringAfter("audio/").substringBefore("+")
+            mime.startsWith("video/") -> "." + mime.substringAfter("video/").substringBefore("+")
+            else -> ""
+        }
+    }
+
+    fun addUriAsFolder(treeUri: Uri) {
+        val ctx = getApplication<android.app.Application>()
+        viewModelScope.launch {
+            try {
+                appendLog("[UI] 开始复制文件夹到缓存...")
+                val rootName = treeDisplayName(ctx, treeUri) ?: "folder"
+                val safeName = sanitizeFileName(rootName)
+                val cacheRoot = File(ctx.cacheDir, "to_send/" + safeName + "_" + System.currentTimeMillis())
+                if (cacheRoot.exists()) cacheRoot.deleteRecursively()
+                cacheRoot.mkdirs()
+                val rootDocId = try {
+                    android.provider.DocumentsContract.getTreeDocumentId(treeUri)
+                } catch (e: Exception) {
+                    throw IllegalStateException("无法解析选择的目录: " + e.message)
+                }
+                val count = copyTree(ctx, treeUri, rootDocId, cacheRoot)
+                appendLog("[UI] 文件夹已复制到缓存: " + safeName + " (" + count + " 个文件)")
+                _items.value = _items.value + TransferItem(
+                    path = cacheRoot.absolutePath,
+                    isFolder = true,
+                    uriString = treeUri.toString()
+                )
+            } catch (e: Exception) {
+                appendLog("[UI] 添加文件夹失败: " + e.message)
+            }
+        }
+    }
+
+    /** 用 DocumentFile 拿 tree URI 的显示名（比 OpenableColumns 更可靠） */
+    private fun treeDisplayName(ctx: android.content.Context, treeUri: Uri): String? {
+        return try {
+            androidx.documentfile.provider.DocumentFile.fromTreeUri(ctx, treeUri)?.name
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** 清掉文件名里的非法字符 */
+    private fun sanitizeFileName(name: String): String {
+        return name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifEmpty { "folder" }
+    }
+
+    /**
+     * 递归复制 SAF 树到本地缓存目录。
+     * 返回复制的文件数。
+     *
+     * 关键设计：
+     *   - 递归时**始终传同一个 treeUri 和子节点的 docId**，而不是子节点的 URI。
+     *     因为 `DocumentsContract.getDocumentId(uri)` 对 `content://.../tree/downloads`
+     *     这种特殊 tree URI（DownloadsProvider）会抛 Invalid URI；
+     *     而 `buildDocumentUriUsingTree(treeUri, childId)` 得到的子 URI 再次进入
+     *     本函数时也会踩到同一问题。
+     *   - 只用 `buildChildDocumentsUriUsingTree(treeUri, docId)` 枚举子项，
+     *     该 API 对各种 SAF provider（含 DownloadsProvider）都可靠。
+     */
+    private fun copyTree(ctx: android.content.Context, treeUri: Uri, docId: String, destRoot: File): Int {
+        var count = 0
+        val childrenUri = android.provider.DocumentsContract
+            .buildChildDocumentsUriUsingTree(treeUri, docId)
+        ctx.contentResolver.query(childrenUri, null, null, null, null)?.use { cursor ->
+            val nameCol = cursor.getColumnIndex(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeCol = cursor.getColumnIndex(android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE)
+            val idCol = cursor.getColumnIndex(android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            if (nameCol < 0 || mimeCol < 0 || idCol < 0) return 0
+            while (cursor.moveToNext()) {
+                val name = cursor.getString(nameCol) ?: continue
+                val mime = cursor.getString(mimeCol) ?: ""
+                val childId = cursor.getString(idCol) ?: continue
+                val out = File(destRoot, sanitizeFileName(name))
+                if (mime == android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
+                    out.mkdirs()
+                    count += copyTree(ctx, treeUri, childId, out)
+                } else {
+                    val childUri = android.provider.DocumentsContract
+                        .buildDocumentUriUsingTree(treeUri, childId)
+                    try {
+                        ctx.contentResolver.openInputStream(childUri)?.use { input ->
+                            FileOutputStream(out).use { fos -> input.copyTo(fos) }
+                        }
+                        count++
+                    } catch (e: Exception) {
+                        appendLog("[UI] 复制文件失败: " + name + " - " + e.message)
+                    }
+                }
+            }
+        }
+        return count
+    }
+
+    private fun queryDisplayName(ctx: android.content.Context, uri: Uri): String? {
+        return try {
+            ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) c.getString(idx) else null
+                } else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun removeItem(index: Int) {
+        val list = _items.value.toMutableList()
+        if (index in list.indices) {
+            list.removeAt(index)
+            _items.value = list
+        }
+    }
+
+    fun moveUp(index: Int) {
+        if (index <= 0) return
+        val list = _items.value.toMutableList()
+        val tmp = list[index - 1]
+        list[index - 1] = list[index]
+        list[index] = tmp
+        _items.value = list
+    }
+
+    fun moveDown(index: Int) {
+        val list = _items.value.toMutableList()
+        if (index >= list.size - 1) return
+        val tmp = list[index + 1]
+        list[index + 1] = list[index]
+        list[index] = tmp
+        _items.value = list
+    }
+
+    fun clearItems() {
+        _items.value = emptyList()
+    }
+
+    fun appendLog(msg: String) {
+        _logs.value = (_logs.value + msg).takeLast(500)
+    }
+
+    fun send() {
+        // 防重：正在进行中则忽略（避免用户连点导致同一批文件发多遍）
+        if (_sending.value) {
+            appendLog("[UI] 正在发送中，请等待当前任务完成")
+            return
+        }
+        val svc = P2PFileTransferService.instance ?: return
+        val targets = _selected.value.toList()
+        if (targets.isEmpty()) {
+            appendLog("[UI] 请先选择至少一台设备")
+            return
+        }
+        if (_items.value.isEmpty()) {
+            appendLog("[UI] 请先添加文件或文件夹")
+            return
+        }
+        // 去重 IP（防止 devices 列表里同一 IP 出现两次，或 selected set 异常）
+        val uniqueTargets = targets.distinct()
+        if (uniqueTargets.size != targets.size) {
+            appendLog("[UI] 目标设备去重: " + targets.size + " → " + uniqueTargets.size)
+        }
+
+        _sending.value = true
+        val itemsToSend = _items.value
+        appendLog("[UI] 开始发送: " + uniqueTargets.size + " 台设备 × " + itemsToSend.size + " 个项目")
+        try {
+            svc.sendItems(uniqueTargets, itemsToSend) { successPaths ->
+                // 从待发送列表中移除所有 IP 都发送成功的项目
+                if (successPaths.isEmpty()) {
+                    appendLog("[UI] 所有项目发送失败，待发送列表保持不变")
+                } else {
+                    val remain = _items.value.filter { it.path !in successPaths }
+                    val removedCount = _items.value.size - remain.size
+                    _items.value = remain
+                    appendLog("[UI] 已从待发送列表移除 " + removedCount + " 个成功项目" +
+                            if (remain.isNotEmpty()) "，剩余 " + remain.size + " 个未成功" else "")
+                }
+                _sending.value = false
+            }
+        } catch (e: Exception) {
+            _sending.value = false
+            appendLog("[UI] 发送异常: " + e.message)
+        }
+    }
+}
+
+// ================= Compose UI =================
+
+/** 房间模式卡片：输入服务器/房间号加入，展示成员并支持选中发送。 */
+@Composable
+fun RoomCard(vm: MainViewModel) {
+    val joined by vm.roomJoined.collectAsState()
+    val roomName by vm.roomName.collectAsState()
+    val roomServer by vm.roomServer.collectAsState()
+    val members by vm.roomMembers.collectAsState()
+    val serverHistory by vm.serverHistory.collectAsState()
+
+    var serverText by remember { mutableStateOf("") }
+    var roomText by remember { mutableStateOf("") }
+    var expanded by remember { mutableStateOf(false) }
+    var historyExpanded by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (joined) MaterialTheme.colorScheme.tertiaryContainer
+            else MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Filled.Share,
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        if (joined) "房间: " + roomName + " (" + members.size + " 人)" else "房间模式（公网互传）",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    if (joined && roomServer.isNotEmpty()) {
+                        Text(
+                            "@ " + roomServer,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                if (joined) {
+                    TextButton(onClick = {
+                        vm.leaveRoom()
+                        serverText = ""; roomText = ""
+                    }) { Text("退出") }
+                } else {
+                    IconButton(onClick = { expanded = !expanded }) {
+                        Icon(
+                            if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                            contentDescription = "展开"
+                        )
+                    }
+                }
+            }
+
+            if (!joined) {
+                if (!expanded) {
+                    Text(
+                        "输入相同房间号即可跨网络互传；不加入则仅局域网。点击右侧箭头展开。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    Spacer(Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = serverText,
+                            onValueChange = { serverText = it },
+                            label = { Text("服务器地址 (host 或 host:port)") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        // 历史下拉按钮：仅当有历史且未展开时显示
+                        if (serverHistory.isNotEmpty()) {
+                            IconButton(onClick = { historyExpanded = !historyExpanded }) {
+                                Icon(
+                                    if (historyExpanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                                    contentDescription = "历史地址"
+                                )
+                            }
+                        }
+                    }
+                    // 历史地址列表
+                    if (historyExpanded && serverHistory.isNotEmpty()) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                        ) {
+                            Column {
+                                serverHistory.forEach { h ->
+                                    Text(
+                                        h,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { serverText = h; historyExpanded = false }
+                                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(
+                        value = roomText,
+                        onValueChange = { roomText = it },
+                        label = { Text("房间号") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = { vm.joinRoom(serverText.trim(), roomText.trim()) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("加入房间") }
+                }
+            } else {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "成员已合并到下方【在线设备】列表，带 [房间设备] 标识。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MainScreen(
+    vm: MainViewModel,
+    onAddFiles: () -> Unit,
+    onAddFolder: () -> Unit,
+    onPickSaveDir: () -> Unit,
+    onResetSaveDir: () -> Unit
+) {
+    val running by P2PFileTransferService.isRunning.collectAsState()
+    val service = if (running) P2PFileTransferService.instance else null
+    val devices by vm.devices.collectAsState()
+    val selected by vm.selected.collectAsState()
+    val roomMembers by vm.roomMembers.collectAsState()
+    val selectedPeers by vm.selectedRoomPeers.collectAsState()
+    val items by vm.items.collectAsState()
+    val logs by vm.logs.collectAsState()
+    val sendProgress by P2PFileTransferService.sendProgress.collectAsState()
+    val recvProgress by P2PFileTransferService.recvProgress.collectAsState()
+    val autoScan by P2PFileTransferService.autoScan.collectAsState()
+    val incoming by vm.incoming.collectAsState()
+    val resumeReminder by vm.resumeReminder.collectAsState()
+    val saveDirDesc by vm.saveDirDesc.collectAsState()
+    val deviceName by vm.deviceName.collectAsState()
+
+    var scanCidrDialog by remember { mutableStateOf(false) }
+    var scanCidrText by remember { mutableStateOf("") }
+    var saveDirDialog by remember { mutableStateOf(false) }
+    var deviceNameDialog by remember { mutableStateOf(false) }
+    var deviceNameText by remember { mutableStateOf("") }
+
+    // 设备名编辑弹窗
+    if (deviceNameDialog) {
+        AlertDialog(
+            onDismissRequest = { deviceNameDialog = false },
+            title = { Text("本机设备名") },
+            text = {
+                Column {
+                    Text("其他设备在搜索时会看到这个名字：")
+                    OutlinedTextField(
+                        value = deviceNameText,
+                        onValueChange = { deviceNameText = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.setDeviceName(deviceNameText)
+                    deviceNameDialog = false
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deviceNameDialog = false }) { Text("取消") }
+            }
+        )
+    }
+
+    // 保存目录操作弹窗
+    if (saveDirDialog) {
+        AlertDialog(
+            onDismissRequest = { saveDirDialog = false },
+            title = { Text("保存位置") },
+            text = {
+                Text(
+                    "当前保存位置:\n" + saveDirDesc + "\n\n" +
+                            "默认位置: 下载/P2PFileTransfer/\n\n" +
+                            "点击“选择目录”用系统文件选择器选一个文件夹（如 Download、Documents 或外置存储上的任意目录）。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    saveDirDialog = false
+                    onPickSaveDir()
+                }) { Text("选择目录") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    saveDirDialog = false
+                    onResetSaveDir()
+                }) { Text("恢复默认") }
+            }
+        )
+    }
+
+    // 网段扫描弹窗
+    if (scanCidrDialog) {
+        AlertDialog(
+            onDismissRequest = { scanCidrDialog = false },
+            title = { Text("网段扫描") },
+            text = {
+                Column {
+                    Text("输入网段（如 192.168.1.0/24，留空则扫描所有子网）")
+                    OutlinedTextField(
+                        value = scanCidrText,
+                        onValueChange = { scanCidrText = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val cidr = scanCidrText.trim()
+                    if (cidr.isEmpty()) service?.scanAllSubnets() else service?.scanSubnet(cidr)
+                    scanCidrDialog = false
+                }) { Text("扫描") }
+            },
+            dismissButton = {
+                TextButton(onClick = { scanCidrDialog = false }) { Text("取消") }
+            }
+        )
+    }
+
+    // 续传提醒
+    if (resumeReminder != null) {
+        val rr = resumeReminder!!
+        val preview = rr.items.take(10).joinToString("\n") { item ->
+            val name = if (item.isFolder) ("[目录] " + (item.relPath ?: "?")) else ("[文件] " + File(item.filepath).name)
+            val pct = if (item.totalSize > 0) (item.offset * 100 / item.totalSize) else 0
+            "  " + name + " (" + pct + "%)"
+        }
+        AlertDialog(
+            onDismissRequest = { vm.respondResumeReminder(rr.id, false) },
+            title = { Text("续传提醒") },
+            text = {
+                Text(
+                    "检测到设备 " + rr.hostname + " (" + rr.fromIp + ") 上线！\n" +
+                            "以下文件未完成传输，是否继续上传？\n\n" + preview +
+                            if (rr.items.size > 10) "\n  ... 还有 " + (rr.items.size - 10) + " 个文件" else ""
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { vm.respondResumeReminder(rr.id, true) }) { Text("续传") }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.respondResumeReminder(rr.id, false) }) { Text("放弃") }
+            }
+        )
+    }
+
+    // 来件确认
+    if (incoming != null) {
+        val req = incoming!!
+        AlertDialog(
+            onDismissRequest = { vm.respondIncoming(req.id, false) },
+            title = { Text(if (req.isFolder) "收到文件夹" else "收到文件") },
+            text = {
+                Text(
+                    "来自: " + req.fromIp + "\n" +
+                            "名称: " + req.fileName + "\n" +
+                            "大小: " + SizeFormatter.humanSize(req.totalSize) +
+                            "\n\n是否接收？"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { vm.respondIncoming(req.id, true) }) { Text("接收") }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.respondIncoming(req.id, false) }) { Text("拒绝") }
+            }
+        )
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text("文件互传 V15.2", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            text = "设备名: " + deviceName + "   ·   保存到: " + saveDirDesc,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                },
+                actions = {
+                    IconButton(onClick = {
+                        deviceNameText = deviceName
+                        deviceNameDialog = true
+                    }) {
+                        Icon(Icons.Filled.Info, contentDescription = "修改设备名")
+                    }
+                    IconButton(onClick = { saveDirDialog = true }) {
+                        Icon(Icons.Filled.Settings, contentDescription = "设置保存目录")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            )
+        },
+        bottomBar = {
+            Surface(color = MaterialTheme.colorScheme.surface, shadowElevation = 8.dp) {
+                val roomPeers by vm.selectedRoomPeers.collectAsState()
+                val lanReady = selected.isNotEmpty() && items.isNotEmpty()
+                val roomReady = roomPeers.isNotEmpty() && items.isNotEmpty()
+                val ready = lanReady || roomReady
+                val sending by vm.sending.collectAsState()
+                val canSend = ready && !sending
+                Button(
+                    onClick = {
+                        // 房间成员优先；未选房间成员则走局域网发送
+                        if (roomPeers.isNotEmpty()) vm.sendToRoom() else vm.send()
+                    },
+                    enabled = canSend,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                        .height(52.dp)
+                ) {
+                    Text(
+                        text = when {
+                            sending -> "发送中，请稍候…"
+                            roomReady -> "发送到房间  ·  " + roomPeers.size + " 个成员 / " + items.size + " 个文件"
+                            lanReady -> "极速发送  ·  " + selected.size + " 台设备 / " + items.size + " 个文件"
+                            else -> "请选择设备和文件后发送"
+                        },
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+            }
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp)
+        ) {
+            Spacer(Modifier.height(8.dp))
+
+            // ===== 房间模式 =====
+            RoomCard(vm)
+
+            Spacer(Modifier.height(8.dp))
+
+            // ===== 设备区 =====
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "在线设备 (" + (devices.size + roomMembers.size) + ")",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        FilledTonalButton(
+                            onClick = { service?.broadcastSearch() },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text("广播搜索", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { service?.scanAllSubnets() },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                        ) {
+                            Text("扫描子网", style = MaterialTheme.typography.labelMedium)
+                        }
+                        OutlinedButton(
+                            onClick = { scanCidrDialog = true },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                        ) {
+                            Text("网段", style = MaterialTheme.typography.labelMedium)
+                        }
+                        OutlinedButton(
+                            onClick = { service?.toggleAutoScan() },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                if (autoScan) "后台:开" else "后台:关",
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+
+                    // 1) 房间成员（置顶，带 [房间设备] 标识）
+                    roomMembers.forEach { st ->
+                        val checked = selectedPeers.contains(st.member.id)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { vm.toggleRoomPeer(st.member.id) }
+                                .padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = checked,
+                                onCheckedChange = { vm.toggleRoomPeer(st.member.id) }
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "[房间设备] " + st.member.name,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    when (st.state) {
+                                        RoomConnState.CONNECTED -> "已连接 " + (st.addr ?: "")
+                                        RoomConnState.CONNECTING -> "连接中…"
+                                        RoomConnState.FAILED -> "连接失败"
+                                        else -> "空闲"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = when (st.state) {
+                                        RoomConnState.CONNECTED -> MaterialTheme.colorScheme.primary
+                                        RoomConnState.FAILED -> MaterialTheme.colorScheme.error
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    // 2) 局域网设备
+                    devices.forEach { node ->
+                        val checked = selected.contains(node.ip)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { vm.toggleSelected(node.ip) }
+                                .padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = checked,
+                                onCheckedChange = { vm.toggleSelected(node.ip) }
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    node.hostname,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    node.ip,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    if (devices.isEmpty() && roomMembers.isEmpty()) {
+                        Text(
+                            "暂无设备。点击上方【广播搜索】发现局域网设备，或加入房间获取房间成员。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(vertical = 12.dp)
+                        )
+                    } else {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { service?.refreshOnline() },
+                            modifier = Modifier.fillMaxWidth(),
+                            contentPadding = PaddingValues(vertical = 6.dp)
+                        ) {
+                            Text("刷新在线状态", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            // ===== 待发送区 =====
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "待发送 (" + items.size + ")",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (items.isNotEmpty()) {
+                            TextButton(onClick = { vm.clearItems() }) { Text("清空") }
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = onAddFiles,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
+                        ) {
+                            Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("文件", style = MaterialTheme.typography.labelMedium)
+                        }
+                        Button(
+                            onClick = onAddFolder,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
+                        ) {
+                            Icon(Icons.Filled.Folder, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("文件夹", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+
+                    if (items.isEmpty()) {
+                        Text(
+                            "暂无待发送项目，点击上方按钮添加",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(vertical = 12.dp)
+                        )
+                    } else {
+                        items.forEachIndexed { idx, it ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = if (it.isFolder) Icons.Filled.Folder else Icons.AutoMirrored.Filled.InsertDriveFile,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(20.dp),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = File(it.path).name,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = if (it.isFolder) "文件夹" else SizeFormatter.humanSize(File(it.path).length()),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { vm.moveUp(idx) },
+                                    enabled = idx > 0,
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(Icons.Filled.ArrowUpward, contentDescription = "上移", modifier = Modifier.size(18.dp))
+                                }
+                                IconButton(
+                                    onClick = { vm.moveDown(idx) },
+                                    enabled = idx < items.size - 1,
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(Icons.Filled.ArrowDownward, contentDescription = "下移", modifier = Modifier.size(18.dp))
+                                }
+                                IconButton(
+                                    onClick = { vm.removeItem(idx) },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(Icons.Filled.Close, contentDescription = "移除", modifier = Modifier.size(18.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            // ===== 进度区 =====
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    ProgressView(title = "发送进度", progress = sendProgress)
+                    Spacer(Modifier.height(4.dp))
+                    ProgressView(title = "接收进度", progress = recvProgress)
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            // ===== 日志区 =====
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text("日志", style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.height(4.dp))
+                    Box(modifier = Modifier.fillMaxWidth().height(140.dp)) {
+                        LogView(logs = logs)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+        }
+    }
+}

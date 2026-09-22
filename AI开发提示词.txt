@@ -1,0 +1,386 @@
+================================================================================
+                    P2P 文件互传系统 · AI 开发提示词（全网通版）
+================================================================================
+
+用途：将本文件内容整体发给 AI 代码生成工具（Cursor / Copilot / Qwen / Claude 等），
+      即可生成完整可运行的三端项目（电脑端 Python + 安卓端 Kotlin + 信令服务器）。
+
+提示：内容较长，建议分模块投喂（先服务器，再电脑端，最后安卓端）。
+
+================================================================================
+                            复制起点 · COPY START
+================================================================================
+
+你是一名资深全栈工程师，精通 Python 网络编程与 Android Kotlin 开发。
+请根据以下完整技术规格，实现一个跨平台 P2P 文件互传系统，包含三部分：
+  1. 信令服务器（Python，纯标准库）
+  2. 电脑端（Python + tkinter，纯标准库）
+  3. 安卓端（Kotlin + Jetpack Compose）
+要求代码完整、可编译、可运行，协议严格一致。
+
+================================================================================
+一、总体架构
+================================================================================
+
+系统提供两种工作模式：
+
+【局域网模式】传统 P2P 直连
+  - UDP 广播 + 子网扫描发现设备
+  - TCP 直连传输文件
+
+【公网房间模式】信令服务器牵线 + TCP 打洞
+  - 设备输入相同"房间号"加入同一房间
+  - 服务器交换双方地址并协调打洞
+  - 打洞成功后两端直连传文件
+  - 服务器【只交换地址信令，不转发任何文件数据】
+
+设计原则：
+  - 单一职责：服务器单文件；客户端网络模块独立
+  - 单一来源：所有可调参数集中配置，改一处全局生效
+  - 房间号才启用：不输入房间号 → 纯局域网行为
+  - 复用长连接：打洞连接保持打开，发送时复用
+  - 最小侵入：房间模式叠加于局域网模式之上
+
+================================================================================
+二、端口与常量（两端必须严格一致）
+================================================================================
+
+【局域网模式端口】
+  UDP_PORT  = 9998    设备发现（心跳/广播/回复）
+  TCP_PORT  = 9999    文件传输
+  SCAN_PORT = 9997    扫描探测（与设备发现隔离）
+
+【公网房间模式端口（服务器）】
+  LISTEN_PORT     = 3336   信令交互（UDP，双栈监听）
+  TCP_LISTEN_PORT = 3337   TCP 映射观测（客户端连此暴露 TCP 公网映射，双栈监听）
+
+【IPv6 / 双栈要求】
+  · 信令服务器 UDP 3336 与 TCP 3337 必须同时监听 IPv4 + IPv6
+    （IPv6 socket 设 IPV6_V6ONLY=1，避免与 IPv4 抢端口）
+  · 客户端上报地址 lan 列表 = IPv4 内网地址 + 公网 IPv6
+    （过滤 IPv6 链路本地 fe80::/10 与回环 ::1）
+  · IPv6 地址在 "ip:port" 中必须用方括号包裹：[240e::1]:3336
+    （IPv6 地址本身含冒号，方括号用于与端口区分）
+  · 提供地址解析工具：解析 "ip:port" / "[ipv6]:port"；拒绝无方括号的 IPv6
+  · 服务器地址栏解析支持：host / host:port / [ipv6]:port / 纯 IPv6
+  · 信令客户端按服务器地址族自适应：UDP socket / TCP 映射连接 /
+    打洞 bind 均按 v4 或 v6 选择对应地址族
+  · 打洞候选地址：内网地址(v4/v6) → TCP 公网映射(v4/v6)，均支持
+
+【关键常量】
+  NODE_TIMEOUT            = 600 秒    节点超时
+  BUFFER_SIZE             = 1 MB      初始缓冲（动态调整）
+  MAX_BUFFER_SIZE         = 8 MB      最大缓冲（电脑）/ 4MB（安卓）
+  SOCKET_BUFFER_SIZE      = 16 MB     socket 缓冲
+  AUTO_SCAN_INTERVAL      = 20 秒     后台扫描间隔
+  SCAN_TIMEOUT            = 0.5 秒    单 IP 扫描超时
+  HEARTBEAT_MAX_FAIL      = 3         心跳失败阈值
+  MAX_RETRIES             = 3         传输重试次数
+
+【房间模式常量】
+  MAX_ROOM_SIZE           = 16        单房间最大人数
+  HEARTBEAT_INTERVAL      = 20 秒     客户端心跳间隔
+  HEARTBEAT_TIMEOUT       = 30 秒     服务器成员超时（>心跳间隔）
+  PUNCH_CONCURRENCY       = 6         同时打洞任务数
+  PUNCH_CONNECT_TIMEOUT   = 0.3 秒    单次 TCP connect 超时
+  PUNCH_RETRY             = 3         打洞重试次数
+  PUNCH_RETRY_BACKOFF     = 2 秒      重试退避基数
+  PUNCH_DELAY_MS          = 300 ms    服务器下发打洞后延迟
+  NAT_KEEPALIVE_INTERVAL  = 20 秒     维持 NAT 映射
+
+【标志位】
+  FLAG_FILE          = 0x00   单文件传输
+  FLAG_FOLDER        = 0x01   文件夹传输
+  FLAG_COMPRESS      = 0x01   flags bit0 压缩
+  FLAG_RESUME        = 0x02   flags bit1 续传
+  FLAG_QUERY_OFFSET  = 0x02   作为 TCP 首字节时的续传偏移量查询
+
+【文本压缩白名单（22 种）】
+  .txt .log .json .xml .py .js .html .htm .css .csv
+  .yaml .yml .toml .ini .cfg .conf .md .rst .sh .bat .ps1 .vbs
+
+================================================================================
+三、信令服务器（Python，单文件，纯标准库）
+================================================================================
+
+【职责】房间匹配 + 成员管理 + TCP 映射观测 + 打洞协调。零数据转发。
+
+【全局配置（单一来源，文件顶部）】
+  VER = 1
+  LISTEN_IP = "0.0.0.0"
+  LISTEN_PORT = 3336
+  TCP_LISTEN_PORT = 3337
+  MAX_ROOM_SIZE = 16
+  HEARTBEAT_TIMEOUT = 30
+  CLEAN_INTERVAL = 5
+  PUNCH_DELAY_MS = 300
+
+【全局状态】
+  rooms = {}          # {room_name: {member_id: member_dict}}
+  id_index = {}       # {member_id: (room_name, addr)}
+  tcp_mappings = {}   # {member_id: (ip, port)}  观测到的 TCP 公网映射
+  tcp_socks = {}      # {member_id: socket}  保持映射的连接
+  state_lock = threading.Lock()
+
+【信令协议（UDP + JSON UTF-8，单包 ≤1400B）】
+
+  客户端 → 服务器：
+    {"type":"join","ver":1,"room":"8888","name":"设备名","tcp":9999,
+     "lan":["192.168.1.10"],"did":"稳定设备ID"}
+    {"type":"hb","ver":1,"id":"<ID>"}
+    {"type":"punch_req","ver":1,"id":"<我>","target":"<对方>"}
+    {"type":"bye","ver":1,"id":"<我>"}
+
+  服务器 → 客户端：
+    {"type":"joined","id":"A1","members":[
+       {"id":"B2","did":"...","name":"手机","pub":"1.2.3.4:5678",
+        "pub_tcp":"1.2.3.4:9999","lan":["..."],"tcp":9999}]}
+    {"type":"member_join","member":{...同上...}}
+    {"type":"member_leave","id":"B2"}
+    {"type":"punch_go","peer":{...对端...},"at":1730000000123}
+    {"type":"error","code":"ROOM_FULL"}
+
+  说明：成员的 pub（UDP 公网映射）由服务器从 recvfrom 的 addr 自动填充；
+        pub_tcp（TCP 公网映射）由服务器从 TCP 映射观测端口获得。
+
+【核心函数】
+  handle_join      新成员加入，若房间满回 ROOM_FULL；回 joined(含现有成员)，
+                   广播 member_join 给现有成员；房间新建/加入/总览日志
+  handle_hb        刷新成员 last_hb，更新 pub
+  handle_punch_req 校验双方同房间，向双方下发 punch_go（at = now + PUNCH_DELAY_MS）
+  handle_bye       主动离开
+  remove_member    移除成员，广播 member_leave，房间空则销毁；关闭其 TCP 映射连接
+  cleanup_loop     每 CLEAN_INTERVAL 扫描 last_hb 超时成员并移除
+
+【TCP 映射观测】
+  tcp_listener_loop  监听 TCP_LISTEN_PORT，每连接一线程
+  _handle_tcp_reg    读 [2B len][len B id]，登记 tcp_mappings[mid]=addr，
+                     保持连接打开（recv 阻塞直到对端关闭），
+                     连接关闭时清除映射
+
+【启动横幅】（后台线程，不阻塞收包）
+  · 打印监听地址
+  · 打印本机局域网 IP（get_lan_ips）
+  · 尝试联网获取公网 IP（get_public_ip，多源容错，失败不退出）
+  · 明确提示客户端该填什么
+
+【并发】
+  · UDP 单线程处理（recvfrom → dispatch）
+  · TCP 每连接一线程，共享状态用 state_lock 保护
+  · 严禁在持锁期间调用回调或网络发送（避免死锁）
+
+================================================================================
+四、两端二进制文件传输协议（大端序，必须严格一致）
+================================================================================
+
+【单文件传输】
+  发送方 → 接收方（文件头）：
+    [1B] 0x00 (FLAG_FILE)
+    [4B] filename_len (Int32, 大端)
+    [NB] filename (UTF-8)
+    [1B] flags (bit0=compress, bit1=resume)
+    [8B] file_size (Int64, 大端)
+    [8B] offset (仅当 flags & FLAG_RESUME)
+  接收方 → 发送方：
+    [2B] "OK" 或 "NO"
+  发送方 → 接收方（数据）：
+    [NB] file_data（原始或 zlib 压缩）
+    [64B] sha256_hash（hex 字符串 UTF-8）
+  接收方 → 发送方：
+    [10B] "MATCH     " 或 "MISMATCH  "（固定 10 字节，补空格）
+
+【续传偏移量查询】
+  发送方 → 接收方：
+    [1B] 0x02
+    [8B] total_size
+    [4B] filename_len
+    [NB] filename
+  接收方 → 发送方：
+    [8B] local_offset（0 表示无此文件）
+
+【文件夹传输】
+  头：[1B]0x01 [4B]name_len [NB]name [4B]file_count [8B]total_bytes
+  确认：[2B]"OK"/"NO"
+  清单（每文件）：[4B]rel_path_len [NB]rel_path [8B]size [8B]mtime(Double64)
+  清单确认：[1B]0x01/0x00
+  逐文件指令：[1B] 0=skip / 1=full / 2=resume [8B]offset(仅 resume)
+  逐文件传输：同单文件协议（用 rel_path）
+
+================================================================================
+五、电脑端（Python + tkinter，纯标准库）
+================================================================================
+
+【主文件】文件互传.py
+  类结构：SpeedTracker / Node(threading.Thread) / P2PApp
+  纯标准库：socket struct threading hashlib json zlib tkinter ipaddress
+
+【Node 类】网络核心
+  · udp_listener      监听 UDP_PORT（IPv4+IPv6）
+  · scan_listener     监听 SCAN_PORT
+  · _start_broadcasters  每网卡一广播线程（启动 5 秒爆发，之后 1 秒）
+  · tcp_file_receiver TCP 监听 TCP_PORT，accept 后处理
+  · handle_receive    循环处理一条连接上的多条消息（支持长连接）
+  · _send_single_file / _send_folder / _send_file_data_fast
+  · clean_nodes / heartbeat_check / scan_subnet / broadcast_discovery
+
+【P2PApp 类】GUI（tkinter）
+  · 顶部：保存路径标签 + 房间模式面板
+  · 左侧：在线设备列表（多选）
+  · 右侧：待发送项目列表
+  · 下方：进度条（发送/接收/全局）+ 事件日志
+
+【房间模式集成（新增）】
+  房间模式【内联进单文件】（电脑端保持单文件，类名加 Rm 前缀避免冲突）：
+    文件顶部：RM_* 常量（配置单一来源）+ 以下类
+    class RmPunchResult      打洞结果
+    class RmHolePuncher      TCP 打洞
+    class RmSignalingClient  信令客户端
+    class RmConn             长连接
+    class RmRoomManager      房间管理
+    兼容别名：SignalingClient = RmSignalingClient
+              RoomManager = RmRoomManager
+
+  主文件改动点：
+    1. 顶部内联房间模块（ROOM_AVAILABLE 标志，无需外部导入）
+    2. P2PApp.__init__ 加房间状态字段（room_sig/room_mgr/room_server/
+       server_history/selected_room_peers 等）
+    3. _build_ui 调 _build_room_ui（服务器地址下拉框 + 房间号 + 加入按钮）
+    4. on_node_select / refresh_nodes：合并显示房间成员与局域网设备，
+       房间成员带 [房间设备] 标识，末尾 [peer_id]
+    5. send_items_action：房间成员优先（走打洞长连接），否则局域网
+    6. tcp_file_receiver：accept 到打洞入站连接时交给 room_mgr.on_inbound
+    7. handle_room_receive：长连接接收循环（用 io_lock 串行化收发）
+    8. Node.send_items_via_socket：在已有 socket 上发送
+    9. load_config/save_config：持久化 server_history（最多5个）
+   10. on_close：退出房间
+
+【服务器地址持久化】
+  · 存 ~/.p2p_config.json 的 server_history 字段
+  · 下拉框可选历史（最多 5 个，最新在前）
+  · 启动时输入框为空
+
+【关键实现细节】
+  · SO_RCVBUF 必须在 bind 之前设置（TCP window scale 握手协商）
+  · 动态缓冲区：按实测速度调整（只增不减，避免负反馈）
+  · 续传：双方状态取 min/max + 在线 QUERY_OFFSET 协商
+  · 压缩文件不支持续传（压缩流无法分块恢复）
+
+================================================================================
+六、安卓端（Kotlin + Jetpack Compose）
+================================================================================
+
+【环境】
+  包名 com.p2p.filetransfer，最低 SDK 24，目标 SDK 35
+  Kotlin + Jetpack Compose + MVVM，Gradle Kotlin DSL
+  最小化第三方库，网络用原生 Socket；JSON 用 org.json 或 Gson
+
+【结构】
+  MainActivity.kt           主界面 + ViewModel + Compose Screen
+  P2PFileTransferService.kt 前台服务（网络核心）
+  room/                     房间模式模块
+    RoomConfig.kt           配置单一来源
+    RoomModels.kt           RoomMember / PunchGo / RoomConnState / RoomMemberStatus
+    SignalingClient.kt      UDP JSON 信令 + TCP 映射连接
+    HolePuncher.kt          TCP 打洞（Socket.bind+connect）
+    RoomManager.kt          全连接 + 长连接 + 入站接管
+  protocol/                 Constants / ProtoReader / ProtoWriter /
+                            UdpDiscovery / TcpFileTransfer
+  model/ repository/ ui/ util/
+
+【前台服务】
+  · 承载 UDP 发现 + TCP 传输 + 房间模式
+  · 通知渠道：传输进度 / 接收请求 / 应用状态
+  · 获取 Wi-Fi/CPU 唤醒锁，请求忽略电池优化
+
+【房间模式集成】
+  · Service 持有 RoomManager + SignalingClient
+  · TcpFileTransfer.onInboundConnection 钩子：accept 到打洞连接交给 RoomManager
+  · TcpFileTransfer.sendItemsOnSocket / handleReceiveOnSocket：长连接收发
+  · Service 暴露 joinRoom/leaveRoom/sendToRoomMembers + roomJoined/roomMembers 状态流
+  · UI：RoomCard（服务器历史下拉 + 房间号 + 加入）
+  · 设备列表：房间成员与局域网设备合并，房间成员带 [房间设备] 标识
+
+【服务器地址持久化】
+  · SharedPreferences 键 "server_history"，换行分隔，最多 5 个
+  · UI 服务器地址输入框旁加"历史"下拉按钮
+
+【Android 注意】
+  · Android 10+ 分区存储（SAF / MediaStore）
+  · 无 os.sendfile，走普通缓冲读写
+  · UDP 广播部分 ROM 受限 → 优先子网扫描
+  · 后台必须前台服务，否则被系统杀死
+
+================================================================================
+七、公网房间模式 · 打洞关键实现
+================================================================================
+
+【为什么服务器要知道 TCP 映射】
+  NAT 的 UDP 映射和 TCP 映射是两张独立的表。
+  服务器通过 recvfrom 得到的是 UDP 公网地址，不能用于 TCP 打洞。
+  因此客户端要额外建立一条到服务器 TCP 端口(3337)的"映射观测连接"，
+  绑定打洞专用本地端口后再 connect，使服务器观测到的 TCP 公网映射
+  与本机后续打洞使用的本地端口一致。这条连接保持打开以维持映射。
+
+【TCP 打洞流程】
+  1. 客户端加入房间时，建 TCP 映射观测连接（bind 打洞端口 → connect 服务器 3337）
+  2. 服务器登记该客户端的 TCP 公网映射
+  3. 成员互相请求打洞 → 服务器下发 punch_go（含对方 pub_tcp + 统一 at 时刻）
+  4. 双方等到 at 时刻，同时向对方 pub_tcp 发起 connect（TCP 同时打开）
+  5. 打通后，两端各持这条连接的一端（可能一端 outbound 成功，另一端 listener
+     accept 到入站连接），都能收发
+  6. 之后传文件复用这条连接
+
+【收发共用同一 socket 的串行化】
+  打洞连接是双向的。发送方写数据+读 ACK，接收方读数据帧。
+  用一把 io_lock 串行化：发送时持锁；接收循环仅在 select 检测到可读时持锁读一帧。
+  因收发串行触发，不会真并发。
+
+【入站连接识别】
+  一端 connect 成功（持 outbound），另一端的 listener 会 accept 到这条连接。
+  后者用来源 (ip, port) 匹配成员的 pub_tcp，识别为打洞入站连接并接管。
+
+【IPv6 打洞要点】
+  · 地址含冒号，传输时必须用 [ip]:port 格式，解析时先剥离方括号
+  · 内网地址优先试 IPv6（若对方有公网 v6，可绕过 NAT 直连）
+  · TCP 打洞时按地址含冒号判断地址族：bind 用 ("::", port) 还是 ("", port)
+  · 监听 socket 也要双栈（v4 + v6 各一个，v6 设 IPV6_V6ONLY=1）
+  · 两端都有公网 IPv6 → 可直接连，无需打洞（最稳）
+  · 注意：IPv6 与 IPv4 无法互连，两端地址族必须一致才能打洞成功
+
+【打洞并发】
+  一进房间即对房间内所有成员打洞（网状全连接）。
+  用 Semaphore(PUNCH_CONCURRENCY=6) 限制同时打洞任务数，避免端口耗尽。
+
+【失败处理】
+  对称 NAT / 运营商 CGNAT / 手机蜂窝网下打洞可能失败（物理限制）。
+  失败时提示用户，不做中继。
+
+================================================================================
+八、生成要求
+================================================================================
+
+  1. 生成完整项目，三端协议严格一致
+  2. 服务器单文件、纯标准库
+  3. 电脑端纯标准库（tkinter GUI）
+  4. 安卓端可用 Android Studio 直接编译
+  5. 所有可调参数集中为"单一来源"配置
+  6. 房间模式代码与局域网模式解耦（电脑端内联 Rm* 类；安卓端独立 room/ 包）
+  7. 严格按上述端口、常量、协议实现，不得改动
+  8. 关键协议逻辑要有注释
+  9. 严禁在持锁期间执行回调/网络发送（避免死锁）
+
+================================================================================
+九、测试步骤
+================================================================================
+
+  1. 启动信令服务器（有公网 IP 的机器）
+  2. 两端启动客户端，服务器地址填服务器 IP
+  3. 两端输入相同房间号，加入房间
+  4. 观察：成员列表出现对方，状态变为"已连接"
+  5. 勾选房间成员 → 添加文件 → 发送
+  6. 验证文件完整接收（SHA-256 校验）
+  7. 局域网模式：不填房间号，直接用广播/扫描发现设备互传
+
+================================================================================
+                            复制终点 · COPY END
+================================================================================

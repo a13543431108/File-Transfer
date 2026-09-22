@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">文件互传</string>
+    <string name="notification_channel_status">应用状态</string>
+    <string name="notification_channel_progress">传输进度</string>
+    <string name="notification_channel_request">接收请求</string>
+    <string name="notification_title">文件互传运行中</string>
+    <string name="notification_text">正在监听设备发现与文件传输</string>
+</resources>
