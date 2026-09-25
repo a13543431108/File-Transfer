@@ -65,24 +65,59 @@ RM_T_JOIN = "join"
 RM_T_HB = "hb"
 RM_T_PUNCH_REQ = "punch_req"
 RM_T_BYE = "bye"
+RM_T_NAT_PROBE = "nat_probe"              # 客户端 -> 服务器：请求回复观察到的公网地址
+RM_T_TIME_REQ = "time_req"                # 客户端 -> 服务器：NTP 式时间同步请求
+RM_T_TIME_REPLY = "time_reply"            # 服务器 -> 客户端：回显 t1 + 服务器时刻 t2
+RM_T_UDP_HELLO = "udp_hello"              # 客户端 -> 服务器：登记 UDP 打洞 socket 公网映射
 # 消息类型：服务器 -> 客户端
 RM_T_JOINED = "joined"
+RM_T_NAT_PROBE_REPLY = "nat_probe_reply"  # 服务器 -> 客户端：观察到的公网地址
 RM_T_MEMBER_JOIN = "member_join"
 RM_T_MEMBER_LEAVE = "member_leave"
 RM_T_PUNCH_GO = "punch_go"
 RM_T_ERROR = "error"
 # 信令连接
+# 首次使用（无历史）时预填的参考服务器地址，方便新用户
+DEFAULT_ROOM_SERVER = "42.194.133.132"
 RM_DEFAULT_SERVER_PORT = 3336       # 信令服务器默认 UDP 端口
 RM_DEFAULT_SERVER_TCP_PORT = 3337   # 信令服务器 TCP 映射观测端口
+RM_NAT_PROBE_PORT = 3338            # 信令服务器 NAT 探测端口（对称 NAT 检测用）
 RM_HEARTBEAT_INTERVAL = 20          # 心跳间隔（秒）
 RM_RECV_TIMEOUT = 1.0               # 信令 socket 接收超时（秒）
 # 打洞
 RM_PUNCH_CONCURRENCY = 6            # 同时打洞的最大任务数
-RM_PUNCH_CONNECT_TIMEOUT = 0.3      # 单次 TCP connect 超时（秒）
-RM_PUNCH_RETRY = 3                  # 打洞失败重试次数
-RM_PUNCH_RETRY_BACKOFF = 2          # 重试退避基数（秒）
+# 方向 A：单次打洞中【并发 connect 的候选数】上限。
+# 9998 端口上并存的打洞 socket 越多，SO_REUSEPORT 的入站 SYN 匹配
+# 越容易分错，TCP 打洞成功率越低。限制为 2 个并发，在保留少量并行
+# （P2 #3）的同时显著降低 9998 端口竞争。
+RM_PUNCH_CANDIDATE_CONCURRENCY = 2
+# 单次 connect 超时（秒）。风暴模式下每次尝试超时设短，让重连更密：
+# 端口受限锥形 NAT 要求"先出后进"，两端 SYN 时序错开时一侧收不到回包。
+# 缩短单次超时 + 高频重连，能显著提高两端 SYN 交叉命中的概率。
+RM_PUNCH_CONNECT_TIMEOUT = 2.5
+RM_PUNCH_RETRY = 3                  # 外层重试轮次
+RM_PUNCH_RETRY_BACKOFF = 1          # 重试退避基数（秒）
+RM_PUNCH_STORM_DURATION = 6.0       # 每轮"重连风暴"持续时长（秒）
+                                    # 在此窗口内不停地做并行 connect 轮次，
+                                    # 直到成功（含握手确认）或超时。
+RM_PUNCH_HANDSHAKE_TIMEOUT = 2.0    # TCP 打洞握手确认超时（秒）
+RM_PUNCH_HANDSHAKE_MAGIC = b"P2PH"  # 握手魔数（两端一致，4 字节）
+                                    # 作用：区分"真通"与"半开连接"。
+                                    # connect 成功仅代表本端三次握手完成，
+                                    # 半开连接（对端未收到本端 SYN）本端也会
+                                    # connect 成功但发不出数据。发魔数收魔数
+                                    # 才能确认双向可达。
 # 连接保活
-RM_NAT_KEEPALIVE_INTERVAL = 20      # 维持 NAT 映射的间隔（秒）
+RM_NAT_KEEPALIVE_INTERVAL = 15      # 维持 NAT 映射的间隔（秒）
+# 房间模式专用 TCP 端口
+# 必须与局域网 TCP_PORT(9999) 分离：Android 的 SO_REUSEADDR 比 Windows 严格，
+# 若映射观测连接与文件接收监听绑同一端口会 EADDRINUSE，导致无法登记公网映射、
+# pub_tcp 为空、打洞必然失败。
+RM_TCP_PORT = 9998
+# 房间模式专用 UDP 打洞端口（与局域网发现端口 UDP 9998 冲突，独立为 9996）
+RM_UDP_PORT = 9996
+RM_UDP_PROBE_INTERVAL = 0.1         # 探测发送间隔（秒）
+RM_UDP_PROBE_DURATION = 5.0         # 探测持续时间（秒）
 
 ROOM_AVAILABLE = True
 
@@ -129,6 +164,127 @@ def rm_parse_host_port(s):
         return None
 
 
+def rm_detect_nat_type(server_ip, server_port=RM_DEFAULT_SERVER_PORT,
+                       probe_port=RM_NAT_PROBE_PORT, timeout=1.5, log=None):
+    """通过向服务器两个不同的 UDP 端口发探测包，对比服务器观测到的公网映射。
+
+    原理：
+      · 锥形 NAT（Cone）：同一本地端口 -> 任意目标的映射相同
+      · 对称 NAT（Symmetric）：不同目标的映射不同（NAT 按目标分配端口）
+      · 无响应：UDP 被完全封堵，无法判定
+
+    返回 dict：
+      {"type": "cone"|"symmetric"|"unknown"|"no_udp",
+       "primary": "ip:port"|None, "alt": "ip:port"|None}
+
+    只做探测+日志，不影响后续流程。
+    """
+    _log = log or (lambda m: None)
+    fam = socket.AF_INET6 if ":" in server_ip else socket.AF_INET
+    s = None
+    try:
+        s = socket.socket(fam, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+    except Exception as e:
+        _log("[NAT探测] 创建 UDP socket 失败: %s" % e)
+        return {"type": "unknown", "primary": None, "alt": None}
+
+    def _probe(target_port, tag):
+        try:
+            payload = json.dumps({"type": RM_T_NAT_PROBE, "ver": RM_VER,
+                                  "probe": tag}).encode("utf-8")
+            s.sendto(payload, (server_ip, target_port))
+            return True
+        except Exception as e:
+            _log("[NAT探测] 向 %s:%d 发包失败: %s" % (server_ip, target_port, e))
+            return False
+
+    replies = {}
+    try:
+        # 用同一本地 socket 依次探测两个不同服务器端口
+        if not _probe(server_port, "primary"):
+            return {"type": "no_udp", "primary": None, "alt": None}
+        deadline = time.time() + timeout
+        while time.time() < deadline and "primary" not in replies:
+            try:
+                data, _ = s.recvfrom(2048)
+            except socket.timeout:
+                break
+            try:
+                msg = json.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+            if msg.get("type") == RM_T_NAT_PROBE_REPLY:
+                replies[msg.get("probe", "")] = msg.get("pub", "")
+
+        if not _probe(probe_port, "alt"):
+            return {"type": "unknown",
+                    "primary": replies.get("primary"), "alt": None}
+        deadline = time.time() + timeout
+        while time.time() < deadline and "alt" not in replies:
+            try:
+                data, _ = s.recvfrom(2048)
+            except socket.timeout:
+                break
+            try:
+                msg = json.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+            if msg.get("type") == RM_T_NAT_PROBE_REPLY:
+                replies[msg.get("probe", "")] = msg.get("pub", "")
+    finally:
+        try: s.close()
+        except Exception: pass
+
+    primary = replies.get("primary") or None
+    alt = replies.get("alt") or None
+    if not primary:
+        nat_type = "no_udp"
+    elif not alt:
+        nat_type = "unknown"
+    elif primary == alt:
+        nat_type = "cone"
+    else:
+        nat_type = "symmetric"
+    return {"type": nat_type, "primary": primary, "alt": alt}
+
+
+# 服务器时间 - 本地时间（毫秒），由 RmSignalingClient._sync_time 更新，
+# 供 RmHolePuncher._wait_until 读取。用模块级变量避免跨类传引用。
+_RM_CLOCK_OFFSET_MS = 0
+
+
+def rm_punch_handshake(sock, timeout=RM_PUNCH_HANDSHAKE_TIMEOUT):
+    """TCP 打洞握手确认：双方各发魔数、各收魔数。
+
+    返回 True 表示双向可达（收到对端魔数）；False 表示半开或失败。
+    成功时会把 socket 超时恢复为 None（阻塞模式）。
+
+    原理：connect 成功只能证明本端三次握手完成。在半开场景下
+    （本端 SYN 到了对端、对端 SYN 未到本端），本端 connect 也会
+    成功，但本端发出的数据对端收不到、对端也无对应 socket 接收。
+    因此必须做一次应用层往返确认。
+    """
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(RM_PUNCH_HANDSHAKE_MAGIC)
+        buf = bytearray()
+        magic = RM_PUNCH_HANDSHAKE_MAGIC
+        while len(buf) < len(magic):
+            chunk = sock.recv(len(magic) - len(buf))
+            if not chunk:
+                return False
+            buf.extend(chunk)
+        ok = bytes(buf) == magic
+        try:
+            sock.settimeout(None)
+        except Exception:
+            pass
+        return ok
+    except Exception:
+        return False
+
+
 class RmPunchResult:
     """打洞成功的结果：一条保持打开的已连接 socket。"""
 
@@ -144,22 +300,135 @@ class RmHolePuncher:
     def __init__(self, local_tcp_port, log=None):
         self.local_tcp_port = local_tcp_port
         self.log = log or (lambda msg: None)
+        # P2: UDP 打洞成功后记录的对方 UDP 公网端口，用于预测 TCP 端口
+        self.udp_hint = {}     # {peer_id: (ip, port)}
+        self._hint_lock = threading.Lock()
+        # P2 #9: 自适应 connect 超时（由 SYNC RTT 调整）
+        self.connect_timeout = RM_PUNCH_CONNECT_TIMEOUT
+        # 诊断开关：逐候选的失败/超时日志默认不输出（并行候选本就多数失败），
+        # 只在排查问题时打开。成功和最终汇总日志始终输出。
+        self.verbose = False
 
-    def punch(self, peer, at_ms):
+    def set_adaptive_timeout(self, rtt_ms):
+        """P2 #9: 按 SYNC RTT 调整 connect 超时（3~8 秒）。"""
+        if not rtt_ms or rtt_ms <= 0:
+            return
+        # 下限 2.0s（原 3.0s）：配合"重连风暴"模式，单次超时更短让重连更密
+        t = max(2.0, min(8.0, rtt_ms / 1000.0 * 4.0))
+        self.connect_timeout = t
+
+    def set_udp_hint(self, peer_id, ip, port):
+        """P2: 记录 UDP 打洞得到的对端公网地址，供预测 TCP 端口。"""
+        with self._hint_lock:
+            self.udp_hint[peer_id] = (ip, port)
+
+    def punch(self, peer, at_ms, should_stop=None):
+        """执行 TCP 打洞 —— 重连风暴 + 握手确认模式。
+
+        与旧版的区别：
+          · 旧版：每次只做一轮并行 connect（超时 6 秒），失败等下一轮。
+          · 新版：在 RM_PUNCH_STORM_DURATION 窗口内【不停地】做并行
+            connect 轮次（单次超时 2.5 秒），每成功一个立即做握手确认，
+            握手通过才返回；握手失败（半开）则关闭继续下一轮。
+
+        这样两端会持续交叉发 SYN，大幅提升"端口受限锥形 NAT"
+        下同时打开的命中概率；握手确认则保证返回的连接是真双向通。
+
+        should_stop：可选回调，返回 True 表示外部已连接（其他任务成功），
+        风暴应立即停止。
+        """
+        peer_id = peer.get("id")
         tcp_port = peer.get("tcp") or 0
         if not tcp_port:
+            self.log("[打洞] 放弃：对方 tcp 端口为 0 (peer=%s)" % peer_id)
             return None
         candidates = self._build_candidates(peer)
         if not candidates:
+            self.log("[打洞] 放弃：候选地址为空 (peer=%s)" % peer_id)
             return None
+        if self.verbose:
+            self.log("[打洞] peer=%s 候选=%s"
+                     % (peer_id,
+                        ", ".join("%s:%d" % (ip, p) for ip, p in candidates)))
         self._wait_until(at_ms)
-        for ip, port in candidates:
-            result = self._try_connect(ip, port)
+
+        # ---- 重连风暴：窗口内持续做并行 connect 轮次 ----
+        deadline = time.time() + RM_PUNCH_STORM_DURATION
+        round_no = 0
+        while time.time() < deadline:
+            if should_stop and should_stop():
+                if self.verbose:
+                    self.log("[打洞] 风暴停止：peer=%s 已由其他任务连接" % peer_id)
+                return None
+            round_no += 1
+            result = self._connect_candidates_parallel(candidates, peer_id)
             if result:
-                self.log("[打洞] 成功 -> %s:%d" % (result.ip, result.port))
+                # 软握手确认：握手成功→标记已验证；失败→仍返回（降级信任）。
+                # 关键：不再因握手失败而废弃连接。SO_REUSEPORT 干扰下握手往返
+                # 常误失败，若据此关闭会把【本可用的连接】误杀，反而降低成功率。
+                # 是否正确由"实际发数据"来验证（发送失败会自动换路/重建）。
+                if rm_punch_handshake(result.sock, RM_PUNCH_HANDSHAKE_TIMEOUT):
+                    self.log("[打洞] 成功（握手确认）-> %s:%d (peer=%s, 第%d轮)"
+                             % (result.ip, result.port, peer_id, round_no))
+                else:
+                    self.log("[打洞] 连接成功（握手无回应，降级信任）-> %s:%d (peer=%s, 第%d轮)"
+                             % (result.ip, result.port, peer_id, round_no))
                 return result
-        self.log("[打洞] 失败 peer=%s" % peer.get("id"))
+            # 轮间短暂停顿，避免 CPU 空转与端口耗尽
+            time.sleep(0.1)
+        if self.verbose:
+            self.log("[打洞] 风暴结束未成功 peer=%s（%d 轮）" % (peer_id, round_no))
         return None
+
+    def _connect_candidates_parallel(self, candidates, peer_id):
+        """P2 #3: 并行尝试所有候选地址，返回首个成功的 RmPunchResult。"""
+        n = len(candidates)
+        if n == 1:
+            return self._try_connect(candidates[0][0], candidates[0][1])
+        barrier = threading.Barrier(n)
+        results = {}
+        done = threading.Event()
+        win_lock = threading.Lock()
+        # 方向 A：限制同时 connect 的候选数（每个候选都绑 9998）
+        conn_sem = threading.Semaphore(RM_PUNCH_CANDIDATE_CONCURRENCY)
+
+        def worker(idx, ip, port):
+            try:
+                barrier.wait(timeout=3.0)
+            except Exception:
+                pass
+            if done.is_set():
+                return
+            conn_sem.acquire()
+            try:
+                if done.is_set():
+                    return
+                r = self._try_connect(ip, port)
+            finally:
+                conn_sem.release()
+            if r is None:
+                return
+            with win_lock:
+                if done.is_set():
+                    # 已有赢家，关闭本条
+                    try:
+                        r.sock.close()
+                    except Exception:
+                        pass
+                    return
+                results["win"] = r
+                done.set()
+
+        threads = []
+        for i, (ip, port) in enumerate(candidates):
+            t = threading.Thread(target=worker, args=(i, ip, port), daemon=True)
+            t.start()
+            threads.append(t)
+        # 等待赢家或全部结束（上限 = connect 超时 + 余量）
+        done.wait(self.connect_timeout + 2.0)
+        for t in threads:
+            t.join(timeout=0.2)
+        return results.get("win")
 
     def _build_candidates(self, peer):
         tcp_port = peer.get("tcp") or 0
@@ -177,18 +446,57 @@ class RmHolePuncher:
             if key not in seen:
                 seen.add(key)
                 result.append(key)
+        # P2 #4: 若 pub_tcp 为空，用 UDP 打洞得到的公网端口预测 TCP 候选
+        # （很多 NAT 对 TCP/UDP 从同一端口池按序分配）。
+        # 服务器观测的 tcp_udp_offset = 对端 TCP端口 - UDP端口（同一目标 IP），
+        # 用于把预测基准从「UDP 端口本身」修正为「UDP 端口 + offset」。
+        # offset 缺省为 0，行为与旧版完全一致（纯增益、零风险）。
+        if not parsed:
+            with self._hint_lock:
+                hint = self.udp_hint.get(peer.get("id"))
+            if hint and ":" not in hint[0]:   # 仅 IPv4
+                hip, hport = hint
+                off = peer.get("tcp_udp_offset") or 0
+                base = hport + off
+                for dp in (0, -1, 1, -2, 2):
+                    pp = base + dp
+                    if pp <= 0 or pp > 65535:
+                        continue
+                    key = (hip, pp)
+                    if key not in seen:
+                        seen.add(key)
+                        result.append(key)
+                if self.verbose:
+                    self.log("[打洞] 追加 UDP 预测候选 %s:%d±2 (base=%d, offset=%+d, peer=%s)"
+                             % (hip, base, base, off, peer.get("id")))
         return result
 
     def _wait_until(self, at_ms):
+        """等到服务器时间 at_ms 时刻。
+
+        at_ms 是【服务器时钟】的绝对毫秒，本地需减去 clock_offset 换算成
+        本地时刻。若时钟偏差大，按最小 0、最大 2 秒钳制（TCP SYN 会自动重传，
+        早打洞没问题；晚太多会错过对端）。
+        """
         if not at_ms:
             return
-        remain = at_ms / 1000.0 - time.time()
+        local_target = (at_ms - _RM_CLOCK_OFFSET_MS) / 1000.0
+        remain = local_target - time.time()
         if remain > 0:
             time.sleep(min(remain, 2.0))
 
     def _try_connect(self, ip, port):
+        """非阻塞 connect + select 等待 —— TCP 同时打开的正确实现。
+
+        重要：不能用 sock.settimeout()+connect_ex()，因为在 Windows 上
+        settimeout 会让 socket 进入非阻塞模式，connect_ex 立即返回
+        WSAEWOULDBLOCK(10035)，不代表连接失败。必须用 select 等待可写后，
+        用 getsockopt(SO_ERROR) 读取真实结果。
+        """
+        import select as _select
         family = socket.AF_INET6 if ":" in ip else socket.AF_INET
         sock = None
+        bind_ok = False
         try:
             sock = socket.socket(family, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -197,15 +505,49 @@ class RmHolePuncher:
                     sock.bind(("::", self.local_tcp_port))
                 else:
                     sock.bind(("", self.local_tcp_port))
-            except Exception:
-                pass
-            sock.settimeout(RM_PUNCH_CONNECT_TIMEOUT)
+                bind_ok = True
+            except Exception as be:
+                self.log("[打洞] bind %d 失败: %s（继续，走内核随机端口）"
+                         % (self.local_tcp_port, be))
+            # 非阻塞 connect
+            sock.setblocking(False)
+            t0 = time.time()
             rc = sock.connect_ex((ip, port))
             if rc == 0:
+                # 极少数情况立即成功
+                sock.setblocking(True)
                 sock.settimeout(None)
+                optimize_tcp_socket(sock)   # 与局域网同一入口：缓冲区 + 关 Nagle
+                self.log("[打洞] connect 立即成功 %s:%d（bind=%s）" % (ip, port, bind_ok))
                 return RmPunchResult(ip, port, sock)
-        except Exception:
-            pass
+            # EINPROGRESS(115)/WSAEWOULDBLOCK(10035)：等待可写
+            try:
+                _, wlist, xlist = _select.select([], [sock], [sock],
+                                                 self.connect_timeout)
+            except Exception as se:
+                self.log("[打洞] select 异常 %s:%d -> %s" % (ip, port, se))
+                wlist, xlist = [], []
+            dt_ms = int((time.time() - t0) * 1000)
+            if not wlist and not xlist:
+                if self.verbose:
+                    self.log("[打洞] connect 超时 %s:%d（%dms, bind=%s, rc=%d）"
+                             % (ip, port, dt_ms, bind_ok, rc))
+            else:
+                err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if err == 0:
+                    sock.setblocking(True)
+                    sock.settimeout(None)
+                    optimize_tcp_socket(sock)   # 与局域网同一入口：缓冲区 + 关 Nagle
+                    self.log("[打洞] connect 成功 %s:%d（%dms, bind=%s）"
+                             % (ip, port, dt_ms, bind_ok))
+                    return RmPunchResult(ip, port, sock)
+                # 10060=超时, 10061=拒绝, 10065=无路由, 101=网络不可达
+                if self.verbose:
+                    self.log("[打洞] connect 失败 %s:%d errno=%d（%dms, bind=%s）"
+                             % (ip, port, err, dt_ms, bind_ok))
+        except Exception as e:
+            if self.verbose:
+                self.log("[打洞] connect 异常 %s:%d -> %s" % (ip, port, e))
         if sock:
             try:
                 sock.close()
@@ -220,7 +562,8 @@ class RmSignalingClient:
     def __init__(self, server_ip, server_port, room, name, tcp_port, lan_ips,
                  on_joined=None, on_member_join=None, on_member_leave=None,
                  on_punch_go=None, on_error=None, log=None,
-                 server_tcp_port=None, punch_local_port=None, device_id=None):
+                 server_tcp_port=None, punch_local_port=None, device_id=None,
+                 on_udp_hole_ready=None, on_mapping_ready=None, reuse_id=None):
         self.server_ip = server_ip
         self.server_port = server_port
         self.server_tcp_port = server_tcp_port or RM_DEFAULT_SERVER_TCP_PORT
@@ -229,12 +572,20 @@ class RmSignalingClient:
         self.tcp_port = tcp_port
         self.lan_ips = list(lan_ips or [])
         self.device_id = device_id or ""
+        # 身份复用：网络切换重建时传入上次的 my_id，服务器据此复用（不换 id），
+        # 对端看到的是"同一成员回归"，避免掉线感与状态孤儿化。
+        self.reuse_id = str(reuse_id) if reuse_id else ""
         self.punch_local_port = punch_local_port
+        # NTP 式时钟校准：clock_offset_ms = 服务器时间 - 本地时间
+        # 用于 wait_until，使两端不依赖本地时钟是否同步
+        self.clock_offset_ms = 0
         self.on_joined = on_joined
         self.on_member_join = on_member_join
         self.on_member_leave = on_member_leave
         self.on_punch_go = on_punch_go
         self.on_error = on_error
+        self.on_udp_hole_ready = on_udp_hole_ready   # 回调(peer_id, peer_addr)
+        self.on_mapping_ready = on_mapping_ready     # P2 #6: TCP 映射就绪回调
         self.log = log or (lambda msg: None)
         self.my_id = None
         self._joined_members = []
@@ -243,6 +594,15 @@ class RmSignalingClient:
         self._running = False
         self._recv_thread = None
         self._hb_thread = None
+        # UDP 打洞与可靠通道
+        self.udp_hole_sock = None
+        self._udp_hole_thread = None
+        self._udp_rtp_handlers = {}
+        self._udp_rtp_lock = threading.Lock()
+        self._udp_recv_running = False
+        self._udp_recv_thread = None
+        self._hole_targets = {}
+        self._hole_targets_lock = threading.Lock()
 
     def start(self):
         if self._running:
@@ -274,7 +634,10 @@ class RmSignalingClient:
                 pass
             return False
         if self.my_id:
+            # 先做时间同步（NTP 式），再建映射、开 UDP 打洞 socket、开始打洞
+            self._sync_time()
             self._open_mapping()
+            self._open_udp_hole_socket()
             time.sleep(0.2)
         if self.on_joined:
             self.on_joined(self._joined_members)
@@ -283,20 +646,58 @@ class RmSignalingClient:
         self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._hb_thread.start()
         self.log("[信令] 已加入房间 %s，我的ID=%s" % (self.room, self.my_id))
+        # 异步执行 NAT 类型探测（只打日志，不阻塞信令）
+        threading.Thread(target=self._run_nat_probe, daemon=True).start()
         return True
 
-    def stop(self):
+    def _run_nat_probe(self):
+        """加入房间后异步探测本机 NAT 类型并写入日志。"""
+        try:
+            r = rm_detect_nat_type(self.server_ip, self.server_port,
+                                   RM_NAT_PROBE_PORT, timeout=1.5,
+                                   log=self.log)
+            t = r.get("type")
+            names = {"cone": "锥形 NAT（Cone）",
+                     "symmetric": "对称 NAT（Symmetric）",
+                     "no_udp": "UDP 被封堵（无法探测）",
+                     "unknown": "未知（仅收到一路回应）"}
+            self.log("[NAT探测] 本机 NAT 类型 = %s" % names.get(t, t))
+            self.log("[NAT探测] 探测 1（UDP %d）观察到: %s"
+                     % (self.server_port, r.get("primary")))
+            self.log("[NAT探测] 探测 2（UDP %d）观察到: %s"
+                     % (RM_NAT_PROBE_PORT, r.get("alt")))
+            if t == "symmetric":
+                self.log("[NAT探测] 提示：本机为对称 NAT，TCP 打洞成功率极低。")
+            elif t == "cone":
+                self.log("[NAT探测] 提示：本机为锥形 NAT，打洞可行性较高。")
+        except Exception as e:
+            self.log("[NAT探测] 异常: %s" % e)
+
+    def stop(self, quiet=False):
+        """停止信令客户端。
+
+        quiet=True：不发 BYE（用于网络切换重建）——让服务器保留本成员条目，
+        对端不收到 member_leave，重建后复用同一 id 回归，实现"无感重建"。
+        """
         if not self._running:
             return
         self._running = False
-        try:
-            if self.my_id:
-                self._send({"type": RM_T_BYE, "ver": RM_VER, "id": self.my_id})
-        except Exception:
-            pass
+        if not quiet:
+            try:
+                if self.my_id:
+                    self._send({"type": RM_T_BYE, "ver": RM_VER, "id": self.my_id})
+            except Exception:
+                pass
         try:
             if self.map_sock:
                 self.map_sock.close()
+        except Exception:
+            pass
+        # 关闭 UDP 打洞 socket 与接收循环
+        self._udp_recv_running = False
+        try:
+            if self.udp_hole_sock:
+                self.udp_hole_sock.close()
         except Exception:
             pass
         try:
@@ -304,6 +705,152 @@ class RmSignalingClient:
                 self.sock.close()
         except Exception:
             pass
+
+    # ==================== UDP 打洞与可靠通道 ====================
+
+    def _open_udp_hole_socket(self):
+        """打开 UDP 打洞专用 socket（本地 9996），并向服务器登记公网映射。"""
+        try:
+            fam = socket.AF_INET6 if ":" in self.server_ip else socket.AF_INET
+            self.udp_hole_sock = socket.socket(fam, socket.SOCK_DGRAM)
+            self.udp_hole_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if fam == socket.AF_INET6:
+                self.udp_hole_sock.bind(("::", RM_UDP_PORT))
+            else:
+                self.udp_hole_sock.bind(("", RM_UDP_PORT))
+            self.udp_hole_sock.settimeout(1.0)
+            # 必须【从 udp_hole_sock 本身】发 hello，服务器 recvfrom 看到的
+            # 源端口才是 9996 的公网映射。
+            hello = json.dumps({"type": RM_T_UDP_HELLO, "ver": RM_VER,
+                                "id": self.my_id}).encode("utf-8")
+            self.udp_hole_sock.sendto(hello, (self.server_ip, self.server_port))
+            self.log("[UDP打洞] 打洞 socket 已绑定本地 %d，已向服务器登记映射" % RM_UDP_PORT)
+            # 启动全局 UDP 接收循环（仅一次）
+            if not self._udp_recv_running:
+                self._udp_recv_running = True
+                self._udp_recv_thread = threading.Thread(
+                    target=self._udp_global_recv_loop, daemon=True)
+                self._udp_recv_thread.start()
+            # 立即重新 requestPunch：让服务器用刚登记的公网映射重新下发 punch_go
+            for m in self._joined_members:
+                mid = m.get("id")
+                if mid:
+                    try:
+                        self._send({"type": RM_T_PUNCH_REQ, "ver": RM_VER,
+                                    "id": self.my_id, "target": mid})
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.log("[UDP打洞] socket 打开失败: %s" % e)
+            self.udp_hole_sock = None
+
+    def send_udp_to(self, peer_addr, data):
+        """向指定对端地址发送一个 UDP 包（UDP-RTP 发送入口）。"""
+        try:
+            if self.udp_hole_sock:
+                self.udp_hole_sock.sendto(data, peer_addr)
+        except Exception as e:
+            self.log("[UDP-RTP] send_udp_to 失败: %s" % e)
+
+    def register_udp_rtp(self, peer_key, on_packet):
+        """注册某对端地址的 RTP 处理回调。peer_key 为 'ip:port' 字符串。"""
+        with self._udp_rtp_lock:
+            self._udp_rtp_handlers[peer_key] = on_packet
+
+    def unregister_udp_rtp(self, peer_key):
+        with self._udp_rtp_lock:
+            self._udp_rtp_handlers.pop(peer_key, None)
+
+    def _udp_global_recv_loop(self):
+        """全局 UDP 接收循环：从 udp_hole_sock 收包，按源地址分发。
+
+        处理两类包：
+          1) P2P_UDP_HOLE —— 打洞探测；若来自 _hole_targets 里的地址，判定打通
+          2) UDP-RTP 数据 —— 按源地址分发给对应 handler
+        """
+        self.log("[UDP-RTP] 全局接收循环启动")
+        buf = bytearray(2048)
+        while self._udp_recv_running and self.udp_hole_sock:
+            try:
+                self.udp_hole_sock.settimeout(0.5)
+                n, addr = self.udp_hole_sock.recvfrom_into(buf, len(buf))
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+            if n <= 0:
+                continue
+            data = bytes(buf[:n])
+            key = "%s:%d" % (addr[0], addr[1])
+            # 1) 打洞探测包
+            if data == b"P2P_UDP_HOLE":
+                with self._hole_targets_lock:
+                    peer_id = self._hole_targets.get(key)
+                if peer_id is not None:
+                    with self._udp_rtp_lock:
+                        already = key in self._udp_rtp_handlers
+                    if not already:
+                        self.log("[UDP打洞] ★ 成功！收到 %s 的探测包（peer=%s）"
+                                 % (key, peer_id))
+                        if self.on_udp_hole_ready:
+                            try:
+                                self.on_udp_hole_ready(peer_id, addr)
+                            except Exception as ex:
+                                self.log("[UDP打洞] 回调异常: %s" % ex)
+                continue
+            # 2) RTP 数据包
+            with self._udp_rtp_lock:
+                handler = self._udp_rtp_handlers.get(key)
+            if handler:
+                try:
+                    handler(data)
+                except Exception as e:
+                    self.log("[UDP-RTP] 处理包异常: %s" % e)
+        self.log("[UDP-RTP] 全局接收循环退出")
+
+    def _start_udp_hole(self, peer):
+        """收到 punch_go 后，启动 UDP 打洞探测：向对端 pub_udp 持续发包（只发不收）。"""
+        if self.udp_hole_sock is None:
+            self.log("[UDP打洞] socket 未打开，跳过")
+            return
+        peer_id = peer.get("id")
+        pub_udp = peer.get("pub_udp", "")
+        parsed = rm_parse_host_port(pub_udp)
+        if not parsed:
+            self.log("[UDP打洞] 对端 pub_udp 无效（%s），无法打洞" % pub_udp)
+            return
+        ip, port = parsed
+        key = "%s:%d" % (ip, port)
+        with self._hole_targets_lock:
+            self._hole_targets[key] = peer_id
+
+        def _probe():
+            t_end = time.time() + RM_UDP_PROBE_DURATION
+            sent = 0
+            self.log("[UDP打洞] 开始向 %s 发探测包（%.1f 秒）"
+                     % (key, RM_UDP_PROBE_DURATION))
+            while time.time() < t_end:
+                if not self._running:
+                    break
+                try:
+                    self.udp_hole_sock.sendto(b"P2P_UDP_HOLE", (ip, port))
+                    sent += 1
+                except Exception as e:
+                    self.log("[UDP打洞] 发送失败: %s" % e)
+                    break
+                time.sleep(RM_UDP_PROBE_INTERVAL)
+            with self._hole_targets_lock:
+                still_waiting = self._hole_targets.get(key) == peer_id
+            with self._udp_rtp_lock:
+                has_handler = key in self._udp_rtp_handlers
+            if still_waiting and not has_handler:
+                with self._hole_targets_lock:
+                    self._hole_targets.pop(key, None)
+                self.log("[UDP打洞] 失败：发了 %d 个包，未收到 %s 响应（peer=%s）"
+                         % (sent, key, peer_id))
+
+        self._udp_hole_thread = threading.Thread(target=_probe, daemon=True)
+        self._udp_hole_thread.start()
 
     def request_punch(self, target_id):
         self._send({"type": RM_T_PUNCH_REQ, "ver": RM_VER,
@@ -314,11 +861,86 @@ class RmSignalingClient:
         self.sock.sendto(data, (self.server_ip, self.server_port))
 
     def _send_join(self):
-        self._send({
+        msg = {
             "type": RM_T_JOIN, "ver": RM_VER, "room": self.room,
             "name": self.name, "tcp": self.tcp_port, "lan": self.lan_ips,
             "did": self.device_id,
-        })
+        }
+        # 网络重建时携带旧 id，服务器复用之（协议向后兼容：旧服务器忽略该字段）
+        if self.reuse_id:
+            msg["reuse_id"] = self.reuse_id
+        self._send(msg)
+
+    def _sync_time(self):
+        """NTP 式时间同步（单次往返，4 次采样取最小 RTT 的那次）。
+
+        t1: 客户端发送时刻（本地）
+        t2: 服务器接收时刻（服务器）
+        t3: 客户端收到回包时刻（本地）
+        offset = t2 - (t1 + t3) / 2   （服务器时间 - 本地时间）
+
+        完成后把 offset 写入模块级 _RM_CLOCK_OFFSET_MS，供打洞时使用。
+        注意：本方法在 start() 中被调用，此时收包线程尚未启动，
+        因此同步 recvfrom 是安全的（见 start 中的调用位置）。
+        """
+        global _RM_CLOCK_OFFSET_MS
+        import time as _t
+        best_rtt = None
+        best_offset = 0
+        # 临时保存旧超时，方法结束后恢复
+        old_timeout = None
+        try:
+            old_timeout = self.sock.gettimeout()
+        except Exception:
+            pass
+        for _ in range(4):
+            try:
+                t1 = int(_t.time() * 1000)
+                self._send({"type": RM_T_TIME_REQ, "ver": RM_VER, "t1": t1})
+                self.sock.settimeout(1.0)
+                deadline = _t.time() + 1.0
+                reply = None
+                while _t.time() < deadline:
+                    try:
+                        data, _addr = self.sock.recvfrom(65535)
+                    except socket.timeout:
+                        break
+                    try:
+                        msg = json.loads(data.decode("utf-8"))
+                    except Exception:
+                        continue
+                    # 只认时间同步回包（t1 匹配），其他消息丢弃
+                    if msg.get("type") == RM_T_TIME_REPLY and msg.get("t1") == t1:
+                        reply = msg
+                        break
+                if reply is None:
+                    continue
+                t3 = int(_t.time() * 1000)
+                t2 = int(reply.get("t2", 0))
+                rtt = t3 - t1
+                offset = t2 - (t1 + t3) // 2
+                if best_rtt is None or rtt < best_rtt:
+                    best_rtt = rtt
+                    best_offset = offset
+                _t.sleep(0.05)
+            except Exception as e:
+                self.log("[校时] 采样失败: %s" % e)
+                break
+        # 恢复原超时
+        try:
+            if old_timeout is None:
+                self.sock.settimeout(RM_RECV_TIMEOUT)
+            else:
+                self.sock.settimeout(old_timeout)
+        except Exception:
+            pass
+        if best_rtt is not None:
+            _RM_CLOCK_OFFSET_MS = best_offset
+            self.clock_offset_ms = best_offset
+            self.log("[校时] 与服务器时钟偏差 = %d ms（最小 RTT %d ms）"
+                     % (best_offset, best_rtt))
+        else:
+            self.log("[校时] 未能同步，使用本地时钟（可能影响打洞时刻）")
 
     def _open_mapping(self):
         fam = socket.AF_INET6 if ":" in self.server_ip else socket.AF_INET
@@ -335,6 +957,12 @@ class RmSignalingClient:
                 s.sendall(struct.pack("!H", len(mid)) + mid)
                 self.map_sock = s
                 self.log("[信令] TCP 映射观测连接已建立（本地端口=%s）" % s.getsockname()[1])
+                # P2 #6: 通知上层 TCP 映射已就绪，可广播 TCP_READY
+                if self.on_mapping_ready:
+                    try:
+                        self.on_mapping_ready()
+                    except Exception as e:
+                        self.log("[信令] on_mapping_ready 回调异常: %s" % e)
                 return
             except Exception as e:
                 if s:
@@ -389,8 +1017,14 @@ class RmSignalingClient:
                 if self.on_member_leave:
                     self.on_member_leave(msg.get("id"))
             elif t == RM_T_PUNCH_GO:
+                peer = msg.get("peer", {})
+                # UDP 打洞探测（与 TCP 打洞并行，独立通道）
+                try:
+                    self._start_udp_hole(peer)
+                except Exception as e:
+                    self.log("[UDP打洞] 启动异常: %s" % e)
                 if self.on_punch_go:
-                    self.on_punch_go(msg.get("peer", {}), msg.get("at", 0))
+                    self.on_punch_go(peer, msg.get("at", 0))
             elif t == RM_T_ERROR:
                 if self.on_error:
                     self.on_error(msg.get("code", "UNKNOWN"))
@@ -419,6 +1053,192 @@ class RmConn:
         self.io_lock = threading.Lock()
 
 
+# ==================== 梯度冗余多路径调度（叠加层） ====================
+# 设计：不改变现有 connections/udp_conns 存储，仅在其上叠加"路径角色 +
+# 保活调度"决策层。每个 peer 一个 PeerPathScheduler，管理该 peer 的多条路径。
+#
+# 角色：hot(热备，传数据) / warm_safe(保守暖备) / warm_loose(宽松暖备)
+# 保活：软性探测（指数增长逼近 NAT 超时）+ 硬性下限兜底
+
+RM_PROTO_FLOOR = {"tcp": 30, "udp": 15}
+RM_PROTO_SAFE_CAP = {"tcp": 3600, "udp": 60}
+RM_ROLE_FACTOR = {"hot": 1.0, "warm_safe": 1.5, "warm_loose": 4.0}
+
+
+class RmKeepaliveScheduler:
+    """单条路径的保活间隔调度（软性探测 + 硬性下限）。"""
+
+    def __init__(self, role, proto):
+        self.role = role
+        self.proto = proto
+        self.floor = RM_PROTO_FLOOR.get(proto, 15)
+        self.safe_cap = RM_PROTO_SAFE_CAP.get(proto, 60)
+        self.current_interval = self.floor * 2
+        self.upper_bound = None
+        self.lower_bound = None
+        self.success_count = 0
+        self.fail_count = 0
+        self.stable = False
+
+    def _clamp(self, v):
+        v = max(v, self.floor)
+        if self.role == "warm_safe":
+            v = min(v, self.safe_cap)
+        else:
+            v = min(v, 3600)
+        return int(v)
+
+    def on_success(self):
+        self.success_count += 1
+        self.upper_bound = self.current_interval
+        if self.stable:
+            return
+        total = self.success_count + self.fail_count
+        if total >= 5 and self.fail_count / (total + 1) > 0.05:
+            self.stable = True
+            return
+        c = int(self.current_interval * 2 * RM_ROLE_FACTOR.get(self.role, 1.0))
+        if self.lower_bound is not None:
+            c = min(c, (self.upper_bound + self.lower_bound) // 2)
+            self.stable = True
+        self.current_interval = self._clamp(c)
+
+    def on_failure(self):
+        self.fail_count += 1
+        self.lower_bound = self.current_interval
+        self.stable = False
+        if self.upper_bound is not None:
+            self.current_interval = (self.upper_bound + self.lower_bound) // 2
+        else:
+            self.current_interval = self.floor
+        self.current_interval = self._clamp(self.current_interval)
+        if self.fail_count >= 3:
+            self.current_interval = self.floor
+
+
+# 协议优先级：数字越小越优先当 hot。
+# TCP > UDP-RTP（TCP 有内核拥塞控制、NAT 映射超时更长、丢包处理更成熟）。
+RM_PROTO_PRIORITY = {"tcp": 0, "udp": 1}
+
+
+class RmPath:
+    """单条路径的运行时状态。"""
+
+    __slots__ = ("path_id", "proto", "role", "scheduler", "last_seen", "rtt_ms")
+
+    def __init__(self, path_id, proto, role, rtt_ms=0):
+        self.path_id = path_id
+        self.proto = proto
+        self.role = role
+        self.scheduler = RmKeepaliveScheduler(role, proto)
+        self.last_seen = time.time()
+        self.rtt_ms = rtt_ms
+
+    def set_role(self, role):
+        """改角色并同步重建 scheduler（保活参数随角色变化）。"""
+        self.role = role
+        self.scheduler = RmKeepaliveScheduler(role, self.proto)
+
+
+class RmPeerPathScheduler:
+    """单个 peer 的路径分级与保活决策。
+
+    路径来源：
+      · TCP 打洞成功 → 一条 "tcp" 路径
+      · UDP 打洞成功 → 一条 "udp" 路径
+    按 RTT 分级（最小→hot，次小→warm_safe，其余→warm_loose）。
+    """
+
+    def __init__(self, peer_id, log=None):
+        self.peer_id = peer_id
+        self.log = log or (lambda m: None)
+        self.lock = threading.Lock()
+        self.paths = {}      # {path_id: RmPath}
+
+    def register(self, path_id, proto, rtt_ms):
+        """新路径接入（TCP/UDP 打洞成功时调用）。"""
+        with self.lock:
+            existing = self.paths.get(path_id)
+            # 已存在且【未失效】→ 直接复用
+            if existing is not None and existing.role != "dead":
+                return existing
+            # 已存在但已 dead（如 TCP 重连）→ 重建对象。
+            # 新路径先以 "warm_loose" 占位，再由 _regrade_locked 按
+            # (协议优先级, RTT) 重新分级；不能用 "dead" 占位，否则会被
+            # _regrade_locked 的 alive 过滤掉、永不上位（多路径调度失效）。
+            p = RmPath(path_id, proto, "warm_loose", rtt_ms)
+            self.paths[path_id] = p
+            self._regrade_locked()
+        self.log("[路径] peer=%s 注册 %s/%s rtt=%sms role=%s"
+                 % (self.peer_id, path_id, proto, rtt_ms, p.role))
+        return p
+
+    def _regrade_locked(self):
+        """按协议优先级（TCP > UDP）重排所有存活路径的角色。
+
+        规则：存活路径按 (协议优先级, rtt) 排序，依次分配
+        hot → warm_safe → warm_loose；多余路径保持 dead。
+        这样 TCP 一旦可用，就会抢占 hot，让最强的链路传数据。
+        """
+        alive = [p for p in self.paths.values() if p.role != "dead"
+                 or p.scheduler is not None]
+        # 只对"存活"路径重排：此处以 scheduler 存在且非显式 dead 判断
+        alive = [p for p in self.paths.values() if p.role != "dead"]
+        alive.sort(key=lambda x: (RM_PROTO_PRIORITY.get(x.proto, 9), x.rtt_ms))
+        roles = ["hot", "warm_safe", "warm_loose"]
+        for i, p in enumerate(alive):
+            new_role = roles[i] if i < len(roles) else "warm_loose"
+            if p.role != new_role:
+                p.set_role(new_role)
+
+    def regrade(self):
+        """外部可调用的重排（如新增路径后）。"""
+        with self.lock:
+            self._regrade_locked()
+
+    def remove(self, path_id):
+        with self.lock:
+            self.paths.pop(path_id, None)
+
+    def get_by_role(self, role):
+        with self.lock:
+            for p in self.paths.values():
+                if p.role == role:
+                    return p
+        return None
+
+    def get_hot(self):
+        return self.get_by_role("hot")
+
+    def promote_on_hot_failure(self):
+        """热备失效 → 保守暖备上位，宽松暖备升保守。返回新的热备 path_id。"""
+        with self.lock:
+            hot = None
+            safe = None
+            loose = None
+            for p in self.paths.values():
+                if p.role == "hot":
+                    hot = p
+                elif p.role == "warm_safe":
+                    safe = p
+                elif p.role == "warm_loose":
+                    loose = p
+            if hot:
+                hot.role = "dead"
+            new_hot = None
+            if safe:
+                safe.set_role("hot")
+                new_hot = safe.path_id
+            if loose:
+                loose.set_role("warm_safe")
+        return new_hot
+
+    def role_of(self, path_id):
+        with self.lock:
+            p = self.paths.get(path_id)
+            return p.role if p else None
+
+
 class RmRoomManager:
     """房间连接管理：全连接 + 长连接 + 入站接管 + 保活。"""
 
@@ -429,11 +1249,47 @@ class RmRoomManager:
         self.lock = threading.Lock()
         self.members = {}
         self.connections = {}
+        self.udp_conns = {}    # {peer_id: UdpReliableSocket}
         self._punch_sem = threading.Semaphore(RM_PUNCH_CONCURRENCY)
         self._puncher = RmHolePuncher(local_tcp_port, log=self.log)
         self._running = False
         self._keepalive_thread = None
         self.on_socket_ready = None
+        self.on_udp_ready = None   # 回调(peer_id, UdpReliableSocket)
+        self.on_state_changed = None   # 回调：成员状态变化时触发 UI 刷新
+        # 自动重建冷却：{peer_id: last_rebuild_ts}
+        # 避免同一 peer 短时间内重复触发打洞（失联检测 + keepalive 可能同时触发）
+        self._rebuild_cooldown = {}
+        self._rebuild_cooldown_lock = threading.Lock()
+        self._rebuild_cooldown_sec = 30.0
+        # P2: 打洞轮次对齐（对端下发 PUNCH_ROUND → 存入，供 _punch_task 等待）
+        self._punch_round_cond = threading.Condition(threading.Lock())
+        self._punch_round_evt = {}   # {peer_id: (round_no, t_go_r)}
+        # P2 #6: 本机 TCP 映射是否就绪
+        self._mapping_ready = False
+        # 梯度冗余多路径调度：{peer_id: RmPeerPathScheduler}
+        self._path_schedulers = {}
+        # 打洞并发计数：{peer_id: int} —— 同一 peer 最多 2 个 _punch_task
+        self._punch_active = {}
+        # 连接池：{peer_id: 最后活跃时间戳} —— 用于空闲降频保活 / LRU 清理
+        self._peer_last_active = {}
+        # 接收代际：{peer_key: int} —— 新通道接管时递增，旧接收循环据此退出，
+        # 避免换路时新旧两个接收循环同时写盘（竞态）
+        self._recv_epoch = {}
+
+    def _get_path_sched(self, peer_id):
+        """取（或创建）某 peer 的路径调度器。"""
+        with self.lock:
+            s = self._path_schedulers.get(peer_id)
+            if s is None:
+                s = RmPeerPathScheduler(peer_id, log=self.log)
+                self._path_schedulers[peer_id] = s
+            return s
+
+    def mark_mapping_ready(self):
+        """P2 #6: TCP 映射就绪 → 向所有已有 UDP 通道广播，后续新建通道也会发。"""
+        self._mapping_ready = True
+        self.broadcast_tcp_ready()
 
     def start(self):
         self._running = True
@@ -446,6 +1302,307 @@ class RmRoomManager:
             for conn in self.connections.values():
                 self._close_sock(conn)
             self.connections.clear()
+            for rtp in self.udp_conns.values():
+                try:
+                    rtp.close()
+                except Exception:
+                    pass
+            self.udp_conns.clear()
+
+    def on_udp_hole_ready(self, peer_id, peer_addr):
+        """UDP 打洞成功：建立可靠 UDP 通道（共享 socket 模式）。"""
+        sig = self.signaling
+        if sig is None:
+            self.log("[UDP-RTP] signaling 为空，跳过")
+            return
+        with self.lock:
+            if peer_id in self.udp_conns:
+                return
+        try:
+            from udp_reliable import UdpReliableSocket
+            def _send(addr, data):
+                sig.send_udp_to(addr, data)
+            # P2 #4: 记录对端 UDP 公网地址，供 TCP 打洞预测端口
+            try:
+                self._puncher.set_udp_hint(peer_id, peer_addr[0], peer_addr[1])
+            except Exception:
+                pass
+            def _on_dead(addr):
+                self._handle_udp_peer_dead(peer_id)
+            def _on_sync(t_go):
+                # P1: SYNC 完成 → 到 t_go 精准 TCP 打洞
+                # P2 #9: 用 SYNC RTT 自适应 connect 超时
+                try:
+                    rtt = rtp.get_sync_rtt()
+                    if rtt:
+                        self._puncher.set_adaptive_timeout(rtt)
+                except Exception:
+                    pass
+                self._on_sync_ready(peer_id, t_go)
+            def _on_round(round_no, t_go_r):
+                # P2: 主导方下发下一轮打洞时刻
+                self._on_punch_round(peer_id, round_no, t_go_r)
+            def _on_tcp_ready():
+                # P2 #6: 对端 TCP 映射就绪 → 立即触发一次打洞
+                self._on_peer_tcp_ready(peer_id)
+            def _on_punch_fail():
+                # P2 #8: 对端放弃 TCP → 停止本端空等
+                self._on_peer_punch_fail(peer_id)
+            rtp = UdpReliableSocket(_send, peer_addr, log=self.log,
+                                     on_peer_dead=_on_dead,
+                                     on_sync_ready=_on_sync,
+                                     on_punch_round=_on_round,
+                                     on_tcp_ready=_on_tcp_ready,
+                                     on_punch_fail=_on_punch_fail)
+        except Exception as e:
+            self.log("[UDP-RTP] 创建失败: %s" % e)
+            return
+        try:
+            peer_key = "%s:%d" % (peer_addr[0], peer_addr[1])
+            sig.register_udp_rtp(peer_key, rtp.on_packet)
+        except Exception as e:
+            self.log("[UDP-RTP] 注册接收回调失败: %s" % e)
+            return
+        with self.lock:
+            self.udp_conns[peer_id] = rtp
+            member = dict(self.members.get(peer_id, {}))
+        self.log("[UDP-RTP] 已为 %s 建立可靠通道 %s"
+                 % (member.get("name", peer_id), peer_addr))
+        # 梯度冗余：注册 UDP 路径
+        try:
+            self._get_path_sched(peer_id).register("udp:%s" % peer_id, "udp", 0)
+        except Exception:
+            pass
+        cb = self.on_udp_ready
+        if cb:
+            try:
+                cb(peer_id, rtp)
+            except Exception as e:
+                self.log("[UDP-RTP] 回调异常: %s" % e)
+        # P2 #6: 若本机 TCP 映射已就绪，立即告知对端可开始打洞
+        if self._mapping_ready:
+            try:
+                rtp.send_tcp_ready()
+                self.log("[打洞] 新通道通知 TCP_READY -> peer=%s" % peer_id)
+            except Exception:
+                pass
+        # P1: UDP-RTP 通道就绪后，若是 initiator 则启动 SYNC 以精准 TCP 打洞
+        try:
+            my_id = getattr(sig, "my_id", None) or ""
+            if my_id and my_id < peer_id:
+                threading.Thread(target=self._maybe_start_sync,
+                                 args=(peer_id, rtp), daemon=True).start()
+        except Exception as e:
+            self.log("[SYNC] 启动判断异常: %s" % e)
+
+    def _maybe_start_sync(self, peer_id, rtp):
+        """P1: 延迟 300ms 后（避免与 punch_go 触发的 TCP 打洞并发）发起 SYNC。"""
+        try:
+            time.sleep(0.3)
+            with self.lock:
+                conn = self.connections.get(peer_id)
+                if conn and conn.state == RM_STATE_CONNECTED:
+                    return   # 已经 TCP 连接，不需要 SYNC
+            self.log("[SYNC] 作为 initiator 向 peer=%s 发起 SYNC" % peer_id)
+            rtp.start_sync()
+        except Exception as e:
+            self.log("[SYNC] 异常: %s" % e)
+
+    def _on_sync_ready(self, peer_id, t_go):
+        """P1: SYNC 完成，到 t_go 时刻精准执行 TCP 同时打开。"""
+        with self.lock:
+            conn = self.connections.get(peer_id)
+            if conn and conn.state == RM_STATE_CONNECTED:
+                return
+            peer = self.members.get(peer_id)
+        if not peer:
+            return
+        threading.Thread(target=self._sync_punch_task,
+                         args=(peer_id, peer, t_go), daemon=True).start()
+
+    def _sync_punch_task(self, peer_id, peer, t_go):
+        """单次精准 TCP 打洞（不重试，因为 SYNC 已对齐时刻）。"""
+        try:
+            # at_ms = t_go 是【本机时刻】（由 SYNC 计算），_wait_until 的换算
+            # 在 punch 内部用 _RM_CLOCK_OFFSET_MS——但 t_go 已是本机时刻，
+            # 故需绕过换算直接等待。
+            now_ms = int(time.time() * 1000)
+            wait_sec = (t_go - now_ms) / 1000.0
+            if wait_sec > 0:
+                time.sleep(min(wait_sec, 3.0))
+            result = self._puncher.punch(peer, 0)   # at_ms=0，已 sleep 到点
+            if result:
+                self._install_socket(peer_id, result)
+                self.log("[SYNC] 精准 TCP 打洞成功 peer=%s" % peer_id)
+            else:
+                self.log("[SYNC] 精准 TCP 打洞失败 peer=%s，转入多轮重试" % peer_id)
+                # P2: 单次精准打洞失败后，回落到轮次对齐的多轮重试
+                self._punch_task(peer, 0)
+        except Exception as e:
+            self.log("[SYNC] TCP 打洞异常: %s" % e)
+
+    def get_udp_socket(self, peer_id):
+        with self.lock:
+            return self.udp_conns.get(peer_id)
+
+    def broadcast_tcp_ready(self):
+        """P2 #6: TCP 映射就绪 → 向所有已有 UDP 通道的对端广播 TCP_READY。"""
+        with self.lock:
+            items = list(self.udp_conns.items())
+        if not items:
+            return
+        for pid, rtp in items:
+            try:
+                rtp.send_tcp_ready()
+                self.log("[打洞] 广播 TCP_READY -> peer=%s" % pid)
+            except Exception:
+                pass
+
+    def _on_peer_tcp_ready(self, peer_id):
+        """P2 #6: 对端 TCP 映射已就绪 → 立即触发一次打洞（无需等服务器 punch_go）。"""
+        with self.lock:
+            peer = self.members.get(peer_id)
+            conn = self.connections.get(peer_id)
+            if conn and conn.state in (RM_STATE_CONNECTING, RM_STATE_CONNECTED):
+                return
+            if not peer:
+                return
+            self.connections[peer_id] = RmConn(peer)
+        self.log("[打洞] 对端 TCP 就绪，立即发起打洞 peer=%s" % peer_id)
+        threading.Thread(target=self._punch_task, args=(peer, 0), daemon=True).start()
+
+    def _on_peer_punch_fail(self, peer_id):
+        """P2 #8: 对端放弃 TCP → 本端停止空等，标记失败并回退 UDP。
+
+        关键：对端放弃 TCP 说明它那条方向没打通。本端即便 connect 成功，
+        也可能是【半开连接】——本端 SYN 到了对端，但对端 SYN 没到本端，
+        对端应用层没有对应 socket 接收。这种连接本端 send() 能进内核缓冲，
+        对端却收不到，数据会超时/RST。
+        因此必须【无论本端是否 CONNECTED 都关闭 TCP】，否则会把文件发进
+        一条单向死连接（现象：协商续传 timeout、通道失败 10053/10054）。
+        """
+        with self.lock:
+            conn = self.connections.get(peer_id)
+            # 关键：若本端已 CONNECTED（且是经握手确认的真连接），
+            # 对端的 PUNCH_FAIL 只是"它那条腿失败"，不代表本端连接不可用。
+            # 此时【不关闭】本端连接，避免误杀刚建立的有效通道。
+            # 只有当本端也非 CONNECTED（半开或未连）时才关闭重试。
+            if conn and conn.state == RM_STATE_CONNECTED:
+                self.log("[打洞] 收到对端 PUNCH_FAIL，但本端已握手确认连接，忽略")
+                return
+        self.log("[打洞] 对端放弃 TCP，peer=%s 关闭半开连接并回退 UDP" % peer_id)
+        with self.lock:
+            conn = self.connections.get(peer_id)
+            if conn:
+                self._close_sock(conn)
+                conn.state = RM_STATE_FAILED
+        # 路径调度：热备失效 → 暖备上位
+        try:
+            self._on_path_failure(peer_id, "tcp")
+        except Exception:
+            pass
+        cb = self.on_state_changed
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def _on_punch_round(self, peer_id, round_no, t_go_r):
+        """P2: 收到主导方下发的打洞轮次时刻。"""
+        with self._punch_round_cond:
+            self._punch_round_evt[peer_id] = (round_no, t_go_r)
+            self._punch_round_cond.notify_all()
+
+    def _wait_punch_round(self, peer_id, round_no, timeout):
+        """P2: 等待主导方下发的 >= round_no 的时刻（responder 钟）。返回 t_go_r 或 None。"""
+        deadline = time.time() + timeout
+        with self._punch_round_cond:
+            while True:
+                v = self._punch_round_evt.get(peer_id)
+                if v and v[0] >= round_no:
+                    return v[1]
+                remain = deadline - time.time()
+                if remain <= 0:
+                    return None
+                self._punch_round_cond.wait(remain)
+
+    def _sleep_until_local(self, t_local_ms):
+        """P2: sleep 到本机绝对毫秒时刻（用于轮次对齐后的打洞）。"""
+        remain = (t_local_ms - int(time.time() * 1000)) / 1000.0
+        if remain > 0:
+            time.sleep(min(remain, 3.0))
+
+    def _on_path_failure(self, peer_id, proto):
+        """梯度冗余：某协议路径失效 → 触发角色轮转（保守暖备上位热备）。"""
+        sched = self._path_schedulers.get(peer_id)
+        if not sched:
+            return
+        if proto == "tcp":
+            new_hot = sched.promote_on_hot_failure()
+            if new_hot:
+                self.log("[路径] peer=%s 热备失效，%s 上位为热备"
+                         % (peer_id, new_hot))
+        else:
+            # UDP 失效：从调度器移除该路径（TCP 通常已是热备）
+            sched.remove("udp:%s" % peer_id)
+
+    def new_recv_epoch(self, peer_key):
+        """新接收循环启动时调用：递增该 peer 的代际号，返回新值。"""
+        with self.lock:
+            e = self._recv_epoch.get(peer_key, 0) + 1
+            self._recv_epoch[peer_key] = e
+            return e
+
+    def is_current_epoch(self, peer_key, epoch):
+        """检查某接收循环是否仍是当前代际（旧的应退出）。"""
+        with self.lock:
+            return self._recv_epoch.get(peer_key) == epoch
+
+    def _request_rebuild(self, peer_id):
+        """请求服务器重新协调打洞（带冷却）。【不销毁任何现存连接】。
+
+        与 _handle_udp_peer_dead 的区别：本方法只发重建请求，
+        不会 pop/close 任何通道 —— 供 TCP 死亡等场景使用，
+        避免误杀另一条健康路径（如刚上位的 UDP 热备）。
+        """
+        now = time.time()
+        with self._rebuild_cooldown_lock:
+            last = self._rebuild_cooldown.get(peer_id, 0)
+            if now - last < self._rebuild_cooldown_sec:
+                self.log("[房间] peer=%s 重建冷却中（%.0f 秒前）"
+                         % (peer_id, now - last))
+                return
+            self._rebuild_cooldown[peer_id] = now
+        try:
+            if self.signaling:
+                self.log("[房间] peer=%s 请求重新打洞" % peer_id)
+                self.signaling.request_punch(peer_id)
+        except Exception as e:
+            self.log("[房间] peer=%s 重新打洞请求失败: %s" % (peer_id, e))
+
+    def _handle_udp_peer_dead(self, peer_id):
+        """UDP-RTP 对端失联 → 清理 UDP 连接 + 触发重建（带冷却）。"""
+        self.log("[UDP-RTP] peer=%s 通道失联，清理并触发重建" % peer_id)
+        try:
+            self._on_path_failure(peer_id, "udp")
+        except Exception:
+            pass
+        with self.lock:
+            rtp = self.udp_conns.pop(peer_id, None)
+        if rtp:
+            try:
+                rtp.close()
+            except Exception:
+                pass
+            try:
+                addr = rtp.peer
+                peer_key = "%s:%d" % (addr[0], addr[1])
+                if self.signaling:
+                    self.signaling.unregister_udp_rtp(peer_key)
+            except Exception:
+                pass
+        self._request_rebuild(peer_id)
 
     def on_joined(self, members):
         for m in members:
@@ -460,6 +1617,19 @@ class RmRoomManager:
             conn = self.connections.pop(peer_id, None)
             if conn:
                 self._close_sock(conn)
+            # 梯度冗余：清理该 peer 的路径调度器
+            self._path_schedulers.pop(peer_id, None)
+            # 连接池：清理空闲记录
+            self._peer_last_active.pop(peer_id, None)
+            # UDP 连接也要清理（否则成员离开后仍占资源）
+            rtp = self.udp_conns.pop(peer_id, None)
+        if rtp:
+            try:
+                rtp.close()
+            except Exception:
+                pass
+        with self._rebuild_cooldown_lock:
+            self._rebuild_cooldown.pop(peer_id, None)
         self.log("[房间] 成员离开 %s" % peer_id)
 
     def on_punch_go(self, peer, at_ms):
@@ -478,6 +1648,10 @@ class RmRoomManager:
         """处理 listener accept 到的连接：若匹配成员 TCP 公网映射则接管。
 
         回调必须在【释放锁之后】执行（get_conn 需要同一把锁，锁内回调会死锁）。
+
+        握手确认：入站方作为"被连方"，与连接方各发一次魔数、各收一次。
+        两端都 send+recv（魔数相同），即可确认双向可达；握手失败说明
+        对方并未真正建立双向连接（例如对方是另一方向的半开），拒绝接管。
         """
         ip, port = addr[0], addr[1]
         key = "%s:%d" % (ip, port)
@@ -487,19 +1661,29 @@ class RmRoomManager:
             for pid, m in self.members.items():
                 pub_tcp = m.get("pub_tcp", "")
                 if pub_tcp and pub_tcp == key:
-                    conn = self.connections.get(pid)
-                    if conn and conn.state == RM_STATE_CONNECTED and conn.sock:
-                        return True
-                    new_conn = RmConn(m)
-                    new_conn.state = RM_STATE_CONNECTED
-                    new_conn.sock = sock
-                    new_conn.addr = (ip, port)
-                    self.connections[pid] = new_conn
                     ready_pid = pid
                     ready_member = dict(m)
                     break
         if ready_pid is None:
             return False
+        # 软握手确认（在释放锁之后做，避免阻塞锁）：成功→验证；失败→仍接管。
+        # 与出站一致：不因握手失败而拒绝连接，避免误杀本可用的连接。
+        if rm_punch_handshake(sock, RM_PUNCH_HANDSHAKE_TIMEOUT):
+            self.log("[打洞] 入站连接 %s 握手确认" % key)
+        else:
+            self.log("[打洞] 入站连接 %s（握手无回应，降级信任）" % key)
+        with self.lock:
+            conn = self.connections.get(ready_pid)
+            if conn and conn.state == RM_STATE_CONNECTED and conn.sock:
+                return True
+            # 覆盖前先关掉旧 socket，避免并发入站/出站竞争导致 fd 泄漏
+            if conn:
+                self._close_sock(conn)
+            new_conn = RmConn(ready_member)
+            new_conn.state = RM_STATE_CONNECTED
+            new_conn.sock = sock
+            new_conn.addr = (ip, port)
+            self.connections[ready_pid] = new_conn
         self._apply_keepalive(sock)
         self.log("[房间] 入站连接 %s <- %s" % (ready_member.get("name", ready_pid), key))
         cb = self.on_socket_ready
@@ -516,6 +1700,99 @@ class RmRoomManager:
             if conn and conn.state == RM_STATE_CONNECTED and conn.sock:
                 return conn.sock
         return None
+
+    def _channel_usable(self, sock):
+        """检查通道是否仍可用（未被关闭）。
+
+        换路后旧接收循环会在 finally 里 sock.close()，但 connections/udp_conns
+        表可能仍留着该对象，get_send_channel 若返回它会立即发送失败。
+        """
+        if sock is None:
+            return False
+        if getattr(sock, "is_udp_rtp", False):
+            try:
+                return not sock._closed
+            except Exception:
+                return True
+        try:
+            return sock.fileno() != -1
+        except Exception:
+            return False
+
+    def mark_active(self, peer_id):
+        """连接池：标记某 peer 刚被使用（传输开始/结束），重置空闲计时。"""
+        with self.lock:
+            self._peer_last_active[peer_id] = time.time()
+
+    def _idle_factor(self, peer_id, now):
+        """连接池：按空闲时长返回保活间隔放大系数。
+
+        空闲越久，保活越稀疏（省电省流量）；下次传输前会被 mark_active 重置。
+        · < 60s    → ×1（正常）
+        · < 10min  → ×4
+        · < 1h     → ×16
+        · 更久     → ×64（几乎停摆，接受下次重建）
+        """
+        last = self._peer_last_active.get(peer_id, now)
+        idle = now - last
+        if idle < 60:
+            return 1
+        if idle < 600:
+            return 4
+        if idle < 3600:
+            return 16
+        return 64
+
+    def get_send_channel(self, peer_id, exclude_socks=None):
+        """按路径角色选路发送：优先热备，其次保守暖备，最后宽松暖备。
+
+        返回 (sock, io_lock, is_udp, role) 或 None。
+        · 角色由梯度冗余调度器维护（hot/warm_safe/warm_loose）
+        · 无调度器时退化为旧行为（TCP 优先，UDP 回退）
+        · exclude_socks：已试过且失败的 socket 集合（按 id() 比较），换路时跳过
+        """
+        exclude = exclude_socks or set()
+        sched = self._path_schedulers.get(peer_id)
+        if sched is not None:
+            for role in ("hot", "warm_safe", "warm_loose"):
+                with sched.lock:
+                    path = next((p for p in sched.paths.values()
+                                 if p.role == role), None)
+                if path is None:
+                    continue
+                if path.proto == "tcp":
+                    with self.lock:
+                        conn = self.connections.get(peer_id)
+                        if (conn and conn.state == RM_STATE_CONNECTED and conn.sock
+                                and id(conn.sock) not in exclude
+                                and self._channel_usable(conn.sock)):
+                            return (conn.sock, conn.io_lock, False, role)
+                else:
+                    with self.lock:
+                        rtp = self.udp_conns.get(peer_id)
+                        if (rtp is not None and id(rtp) not in exclude
+                                and self._channel_usable(rtp)):
+                            return (rtp, rtp.io_lock, True, role)
+        # 回退：任意可用通道
+        with self.lock:
+            conn = self.connections.get(peer_id)
+            if (conn and conn.state == RM_STATE_CONNECTED and conn.sock
+                    and id(conn.sock) not in exclude
+                    and self._channel_usable(conn.sock)):
+                return (conn.sock, conn.io_lock, False, "?")
+            rtp = self.udp_conns.get(peer_id)
+            if (rtp is not None and id(rtp) not in exclude
+                    and self._channel_usable(rtp)):
+                return (rtp, rtp.io_lock, True, "?")
+        return None
+
+    def get_path_roles(self, peer_id):
+        """供 UI 展示：返回该 peer 的 {path_id: role}。"""
+        sched = self._path_schedulers.get(peer_id)
+        if not sched:
+            return {}
+        with sched.lock:
+            return {pid: p.role for pid, p in sched.paths.items()}
 
     def has_peer(self, peer_id):
         with self.lock:
@@ -537,11 +1814,25 @@ class RmRoomManager:
             out = []
             for pid, m in self.members.items():
                 conn = self.connections.get(pid)
+                state = conn.state if conn else "idle"
+                addr = conn.addr if conn else None
+                # UDP 通道已通即视为在线可用，无需等待 TCP（TCP 可能仍在打洞中/失败）
+                if state != RM_STATE_CONNECTED and pid in self.udp_conns:
+                    state = RM_STATE_CONNECTED
+                    rtp = self.udp_conns[pid]
+                    addr = "udp://%s:%d" % rtp.peer
+                # 梯度冗余：附加路径角色（hot/warm_safe/warm_loose）
+                roles = {}
+                sched = self._path_schedulers.get(pid)
+                if sched:
+                    with sched.lock:
+                        roles = {ppath.path_id: ppath.role for ppath in sched.paths.values()}
                 out.append({
                     "id": pid,
                     "name": m.get("name", ""),
-                    "state": conn.state if conn else "idle",
-                    "addr": conn.addr if conn else None,
+                    "state": state,
+                    "addr": addr,
+                    "path_roles": roles,
                 })
             return out
 
@@ -557,25 +1848,106 @@ class RmRoomManager:
             self.log("[房间] 请求打洞失败: %s" % e)
 
     def _punch_task(self, peer, at_ms):
+        """多轮重试打洞。
+
+        关键：每轮开始前【重读】self.members 里的最新 peer——
+        因为第一次 punch_go 到达时，对端的 pub_tcp 可能还没在服务器登记
+        （对端此时还在 syncTime / openMapping），导致下发的 peer 里
+        pub_tcp 为空。之后对端完成登记并再次 request_punch 时，会下发第二次
+        punch_go 携带有效 pub_tcp。若本任务不重读，就会一直用旧的空 pub_tcp。
+        """
         peer_id = peer.get("id")
+        # 打洞并发限制：同一 peer 最多允许 2 个 _punch_task 并发。
+        # 保留适度冗余（多触发源中若一个卡住，另一个可补位），又不至于泛滥。
+        with self.lock:
+            cnt = self._punch_active.get(peer_id, 0)
+            if cnt >= 2:
+                return
+            self._punch_active[peer_id] = cnt + 1
         self._punch_sem.acquire()
         try:
             for attempt in range(1, RM_PUNCH_RETRY + 1):
                 if not self._running:
                     return
-                result = self._puncher.punch(peer, at_ms)
+                # 已连接则退出：其他并发任务已成功，避免无谓尝试
+                # （消除 errno=10048 端口冲突 / 无路由等噪音日志，省资源省电）
+                with self.lock:
+                    _c = self.connections.get(peer_id)
+                    if _c and _c.state == RM_STATE_CONNECTED:
+                        self.log("[打洞] peer=%s 已由其他任务连接，本任务退出" % peer_id)
+                        return
+                # 重读最新 peer（含可能刚更新过的 pub_tcp）
+                with self.lock:
+                    latest = self.members.get(peer_id) or peer
+                if attempt == 1:
+                    self.log("[打洞] 任务启动 peer=%s 本地端口=%d"
+                             % (peer_id, self._puncher.local_tcp_port))
+                else:
+                    self.log("[打洞] 第 %d 轮重试 peer=%s（pub_tcp=%s）"
+                             % (attempt, peer_id, latest.get("pub_tcp", "")))
+                # 传入 should_stop：风暴期间若其他任务已连上，立即停止
+                def _already_connected(_pid=peer_id):
+                    with self.lock:
+                        _cc = self.connections.get(_pid)
+                        return bool(_cc and _cc.state == RM_STATE_CONNECTED)
+                result = self._puncher.punch(latest, at_ms, should_stop=_already_connected)
                 if result:
                     self._install_socket(peer_id, result)
                     return
                 if attempt < RM_PUNCH_RETRY:
-                    time.sleep(attempt * RM_PUNCH_RETRY_BACKOFF)
-                    at_ms = 0
+                    next_round = attempt + 1
+                    backoff = attempt * RM_PUNCH_RETRY_BACKOFF
+                    rtp = self.get_udp_socket(peer_id)
+                    my_id = getattr(self.signaling, "my_id", None) or ""
+                    if rtp is not None and my_id and my_id < peer_id:
+                        # 主导方：约定下一轮本机时刻 → 换算 responder 钟下发
+                        t_go_next_i = int(time.time() * 1000) + backoff * 1000
+                        off = rtp.get_sync_offset() or 0
+                        rtp.send_punch_round(next_round, t_go_next_i + off)
+                        self.log("[打洞] 主导轮次 %d，约定 T_go(本地)=%d"
+                                 % (next_round, t_go_next_i))
+                        self._sleep_until_local(t_go_next_i)
+                        at_ms = 0
+                    elif rtp is not None and my_id and my_id > peer_id:
+                        # 响应方：等待主导方下发的下一轮时刻
+                        t_go_r = self._wait_punch_round(peer_id, next_round, backoff + 2.0)
+                        if t_go_r is not None:
+                            self.log("[打洞] 跟随主导轮次 %d，T_go(本地)=%d"
+                                     % (next_round, t_go_r))
+                            self._sleep_until_local(t_go_r)
+                        else:
+                            time.sleep(backoff)
+                        at_ms = 0
+                    else:
+                        # 无 UDP 通道：退化为本地退避
+                        time.sleep(backoff)
+                        at_ms = 0
+            # 仅在仍未连接时才标记失败：避免把并发任务已建立的 CONNECTED 覆盖
+            mark_failed = False
             with self.lock:
                 conn = self.connections.get(peer_id)
-                if conn:
+                if conn and conn.state != RM_STATE_CONNECTED:
                     conn.state = RM_STATE_FAILED
+                    mark_failed = True
+            if not mark_failed:
+                self.log("[房间] 本任务失败，但 peer=%s 已由其他任务连接，忽略"
+                         % peer_id)
+                return
             self.log("[房间] 连接失败 %s" % peer.get("name", peer_id))
+            # P2 #8: 通知对端本端已放弃 TCP，避免对端空等
+            try:
+                rtp = self.get_udp_socket(peer_id)
+                if rtp is not None:
+                    rtp.send_punch_fail()
+            except Exception:
+                pass
         finally:
+            with self.lock:
+                c = self._punch_active.get(peer_id, 1) - 1
+                if c <= 0:
+                    self._punch_active.pop(peer_id, None)
+                else:
+                    self._punch_active[peer_id] = c
             self._punch_sem.release()
 
     def _install_socket(self, peer_id, result):
@@ -597,12 +1969,24 @@ class RmRoomManager:
             member = dict(self.members.get(peer_id, {}))
         self._apply_keepalive(result.sock)
         self.log("[房间] 已连接 %s -> %s:%d" % (member.get("name", peer_id), result.ip, result.port))
+        # 梯度冗余：注册 TCP 路径（角色由调度器按空缺位分配）
+        try:
+            self._get_path_sched(peer_id).register("tcp:%s" % peer_id, "tcp", 0)
+        except Exception:
+            pass
         cb = self.on_socket_ready
         if cb:
             try:
                 cb(peer_id, result.sock, member)
             except Exception as e:
                 self.log("[房间] 接收回调异常: %s" % e)
+        # 打洞成功 → 通知 UI 刷新（状态从"连接中"变"已连接"）
+        sc = self.on_state_changed
+        if sc:
+            try:
+                sc()
+            except Exception:
+                pass
 
     def _apply_keepalive(self, sock):
         try:
@@ -619,38 +2003,137 @@ class RmRoomManager:
             conn.sock = None
 
     def _keepalive_loop(self):
+        """梯度冗余保活循环。
+
+        以 1 秒为节拍轮询；每条路径按各自的软性探测间隔决定何时检查/保活。
+        - 热备：间隔最短，快速感知断线
+        - 保守暖备：硬性钳制，确保 NAT 映射有效
+        - 宽松暖备：间隔最长，尽量省电
+        路径检查失败 → 更新调度器（on_failure）+ 触发角色轮转。
+        """
+        _next_due = {}
         while self._running:
-            time.sleep(RM_NAT_KEEPALIVE_INTERVAL)
+            time.sleep(1.0)
             if not self._running:
                 break
+            now = time.time()
+            state_changed = False
+
+            # ---- 1) 按路径调度器的软性间隔，逐条检查/保活 ----
+            for pid in list(self._path_schedulers.keys()):
+                sched = self._path_schedulers.get(pid)
+                if not sched:
+                    continue
+                with sched.lock:
+                    items = list(sched.paths.items())
+                idle_factor = self._idle_factor(pid, now)
+                live_ids = set()
+                for path_id, p in items:
+                    # A) 跳过 dead 路径（不再无谓探测，等重连时 register 替换）
+                    if p.role == "dead":
+                        continue
+                    live_ids.add(path_id)
+                    if now < _next_due.get(path_id, 0):
+                        continue
+                    ok = self._probe_path(pid, path_id, p)
+                    if ok:
+                        p.scheduler.on_success()
+                        p.last_seen = now
+                    else:
+                        p.scheduler.on_failure()
+                        self.log("[保活] 路径 %s 失败（间隔=%ds）"
+                                 % (path_id, p.scheduler.current_interval))
+                    # 连接池：空闲降频（间隔 ×idle_factor）
+                    _next_due[path_id] = now + p.scheduler.current_interval * idle_factor
+                # B) 清理已移除路径的 _next_due 条目（避免长期累积）
+                for stale_id in [k for k in _next_due if k not in live_ids]:
+                    _next_due.pop(stale_id, None)
+
+            # ---- 2) TCP 长连接存活检查（兜底，快速感知） ----
             with self.lock:
-                items = [(pid, conn) for pid, conn in self.connections.items()
-                         if conn.state == RM_STATE_CONNECTED]
-            for pid, conn in items:
+                tcp_items = [(pid, conn) for pid, conn in self.connections.items()
+                             if conn.state == RM_STATE_CONNECTED]
+            for pid, conn in tcp_items:
                 if not self._alive(conn.sock):
-                    self.log("[保活] %s 通道失效，重新打洞" % pid)
+                    self.log("[保活] %s TCP 通道失效，重新打洞" % pid)
+                    dead = False
                     with self.lock:
                         cur = self.connections.get(pid)
-                        if cur:
+                        if cur is conn:
                             self._close_sock(cur)
                             cur.state = RM_STATE_FAILED
+                            dead = True
+                    if not dead:
+                        continue
                     try:
-                        self.signaling.request_punch(pid)
+                        self._on_path_failure(pid, "tcp")
                     except Exception:
                         pass
+                    # 关键修复：TCP 死亡【不能】走 _handle_udp_peer_dead ——
+                    # 那会销毁健康的 UDP 通道（可能是刚上位的热备）。
+                    # 只请求重建 TCP，绝不触碰其他路径。
+                    self._request_rebuild(pid)
+                    state_changed = True
+
+            # ---- 3) UDP-RTP 存活检查 ----
+            with self.lock:
+                udp_items = list(self.udp_conns.items())
+            for pid, rtp in udp_items:
+                try:
+                    if rtp.is_dead():
+                        self.log("[保活] %s UDP-RTP 通道失联" % pid)
+                        self._handle_udp_peer_dead(pid)
+                        state_changed = True
+                except Exception:
+                    pass
+
+            if state_changed:
+                cb = self.on_state_changed
+                if cb:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+
+    def _probe_path(self, peer_id, path_id, path):
+        """探测某条路径是否存活（按协议选方式）。
+
+        · tcp：用 _alive() 检查 socket（MSG_PEEK）
+        · udp：检查 UdpReliableSocket 是否失联
+        返回 True 表示存活。
+        """
+        if path.proto == "tcp":
+            with self.lock:
+                conn = self.connections.get(peer_id)
+            if conn and conn.state == RM_STATE_CONNECTED and conn.sock:
+                return self._alive(conn.sock)
+            return False
+        else:
+            with self.lock:
+                rtp = self.udp_conns.get(peer_id)
+            if rtp is None:
+                return False
+            try:
+                return not rtp.is_dead()
+            except Exception:
+                return False
 
     def _alive(self, sock):
         if not sock:
             return False
         try:
             sock.setblocking(False)
-            try:
-                data = sock.recv(1, socket.MSG_PEEK)
-                return data != b""
-            except BlockingIOError:
-                return True
-            except Exception:
-                return False
+        except Exception:
+            # 套接字已被其他线程关闭（WinError 10038 等）→ 视为已失效。
+            # 必须在这里捕获：setblocking 失败后 fd 无效，后续 recv 也无意义。
+            return False
+        try:
+            data = sock.recv(1, socket.MSG_PEEK)
+            return data != b""
+        except BlockingIOError:
+            return True
+        except Exception:
+            return False
         finally:
             try:
                 sock.setblocking(True)
@@ -702,6 +2185,117 @@ TEXT_EXTENSIONS = {
 SENDFILE_SUPPORT = hasattr(os, 'sendfile')
 RESUME_DIR = Path.home() / '.p2p_resume'
 RESUME_DIR.mkdir(exist_ok=True)
+
+# 续传状态保留天数（超过则清理，防止目录膨胀）
+RESUME_RETENTION_DAYS = 30
+# 日志保留天数
+LOG_RETENTION_DAYS = 7
+LOG_FILE = 'transfer.log'
+
+
+# 全局诊断日志钩子：由 P2PApp 初始化时设置为 GUI 的 log 方法。
+# 模块级函数（如 optimize_tcp_socket）通过它把诊断输出到界面日志。
+_DIAG_LOG = None
+
+
+def _diag(msg):
+    """输出诊断信息：优先走 GUI 日志，否则回退 stdout。"""
+    if _DIAG_LOG is not None:
+        try:
+            _DIAG_LOG(msg)
+            return
+        except Exception:
+            pass
+    try:
+        import sys as _sys
+        _sys.stdout.write(msg + "\n")
+        _sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _print_socket_buffers(sock):
+    """读回并打印 socket 的 SNDBUF/RCVBUF 实际值（诊断用，失败静默）。"""
+    try:
+        snd = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+        rcv = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        _diag("[TCP缓冲] 实际生效 SNDBUF=%d RCVBUF=%d（期望 %d）"
+              % (snd, rcv, SOCKET_BUFFER_SIZE))
+    except Exception:
+        pass
+
+
+def optimize_tcp_socket(sock):
+    """统一的 TCP socket 优化 —— 全项目唯一入口。
+
+    所有 TCP socket（局域网发送/接收、房间出站打洞、房间入站 accept）
+    都调用本函数，确保缓冲区与 Nagle 策略一致；避免某条路径漏设导致
+    吞吐被系统默认值卡住（例如房间打洞出站 socket 曾漏设，公网 TCP
+    速度只有 2.6 MB/s）。
+
+    做三件事：
+      1. TCP_NODELAY=1：关闭 Nagle，避免小包延迟累积
+      2. SO_KEEPALIVE + 参数：减少防火墙超时断连
+      3. SO_SNDBUF / SO_RCVBUF 设大（逐级下调），扩大发送/接收窗口
+    注意：SO_RCVBUF 影响 window scale，connect 之前设对接收窗口最有效；
+    connect 之后设主要改善 SO_SNDBUF（发送方向），对发送吞吐仍有效。
+    """
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+    sock.settimeout(None)  # 大文件传输不设置超时
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except AttributeError:
+        pass  # 部分系统不支持
+    # 设置 socket 缓冲区（内核可能限制实际值，逐级下调尝试）
+    for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+        for buf_size in (SOCKET_BUFFER_SIZE * 2, SOCKET_BUFFER_SIZE):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, opt, buf_size)
+                break
+            except Exception:
+                continue
+    # 诊断：读回实际生效值（内核通常会限制；用于定位吞吐瓶颈）
+    _print_socket_buffers(sock)
+
+
+def cleanup_generated_files(log=None):
+    """清理自身生成的文件：过期续传 JSON + 过期日志。
+
+    · 续传状态（RESUME_DIR 下 *.json）：超过 RESUME_RETENTION_DAYS 天未修改则删除
+    · 日志（transfer.log）：超过 LOG_RETENTION_DAYS 天则清空（保留文件名）
+    仅清理本程序自己生成的文件，不触碰用户接收目录。
+    """
+    _log = log or (lambda m: None)
+    # 1) 续传状态
+    try:
+        cutoff = time.time() - RESUME_RETENTION_DAYS * 86400
+        removed = 0
+        for jf in RESUME_DIR.glob('*.json'):
+            try:
+                if jf.stat().st_mtime < cutoff:
+                    jf.unlink()
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            _log(f"[清理] 删除 {removed} 个过期续传记录（>{RESUME_RETENTION_DAYS}天）")
+    except Exception as e:
+        _log(f"[清理] 续传记录清理异常: {e}")
+    # 2) 日志文件
+    try:
+        lf = Path(LOG_FILE)
+        if lf.exists() and (time.time() - lf.stat().st_mtime) > LOG_RETENTION_DAYS * 86400:
+            with open(lf, 'w'):
+                pass
+            _log(f"[清理] 日志超过 {LOG_RETENTION_DAYS} 天，已清空")
+    except Exception as e:
+        _log(f"[清理] 日志清理异常: {e}")
 # 默认保存目录
 SAVE_DIR = Path("Received")
 CONFIG_FILE = Path.home() / '.p2p_config.json'
@@ -789,7 +2383,11 @@ def get_subnet_for_ip(ip_str):
             # 对10.x.x.x用/24代替/8，避免ZeroTier/Tailscale大网段扫描1600万IP
             return f'{ip_str}/24'
         elif ip_str.startswith('172.') and 16 <= int(ip_str.split('.')[1]) <= 31:
-            return f'{ip_str}/12'
+            # 用 /16 而非 /12：企业网/校园网常用 /21 /22 或 /16，
+            # /12 覆盖 1048576 个 IP，会被 MAX_SCAN_IPS 截断到 65536
+            # （只覆盖 172.16.0.0-172.16.255.255），反而扫不到真实网段
+            # （如 172.20.93.x）。/16 正好 65536 个 IP，不触发截断。
+            return f'{ip_str}/16'
         else:
             return f'{ip_str}/24'
     except:
@@ -929,9 +2527,12 @@ def get_resume_file(target_ip, filename, role='sender'):
     safe_name = filename.replace('/', '_').replace('\\', '_')
     return RESUME_DIR / f"resume_{role}_{target_ip}_{safe_name}.json"
 
-def save_resume_state(target_ip, filepath, offset, total_size, mtime, role='sender'):
-    """保存续传状态，role=sender（发送方记录要发的文件）或 recv（接收方记录已收的文件）"""
-    resume_file = get_resume_file(target_ip, os.path.basename(filepath), role)
+def save_resume_state(target_ip, filepath, offset, total_size, mtime, role='sender', key_name=None):
+    """保存续传状态，role=sender（发送方记录要发的文件）或 recv（接收方记录已收的文件）
+    key_name: 续传记录的键（默认 basename(filepath)）。
+              接收方改名保存时传入发送方原始文件名，保证重试能查到记录。"""
+    key = key_name or os.path.basename(filepath)
+    resume_file = get_resume_file(target_ip, key, role)
     data = {
         'filepath': filepath,
         'offset': offset,
@@ -959,11 +2560,10 @@ def load_resume_state(target_ip, filepath, role='sender'):
                 if current_mtime == data.get('mtime'):
                     return data
         else:
-            # 接收方：检查目标文件是否存在且未变化
-            dest_path = Path(SAVE_DIR) / os.path.basename(filepath)
-            if dest_path.exists():
-                current_size = dest_path.stat().st_size
-                if current_size == data.get('offset'):
+            # 接收方：按记录中的【实际路径】检查（支持接收时改名的情况）
+            dest_path = Path(data.get('filepath', ''))
+            if dest_path and dest_path.exists():
+                if dest_path.stat().st_size == data.get('offset'):
                     return data
         # 不匹配则删除记录
         resume_file.unlink()
@@ -971,9 +2571,10 @@ def load_resume_state(target_ip, filepath, role='sender'):
     except:
         return None
 
-def delete_resume_state(target_ip, filepath, role='sender'):
-    """删除续传状态"""
-    resume_file = get_resume_file(target_ip, os.path.basename(filepath), role)
+def delete_resume_state(target_ip, filepath, role='sender', key_name=None):
+    """删除续传状态（key_name 与 save 时保持一致）"""
+    key = key_name or os.path.basename(filepath)
+    resume_file = get_resume_file(target_ip, key, role)
     if resume_file.exists():
         resume_file.unlink()
 
@@ -1056,6 +2657,11 @@ class Node(threading.Thread):
         threading.Thread(target=self.scan_listener, daemon=True).start()
         self._start_broadcasters()
         threading.Thread(target=self.tcp_file_receiver, daemon=True).start()
+        # 房间模式端口 9998 不监听：
+        # TCP 打洞靠双方同时从 9998 出站（simultaneous open），内核自动匹配
+        # 对端 SYN；若本地存在 listener 反而拦截 SYN，且占用端口使打洞 socket
+        # 无法 bind 9998。映射观测 socket 与打洞 socket 共用 9998，靠
+        # SO_REUSEADDR/SO_REUSEPORT（4 元组不同）。
         self.gui.root.after(2000, self.clean_nodes)
         # 启动后立即扫描，快速发现设备
         self.gui.root.after(500, self._startup_scan)
@@ -1446,6 +3052,8 @@ class Node(threading.Thread):
                     self.gui.log("[网络] 本机 IP 已刷新"
                                  + (f"，新增 {', '.join(added)}" if added else "")
                                  + (f"，移除 {', '.join(removed)}" if removed else ""))
+                    # 本机 IP 集合变化 → 网络切换。若在房间中，重建房间连接
+                    self.gui._on_local_network_changed()
         except Exception:
             pass
 
@@ -1723,30 +3331,83 @@ class Node(threading.Thread):
 
     # ---------- TCP 服务器 ----------
     def _optimize_socket(self, sock):
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.settimeout(None)  # 大文件传输不设置超时
-        # 启用 TCP keepalive（减少防火墙超时断开）
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-        except AttributeError:
-            pass  # 部分系统不支持
-        # 设置 socket 缓冲区为 64MB（内核可能会限制实际值，但尽量设大）
-        for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
-            for buf_size in (SOCKET_BUFFER_SIZE * 2, SOCKET_BUFFER_SIZE):
+        """薄封装：调用全项目统一的 socket 优化入口。"""
+        optimize_tcp_socket(sock)
+
+    def room_tcp_listener(self):
+        """房间模式专用 TCP 监听（端口 9998）。
+
+        与局域网文件接收端口（9999）分离的原因：
+          Android 端 SO_REUSEADDR 语义严格，若房间模式的 TCP 映射观测连接
+          与文件接收监听绑同一端口会 EADDRINUSE，导致服务器无法登记公网映射，
+          对端拿不到 pub_tcp 从而打洞必然失败。
+        本监听仅接管房间模式打洞入站连接，收到非房间连接一律关闭。
+        """
+        sock = None
+        for family, addr in ((socket.AF_INET, ('0.0.0.0', RM_TCP_PORT)),
+                             (socket.AF_INET6, ('::', RM_TCP_PORT))):
+            try:
+                s = socket.socket(family, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6:
+                    try:
+                        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    except Exception:
+                        pass
+                # 关键：房间监听 socket 也要在 listen 前设 RCVBUF（window scale）
                 try:
-                    sock.setsockopt(socket.SOL_SOCKET, opt, buf_size)
-                    break
-                except:
-                    continue
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_SIZE)
+                except Exception:
+                    pass
+                s.bind(addr)
+                s.listen(50)
+                sock = s
+                self.gui.log(f"[房间] 房间端口 {RM_TCP_PORT} 监听成功 ({'IPv6' if family == socket.AF_INET6 else 'IPv4'})")
+                break
+            except Exception as e:
+                try: s.close()
+                except Exception: pass
+                continue
+        if sock is None:
+            self.gui.log(f"[房间] 端口 {RM_TCP_PORT} 监听失败（房间模式不可用）")
+            return
+        self.listen_sockets.append(sock)
+        sock.settimeout(1.0)
+        while self.running:
+            try:
+                conn, addr = sock.accept()
+                self._optimize_socket(conn)
+                room_mgr = getattr(self.gui, 'room_mgr', None)
+                if room_mgr is not None:
+                    try:
+                        if room_mgr.on_inbound(conn, addr):
+                            continue
+                    except Exception as e:
+                        self.gui.log(f"[房间] 入站接管异常: {e}")
+                # 非房间连接：直接关闭（房间端口不接受普通文件传输）
+                try: conn.close()
+                except Exception: pass
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as e:
+                if self.running:
+                    self.gui.log(f"[房间] accept 异常: {e}")
+        try: sock.close()
+        except Exception: pass
 
     def tcp_file_receiver(self):
         # IPv4优先，兼容性更好
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # 关键：SO_RCVBUF 必须在 listen 之前设。TCP window scale 在
+            # 三次握手时协商，accept 之后再设 RCVBUF 对已建立连接无效。
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_SIZE)
+            except Exception:
+                pass
             sock.bind(('0.0.0.0', TCP_PORT))
             sock.listen(50)
             self.gui.log(f"[TCP] 监听端口 {TCP_PORT} 成功")
@@ -1837,32 +3498,76 @@ class Node(threading.Thread):
             except:
                 pass
 
-    def handle_room_receive(self, sock, io_lock, peer_key):
+    def handle_room_receive(self, sock, io_lock, peer_key, epoch=None, room_mgr=None):
         """房间模式长连接的接收循环。
 
-        收发共用同一条打洞连接，用 io_lock 串行化：
-        接收循环仅在 select 检测到可读、且拿到锁时读一帧并处理。
+        收发共用同一条连接，用 io_lock 串行化。
+        传输类型：
+          · TCP：用 select 检测可读
+          · UDP-RTP：用 recv_exact 超时判断（内部条件变量）
+
+        epoch/room_mgr：接收代际。换路时新循环代际递增，旧循环检测到
+        自己不再是当前代际即退出，避免新旧两个循环同时写盘。
         """
+        is_udp = getattr(sock, "is_udp_rtp", False)
+        # epoch 键按协议区分（与启动侧一致）
+        epoch_key = peer_key + (":udp" if is_udp else ":tcp")
         try:
             while self.running:
+                # 代际检查：若【同协议】通道已被替换，旧循环退出
+                if room_mgr is not None and epoch is not None:
+                    if not room_mgr.is_current_epoch(epoch_key, epoch):
+                        self.gui.log(f"[房间接收] {epoch_key} 已被新通道接管，旧接收循环退出")
+                        break
                 io_lock.acquire()
                 try:
-                    r, _, _ = select.select([sock], [], [], 0.5)
-                    if not r:
-                        continue
-                    try:
-                        flag_byte = recv_exact(sock, 1)
-                    except Exception:
-                        break
+                    if is_udp:
+                        try:
+                            sock.settimeout(0.5)
+                            flag_byte = sock.recv_exact(1)
+                        except TimeoutError:
+                            continue
+                        except Exception:
+                            break
+                    else:
+                        r, _, _ = select.select([sock], [], [], 0.5)
+                        if not r:
+                            continue
+                        try:
+                            flag_byte = recv_exact(sock, 1)
+                        except Exception:
+                            break
                     if not flag_byte:
                         break
                     flag = flag_byte[0]
                     sock.settimeout(None)
                     addr = (peer_key, 0)
                     if flag == FLAG_FILE:
-                        self._receive_single_file(sock, addr)
+                        # 代际检查：写盘前确认自己仍是当前接收者
+                        if (room_mgr is not None and epoch is not None
+                                and not room_mgr.is_current_epoch(epoch_key, epoch)):
+                            break
+                        try:
+                            self._receive_single_file(sock, addr)
+                        except (PermissionError, OSError) as fe:
+                            # 文件层错误（权限/磁盘满/路径无效）：只拒绝该文件，不关闭连接
+                            self.gui.log(f"[房间接收] 文件接收失败（连接保留）: {fe}")
+                            try:
+                                sock.sendall(b'MISMATCH  ')
+                            except Exception:
+                                pass
                     elif flag == FLAG_FOLDER:
-                        self._receive_folder(sock, addr)
+                        if (room_mgr is not None and epoch is not None
+                                and not room_mgr.is_current_epoch(epoch_key, epoch)):
+                            break
+                        try:
+                            self._receive_folder(sock, addr)
+                        except (PermissionError, OSError) as fe:
+                            self.gui.log(f"[房间接收] 文件夹接收失败（连接保留）: {fe}")
+                            try:
+                                sock.sendall(b'MISMATCH  ')
+                            except Exception:
+                                pass
                     elif flag == 0x02:
                         self._handle_query_offset(sock, addr)
                     else:
@@ -1888,13 +3593,22 @@ class Node(threading.Thread):
             plen = struct.unpack('!I', raw_plen)[0]
             fname_enc = recv_exact(conn, plen)
             filename = fname_enc.decode('utf-8')
-            # 查找本地是否有该文件的部分接收
+            # 关键：以【续传记录】为唯一判据。
+            # 仅当存在匹配的 recv 续传记录（且记录里的实际文件大小 == offset）时，
+            # 才回报已收字节数；否则一律回报 0（视为新文件）。
+            # 这样避免"同名但不同内容"的旧文件被误判为续传起点。
             local_offset = 0
-            save_dir = SAVE_DIR
-            save_path = (save_dir / filename).resolve()
-            if save_path.exists():
-                local_offset = save_path.stat().st_size
-                if local_offset > total_size:
+            rec_key = get_resume_file(addr[0], filename, role='recv')
+            if rec_key.exists():
+                try:
+                    with open(rec_key, 'r') as f:
+                        rec = json.load(f)
+                    actual_path = Path(rec.get('filepath', ''))
+                    if (actual_path and actual_path.exists()
+                            and rec.get('total_size') == total_size
+                            and actual_path.stat().st_size == rec.get('offset')):
+                        local_offset = rec.get('offset', 0)
+                except Exception:
                     local_offset = 0
             conn.sendall(struct.pack('!Q', local_offset))
             self.gui.log(f"[接收] 续传查询: {filename}，本地已收 {human_size(local_offset)}")
@@ -2031,6 +3745,18 @@ class Node(threading.Thread):
             conn.sendall(b'MISMATCH  ')
             return False
 
+    @staticmethod
+    def _unique_path(save_dir, filename):
+        """同名文件已存在时，生成 name(1).ext / name(2).ext ... 的可用路径。"""
+        base = Path(filename)
+        stem, ext = base.stem, base.suffix
+        for i in range(1, 10000):
+            candidate = save_dir / ("%s(%d)%s" % (stem, i, ext))
+            if not candidate.exists():
+                return candidate.resolve()
+        # 极端情况兜底
+        return (save_dir / ("%s_%d%s" % (stem, int(time.time()), ext))).resolve()
+
     # ---------- 接收文件（支持续传） ----------
     def _receive_single_file(self, conn, addr):
         raw_len = recv_exact(conn, 4)
@@ -2055,22 +3781,16 @@ class Node(threading.Thread):
             conn.sendall(b'NO')
             return
 
+        # 续传记录键 = 发送方原始文件名（改名后仍用它查记录）
+        resume_key = filename
         if save_path.exists():
             current_size = os.path.getsize(save_path)
             if resume and current_size == offset:
+                # 真正的续传：沿用现有部分文件
                 pass
             else:
-                result = [None]
-                def ask():
-                    result[0] = messagebox.askyesno("文件已存在", f"文件 {filename} 已存在，是否覆盖？")
-                self.gui.root.after(0, ask)
-                while result[0] is None:
-                    self.gui.root.update_idletasks()
-                    time.sleep(0.01)
-                if not result[0]:
-                    conn.sendall(b'NO')
-                    return
-                save_path.unlink()
+                # 非续传：同名文件已被占用 → 改名 name(1).ext，不覆盖、不删除
+                save_path = self._unique_path(save_dir, filename)
                 offset = 0
         else:
             offset = 0
@@ -2097,7 +3817,8 @@ class Node(threading.Thread):
                 sha = hashlib.sha256()
 
         # 保存接收方初始续传状态（从当前偏移量开始）
-        save_resume_state(addr[0], str(save_path), offset, file_size, 0, role='recv')
+        save_resume_state(addr[0], str(save_path), offset, file_size, 0,
+                          role='recv', key_name=resume_key)
         last_progress_save = [0.0]  # 上次实时保存进度的时间
         _tracker = SpeedTracker()    # 瞬时速度追踪器
 
@@ -2113,7 +3834,8 @@ class Node(threading.Thread):
             # 每5秒或每10%实时保存进度
             now = time.time()
             if now - last_progress_save[0] >= 5 or (received - offset) % max(1, total // 10) < 1024*1024:
-                save_resume_state(addr[0], str(save_path), received, file_size, 0, role='recv')
+                save_resume_state(addr[0], str(save_path), received, file_size, 0,
+                                  role='recv', key_name=resume_key)
                 last_progress_save[0] = now
 
         success = False
@@ -2153,7 +3875,7 @@ class Node(threading.Thread):
             self.gui.root.after(0, lambda: messagebox.showinfo("接收完成", f"文件 {filename} 接收成功！"))
             self.gui.root.after(200, lambda: os.startfile(os.path.dirname(save_path)))
             # 删除接收方续传记录
-            delete_resume_state(addr[0], str(save_path), role='recv')
+            delete_resume_state(addr[0], str(save_path), role='recv', key_name=resume_key)
         else:
             conn.sendall(b'MISMATCH  ')
             self.gui.log(f"[接收] 文件 {filename} 校验失败 ✗")
@@ -2166,7 +3888,7 @@ class Node(threading.Thread):
                 pass
             if success:
                 self.gui.root.after(0, lambda: messagebox.showwarning("接收失败", f"文件 {filename} 校验失败！"))
-            delete_resume_state(addr[0], str(save_path), role='recv')
+            delete_resume_state(addr[0], str(save_path), role='recv', key_name=resume_key)
 
         self.gui.root.after(0, lambda: self.gui.update_recv_progress(0))
         self.gui.set_status("就绪")
@@ -2195,18 +3917,8 @@ class Node(threading.Thread):
         total_bytes = struct.unpack('!Q', raw_total)[0]
 
         save_dir = SAVE_DIR / folder_name
-        if save_dir.exists():
-            result = [None]
-            def ask():
-                result[0] = messagebox.askyesno("文件夹已存在", f"文件夹 {folder_name} 已存在，是否覆盖？")
-            self.gui.root.after(0, ask)
-            # 等待主线程处理完消息框
-            while result[0] is None:
-                self.gui.root.update_idletasks()
-                time.sleep(0.01)
-            if not result[0]:
-                conn.sendall(b'NO')
-                return
+        # PC 端【直接接收】，不弹窗询问覆盖（避免跨线程 GUI 调用阻塞接收线程）。
+        # 已存在时：保留原目录，逐文件按 size/mtime 决定 skip/resume/full（见下方逻辑）。
         conn.sendall(b'OK')
         save_dir.mkdir(parents=True, exist_ok=True)
         base_path = save_dir.resolve()
@@ -2404,9 +4116,15 @@ class Node(threading.Thread):
                 else:
                     conn.sendall(b'MISMATCH  ')
                     self.gui.log(f"[接收]   ✗ {recv_rel_path} (第{attempt+1}次)")
-                    # 清理失败的文件 + 续传状态，以便重试时从头接收
+                    # 清理失败的文件 + .tmp 临时文件 + 续传状态，以便重试时从头接收
                     if dest_path.exists():
                         dest_path.unlink()
+                    try:
+                        tmp_cleanup = dest_path.with_suffix('.tmp')
+                        if tmp_cleanup.exists():
+                            tmp_cleanup.unlink()
+                    except Exception:
+                        pass
                     delete_folder_resume_state(addr[0], folder_name, recv_rel_path)
 
             if not file_ok:
@@ -2945,37 +4663,106 @@ class Node(threading.Thread):
                     callback(path, False)
         self.pausing_network = False  # 传输结束，恢复广播/扫描/心跳
 
-    def send_items_via_socket(self, sock, items, target_key, callback=None, io_lock=None):
+    def send_items_via_socket(self, sock, items, target_key, callback=None, io_lock=None,
+                              room_mgr=None, peer_id=None):
         """在【已有的长连接 socket】上串行发送多个项目（房间模式）。
 
         与 send_files 的区别：
           - 不建立/关闭连接（复用打洞得到的长连接）
           - target_key 为稳定标识（用于续传状态键）
           - io_lock：发送期间持锁，避免与接收循环争抢同一 socket 的读
+
+        【换路续传】当某项目在当前通道发送失败时，若 room_mgr/peer_id 已提供，
+        则自动换到【另一条】可用路径重发该项目（最多 MAX_CHANNEL_SWITCH 次）：
+          · 单文件：靠 QUERY_OFFSET 协商从断点继续，不重传已收部分
+          · 文件夹：重新握手，接收端按本地文件状态 skip/resume/full
         返回：成功发送的项目数
         """
+        MAX_CHANNEL_SWITCH = 3
         ok_count = 0
+        cur_sock, cur_lock = sock, io_lock
+        used_socks = set()
         for path, is_folder in items:
-            try:
-                if io_lock:
-                    io_lock.acquire()
+            sent_ok = False
+            for switch in range(MAX_CHANNEL_SWITCH + 1):
                 try:
-                    if is_folder:
-                        self._send_folder(sock, path, target_key)
-                    else:
-                        self._send_single_file(sock, path, target_key)
-                    ok_count += 1
-                    if callback:
-                        callback(path, True)
-                finally:
-                    if io_lock:
-                        io_lock.release()
-            except Exception as e:
-                self.gui.log(f"[房间发送] 项目 {path} 失败: {e}")
+                    if cur_lock:
+                        cur_lock.acquire()
+                    try:
+                        # 发送前重置读超时：UDP-RTP 接收循环会设 0.5s 超时，
+                        # 若发送方读 ACK 继承该超时，会立刻 TimeoutError。
+                        try:
+                            if getattr(cur_sock, "is_udp_rtp", False):
+                                cur_sock.settimeout(0)
+                            else:
+                                cur_sock.settimeout(None)
+                        except Exception:
+                            pass
+                        if is_folder:
+                            self._send_folder(cur_sock, path, target_key)
+                        else:
+                            self._send_single_file(cur_sock, path, target_key)
+                    finally:
+                        if cur_lock:
+                            cur_lock.release()
+                    sent_ok = True
+                    break
+                except Exception as e:
+                    used_socks.add(id(cur_sock))
+                    self.gui.log(f"[房间发送] 通道失败: {e}")
+                    if room_mgr is None or peer_id is None or switch >= MAX_CHANNEL_SWITCH:
+                        break
+                    # 取另一条可用通道（排除已失败的），换路续传
+                    alt = room_mgr.get_send_channel(peer_id, exclude_socks=used_socks)
+                    if alt is None:
+                        # 【修复】无其他可用通道时【不立即放弃】：
+                        # 触发重新打洞并等待新通道，再断点续传本项目。
+                        # 旧逻辑在此直接放弃，导致 1GB 传了 41 秒后通道一断就全废。
+                        self.gui.log(f"[房间发送] 无其他可用通道，触发重建并等待: {path}")
+                        alt = self._wait_new_channel(room_mgr, peer_id, timeout=30.0)
+                        if alt is None:
+                            self.gui.log(f"[房间发送] 等待重建超时，放弃 {path}")
+                            break
+                        self.gui.log(f"[房间发送] 重建成功，续传 {path}")
+                    cur_sock, cur_lock = alt[0], alt[1]
+                    proto = "UDP-RTP" if alt[2] else "TCP"
+                    self.gui.log(f"[房间发送] 换路续传 {path} -> {proto}（角色={alt[3]}）")
+            if sent_ok:
+                ok_count += 1
+                if callback:
+                    callback(path, True)
+            else:
                 if callback:
                     callback(path, False)
-                break  # 连接可能已损坏，停止后续
+                break  # 所有通道都失败，停止后续项目
         return ok_count
+
+    def _wait_new_channel(self, room_mgr, peer_id, timeout=30.0):
+        """通道全失败后：触发重新打洞，轮询等待新通道出现。
+
+        用于 send_items_via_socket：当所有已知通道都不可用时，不再直接放弃，
+        而是请求重建并等待，拿到新通道后由上层断点续传。
+
+        返回新的 (sock, io_lock, is_udp, role)；超时返回 None。
+        """
+        # 1) 触发重建（带冷却，避免频繁请求）
+        try:
+            rb = getattr(room_mgr, "_request_rebuild", None)
+            if rb is not None:
+                rb(peer_id)
+        except Exception as e:
+            self.gui.log(f"[房间发送] 触发重建异常: {e}")
+        # 2) 轮询等待新通道
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.5)
+            try:
+                chan = room_mgr.get_send_channel(peer_id)
+            except Exception:
+                chan = None
+            if chan is not None:
+                return chan
+        return None
 
     def _send_item_with_retry(self, target_ip, path, is_folder, max_retries):
         """带重试的单个项目发送，返回成功标志。max_retries<=0 时无限重试"""
@@ -3034,9 +4821,13 @@ class P2PApp:
                 self.root = tk.Tk()
         else:
             self.root = tk.Tk()
-        self.root.title("文件互传 V15.2 - 支持拖拽发送")
+        self.root.title("文件互传 V16-全网通")
         self.root.geometry("1200x700")
         self.root.resizable(True, True)
+
+        # 把 GUI 日志方法挂到模块级诊断钩子（供 optimize_tcp_socket 等使用）
+        global _DIAG_LOG
+        _DIAG_LOG = self.log
 
         self.send_items = []
         self.selected_ips = set()
@@ -3070,6 +4861,11 @@ class P2PApp:
         self.selected_room_peers = set()  # 房间成员中选中的 peer_id
         self.server_history = []      # 信令服务器地址历史（最多5个，最新在前）
         self._room_lock = threading.Lock()
+        # 网络切换后房间重建：记录最近成功加入的【原始输入】与房间名
+        self._last_room_server_raw = ""
+        self._last_room_name = ""
+        # 上次网络重建时间（冷却，避免 IP 抖动导致频繁重建）
+        self._last_net_rebuild = 0.0
 
         self._build_ui()
 
@@ -3182,7 +4978,9 @@ class P2PApp:
         frame.pack(fill=tk.X, padx=10, pady=(0, 5))
 
         ttk.Label(frame, text="服务器:").pack(side=tk.LEFT, padx=2)
-        self.room_server_var = tk.StringVar(value="")
+        # 首次使用（无历史）时预填参考服务器地址
+        _hist = getattr(self, 'server_history', [])
+        self.room_server_var = tk.StringVar(value=_hist[0] if _hist else DEFAULT_ROOM_SERVER)
         self.room_server_combo = ttk.Combobox(frame, textvariable=self.room_server_var,
                                               width=20,
                                               values=list(getattr(self, 'server_history', [])))
@@ -3233,8 +5031,11 @@ class P2PApp:
             return
         self.join_room(server, room)
 
-    def join_room(self, server, room):
-        """连接信令服务器并加入房间。"""
+    def join_room(self, server, room, reuse_id=None):
+        """连接信令服务器并加入房间。
+
+        reuse_id：网络切换重建时传入上次的 my_id，让服务器复用（不换 id）。
+        """
         try:
             # 支持三种格式：host / host:port / [ipv6]:port / 纯 IPv6
             host = server.strip()
@@ -3258,6 +5059,9 @@ class P2PApp:
             self.room_server = host
             self.room_server_port = port
             self.room_name = room
+            # 记录原始输入，供网络切换后自动重建
+            self._last_room_server_raw = server.strip()
+            self._last_room_name = room
 
             # 单一来源：设备标识统一从 Node.device_id 取（Node 启动时已生成/持久化）
             device_id = self.node.device_id
@@ -3269,15 +5073,18 @@ class P2PApp:
                 if low.startswith("fe80:") or low == "::1":
                     continue
                 lan_ips.append(v6)
-            punch_port = TCP_PORT
+            punch_port = RM_TCP_PORT
 
             self.room_mgr = RoomManager(None, punch_port, log=self.log)
             self.room_mgr.on_socket_ready = self._on_room_socket_ready
+            self.room_mgr.on_udp_ready = self._on_room_udp_ready
+            # 成员状态变化（保活检测到死亡/重建成功等）→ 派发到主线程刷新 UI
+            self.room_mgr.on_state_changed = lambda: self.root.after(0, self.refresh_nodes)
             self.room_mgr.start()
 
             self.room_sig = SignalingClient(
                 server_ip=host, server_port=port, room=room,
-                name=self.device_name, tcp_port=TCP_PORT, lan_ips=lan_ips,
+                name=self.device_name, tcp_port=RM_TCP_PORT, lan_ips=lan_ips,
                 on_joined=self._on_room_joined,
                 on_member_join=self._on_room_member_join,
                 on_member_leave=self._on_room_member_leave,
@@ -3287,6 +5094,9 @@ class P2PApp:
                 server_tcp_port=RM_DEFAULT_SERVER_TCP_PORT,
                 punch_local_port=punch_port,
                 device_id=device_id,
+                on_udp_hole_ready=self._on_udp_hole_ready,
+                on_mapping_ready=self.room_mgr.mark_mapping_ready,
+                reuse_id=reuse_id,
             )
             self.room_mgr.signaling = self.room_sig
             ok = self.room_sig.start()
@@ -3315,21 +5125,34 @@ class P2PApp:
             self.room_mgr = None
             messagebox.showerror("加入失败", str(e))
 
-    def leave_room(self):
-        """退出房间，停止信令与房间管理。"""
-        try:
-            if self.room_sig:
-                self.room_sig.stop()
-        except Exception:
-            pass
+    def leave_room(self, quiet=False):
+        """退出房间，停止信令与房间管理。
+
+        quiet=True：网络切换重建用——不发 BYE，保留服务器侧成员条目与重建参数。
+
+        顺序关键：先关 RoomManager（内部含所有 UdpReliableSocket，会停
+        keepalive 线程），再关 SignalingClient（含 udp_hole_sock）。
+        若先关 udp_hole_sock，UdpReliableSocket 的 keepalive 线程仍在跑，
+        会用它发送 → WinError 10038。
+        """
         try:
             if self.room_mgr:
                 self.room_mgr.stop()
         except Exception:
             pass
+        try:
+            if self.room_sig:
+                self.room_sig.stop(quiet=quiet)
+        except Exception:
+            pass
         self.room_sig = None
         self.room_mgr = None
         self.room_name = ""
+        if not quiet:
+            # 清除重建参数：用户主动退出后，后续网络变化不应再重建该房间。
+            # （网络切换触发的重建保留参数，重建完成后继续可用）
+            self._last_room_server_raw = ""
+            self._last_room_name = ""
         with self._room_lock:
             self.room_members = []
         self.selected_room_peers = set()
@@ -3340,6 +5163,61 @@ class P2PApp:
         except Exception:
             pass
         self.log("[房间] 已退出房间")
+
+    def _on_local_network_changed(self):
+        """本机网络切换（IP 集合变化）→ 若在房间中，重建房间连接。
+
+        原因：房间模式的信令 UDP socket、TCP 映射观测连接、打洞长连接
+        都绑定在旧网络的路由/源 IP 上。网络一旦切换，旧 NAT 映射全部失效：
+          · 信令心跳失联，服务器 30 秒后剔除本机；
+          · 服务器看到的 pub_tcp / pub_udp 是旧网络的，打洞必然失败。
+        重建方式：leave_room() + join_room(原参数)，所有 socket 用新网络
+        重开、重新登记映射、重新打洞。
+
+        仅当【当前在房间中】时触发，并加 10 秒冷却避免 IP 抖动频繁重建。
+        由 Node._refresh_my_ips 在本机 IP 变化时调用（Node 后台线程）。
+        """
+        if self.room_sig is None or not self._last_room_server_raw or not self._last_room_name:
+            return
+        now = time.time()
+        if now - self._last_net_rebuild < 10.0:
+            return
+        self._last_net_rebuild = now
+        srv = self._last_room_server_raw
+        rn = self._last_room_name
+        # 保存旧 my_id，重建时传给服务器复用（身份稳定，不换 id）
+        old_id = self.room_sig.my_id if self.room_sig else None
+        self.log("[房间] 检测到网络切换，重建房间连接（server=%s, room=%s, 复用ID=%s）"
+                 % (srv, rn, old_id))
+        # 调度到 Tk 主线程执行：join_room / leave_room 内部会操作 UI 并阻塞
+        # （wait_joined 最多数秒），不能直接从本后台线程调用。
+        try:
+            self.root.after(0, lambda: self._do_network_rebuild(srv, rn, old_id))
+        except Exception:
+            pass
+
+    def _do_network_rebuild(self, srv, rn, old_id):
+        """网络切换重建（运行在 Tk 主线程）：静默退出 → 延迟 → 复用 id 重新加入。
+
+        用 quiet=True：不发 BYE，服务器保留本成员条目，对端不掉线；
+        重建后以同一 id 回归，实现"无感重建"。
+        """
+        try:
+            self.leave_room(quiet=True)
+        except Exception as e:
+            self.log("[房间] 网络切换重建：退出房间异常 %s" % e)
+        # 延迟 0.8 秒等新网络路由收敛，再重新加入（带旧 id 复用身份）
+        try:
+            self.root.after(800, lambda: self._rejoin_room(srv, rn, old_id))
+        except Exception:
+            pass
+
+    def _rejoin_room(self, srv, rn, old_id=None):
+        """重新加入房间（网络切换重建的第二步）。"""
+        try:
+            self.join_room(srv, rn, reuse_id=old_id)
+        except Exception as e:
+            self.log("[房间] 网络切换重建失败: %s" % e)
 
     # ---------- 房间回调 ----------
     def _on_room_joined(self, members):
@@ -3372,8 +5250,33 @@ class P2PApp:
         io_lock = conn.io_lock if conn else threading.Lock()
         peer_key = self.room_mgr.get_peer_did(peer_id)
         self.log(f"[房间] 长连接就绪 {member.get('name', peer_id)} <-> {peer}")
+        # epoch 键按协议区分：TCP 启动不应误杀 UDP 的接收循环
+        epoch = self.room_mgr.new_recv_epoch(peer_key + ":tcp")
         threading.Thread(target=self.node.handle_room_receive,
-                         args=(sock, io_lock, peer_key), daemon=True).start()
+                         args=(sock, io_lock, peer_key, epoch, self.room_mgr),
+                         daemon=True).start()
+        self.root.after(0, self.refresh_nodes)
+
+    def _on_udp_hole_ready(self, peer_id, peer_addr):
+        """信令客户端通知 UDP 打洞成功 → 交给 RoomManager 建立可靠通道。"""
+        if self.room_mgr:
+            self.room_mgr.on_udp_hole_ready(peer_id, peer_addr)
+
+    def _on_room_udp_ready(self, peer_id, rtp):
+        """UDP-RTP 通道就绪：启动接收循环。"""
+        try:
+            peer = rtp.getpeername()
+        except Exception:
+            peer = "?"
+        peer_key = self.room_mgr.get_peer_did(peer_id)
+        self.log(f"[房间] UDP-RTP 通道就绪 peer={peer_id} <-> {peer}，启动接收循环")
+        # 关键：用 rtp 自带的 io_lock（与发送侧 get_send_channel 返回的是同一把），
+        # 保证应用层收发互斥。
+        # epoch 键按协议区分
+        epoch = self.room_mgr.new_recv_epoch(peer_key + ":udp")
+        threading.Thread(target=self.node.handle_room_receive,
+                         args=(rtp, rtp.io_lock, peer_key, epoch, self.room_mgr),
+                         daemon=True).start()
         self.root.after(0, self.refresh_nodes)
 
     def send_room_action(self):
@@ -3404,15 +5307,30 @@ class P2PApp:
         def do_send():
             try:
                 for pid in targets:
-                    sock = self.room_mgr.get_socket(pid)
-                    if not sock:
-                        self.log(f"[房间发送] {pid} 未连接，跳过")
-                        continue
                     key = self.room_mgr.get_peer_did(pid)
-                    conn = self.room_mgr.get_conn(pid)
-                    io_lock = conn.io_lock if conn else None
-                    self.log(f"[房间发送] 向 {pid} 发送 {len(items)} 个项目")
-                    self.node.send_items_via_socket(sock, items, key, io_lock=io_lock)
+                    # 连接池：标记活跃，重置该 peer 的空闲计时（保活恢复正常频率）
+                    try:
+                        self.room_mgr.mark_active(pid)
+                    except Exception:
+                        pass
+                    # 梯度冗余：按路径角色选路（hot → warm_safe → warm_loose）
+                    chan = self.room_mgr.get_send_channel(pid)
+                    if chan:
+                        sock, io_lock, is_udp, role = chan
+                        proto = "UDP-RTP" if is_udp else "TCP"
+                        self.log(f"[房间发送] 向 {pid} 发送（{proto}，角色={role}）{len(items)} 个项目")
+                        # 传入 room_mgr/peer_id → 通道失败时自动换路续传
+                        self.node.send_items_via_socket(
+                            sock, items, key, io_lock=io_lock,
+                            room_mgr=self.room_mgr, peer_id=pid)
+                        continue
+                    self.log(f"[房间发送] {pid} 无可用通道（TCP/UDP 均未就绪），跳过")
+                # 连接池：传输结束再标记一次（空闲计时从此刻算起）
+                for pid in targets:
+                    try:
+                        self.room_mgr.mark_active(pid)
+                    except Exception:
+                        pass
                 self.root.after(0, lambda: self.log("[房间发送] 完成"))
             finally:
                 self._sending = False
@@ -3744,6 +5662,11 @@ class P2PApp:
     def rescan(self):
         self.log("[扫描] 正在检查现有设备的在线状态...")
         threading.Thread(target=self.node.remove_offline_nodes, daemon=True).start()
+        # 同时刷新房间成员状态显示（房间内成员由保活循环持续检测）
+        try:
+            self.root.after(0, self.refresh_nodes)
+        except Exception:
+            pass
 
     def log(self, msg):
         """写事件日志（线程安全）。
@@ -4192,10 +6115,12 @@ class P2PApp:
                 pass
         SAVE_DIR.mkdir(parents=True, exist_ok=True)
         self.update_save_dir_label()
-        # 服务器地址历史填入下拉框（输入框本身保持为空）
+        # 服务器地址历史填入下拉框；有历史则预填最近一条，否则保持参考地址
         try:
             if hasattr(self, 'room_server_combo'):
                 self.room_server_combo['values'] = list(self.server_history)
+                if self.server_history:
+                    self.room_server_var.set(self.server_history[0])
         except Exception:
             pass
 
@@ -4404,6 +6329,11 @@ if __name__ == '__main__':
         sys.exit(0)
 
     # 没有已运行实例：本进程作为"主实例"启动
+    # 启动时清理自身生成的过期文件（续传 JSON / 日志）
+    try:
+        cleanup_generated_files(log=lambda m: logging.info(m))
+    except Exception:
+        pass
     app = P2PApp()
     if files:
         # 冷启动时把命令行参数里的文件/文件夹加入待发送列表（等 GUI 就绪）

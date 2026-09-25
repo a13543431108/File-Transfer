@@ -79,6 +79,14 @@ class P2PFileTransferService : Service() {
      */
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
 
+    // 网络切换后房间重建：保存最近一次成功加入的参数（server 原始输入 + 房间名）
+    @Volatile private var lastRoomServer: String = ""
+    @Volatile private var lastRoomName: String = ""
+    // 上一次回调看到的网络句柄（用于判断网络是否真的切换）
+    @Volatile private var lastNetHandle: Long = 0L
+    // 上次重建时间（冷却，避免网络抖动导致频繁重建）
+    @Volatile private var lastNetRebuildAt: Long = 0L
+
     private fun registerWifiNetworkCallback() {
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
@@ -88,6 +96,7 @@ class P2PFileTransferService : Service() {
                     // 可能是 Wi-Fi 或其它网络。统一重新绑定到当前 Wi-Fi（如存在）
                     val ok = com.p2p.filetransfer.util.NetworkUtil.bindProcessToWifi(applicationContext)
                     emitLog("[网络] 网络变化，已重新绑定: " + (if (ok) "Wi-Fi" else "默认"))
+                    maybeRebuildRoomOnNetworkChange(network)
                 }
                 override fun onLost(network: android.net.Network) {
                     // 网络断开时也重新评估（可能仍有 Wi-Fi 只是某条路由掉了）
@@ -101,6 +110,47 @@ class P2PFileTransferService : Service() {
         }
     }
 
+    /**
+     * 网络切换后重建房间连接。
+     *
+     * 原因：房间模式的信令 UDP socket、TCP 映射观测连接、UDP 打洞 socket
+     * 都绑定在旧网络（蜂窝/Wi-Fi）上。网络一旦切换，旧 NAT 映射全部失效：
+     *   · 信令心跳失联，服务器 30 秒后剔除本机；
+     *   · 服务器看到的 pub_tcp / pub_udp 是旧网络的，打洞必然失败。
+     * 重建方式：leaveRoom() + joinRoom()，所有 socket 用新网络重开、
+     * 重新登记映射、重新打洞。
+     *
+     * 仅当【确实切换了网络】（networkHandle 变化）且【当前在房间中】时触发，
+     * 并加 10 秒冷却避免网络抖动导致频繁重建。
+     */
+    private fun maybeRebuildRoomOnNetworkChange(network: android.net.Network) {
+        val handle = network.networkHandle
+        // 首次回调只记录，不重建（避免服务启动即触发）
+        if (lastNetHandle == 0L) { lastNetHandle = handle; return }
+        if (handle == lastNetHandle) return
+        lastNetHandle = handle
+        // 不在房间中（未加入过 / 已主动退出 / 正在重建中）→ 无需重建
+        if (roomSig == null || lastRoomServer.isBlank() || lastRoomName.isBlank()) return
+        val now = System.currentTimeMillis()
+        if (now - lastNetRebuildAt < 10_000L) {
+            emitLog("[房间] 网络切换过于频繁，跳过本次重建")
+            return
+        }
+        lastNetRebuildAt = now
+        val srv = lastRoomServer
+        val rn = lastRoomName
+        // 保存旧 myId，重建时传给服务器复用（身份稳定，不换 id）
+        val oldId = roomSig?.myId
+        emitLog("[房间] 检测到网络切换，重建房间连接（server=" + srv + ", room=" + rn + "）")
+        // 静默退出：不发 BYE，服务器保留成员条目，对端不掉线
+        leaveRoom(quiet = true)
+        serviceScope.launch {
+            // 延迟一小会，等新网络完成路由收敛
+            kotlinx.coroutines.delay(800)
+            joinRoom(srv, rn, reuseId = oldId)
+        }
+    }
+
     private fun unregisterWifiNetworkCallback() {
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
@@ -110,17 +160,97 @@ class P2PFileTransferService : Service() {
         networkCallback = null
     }
 
+    /**
+     * 清空私有暂存目录（getExternalFilesDir/Received/）。
+     *
+     * 该目录只是"发布到公共目录前的中转站"（接收时先落这里，校验后再
+     * 复制到 下载/P2PFileTransfer/ 或用户 SAF 目录）。它不是最终存储，
+     * 若不在启动时清空，历史副本会不断累积，占用大量外部存储空间。
+     *
+     * 代价说明：若上次接收中断（有续传记录 + 部分文件），启动清空后
+     * 续传文件被删，下次同名传输会从头发送（而非断点续传）。这是为
+     * "防爆满"做的取舍——续传状态本身仍在 .p2p_resume 中，协商时检测到
+     * 文件不存在会自动从头开始，不会出错。
+     */
+    private fun cleanupStagingDir() {
+        try {
+            val dir = File(getExternalFilesDir(null) ?: filesDir, "Received")
+            if (!dir.exists()) return
+            // 保留"中断中"的续传文件/文件夹，只删"已完成"的残留：
+            //   · 单文件：.p2p_resume 里有 resume_recv_* 记录（filepath 命中）→ 保留
+            //   · 文件夹：.p2p_resume 里有 folder_resume_* 记录（folderName 命中）→ 保留
+            // 已完成并发布到公共目录的副本，其续传记录已在完成时删除 → 删掉，
+            // 避免私有暂存目录无限累积占用外部存储。
+            val keepFiles = resumeRepo.listRecvFilepaths()
+            val keepFolders = resumeRepo.listFolderNames()
+            var n = 0
+            dir.listFiles()?.forEach { f ->
+                try {
+                    val keep = if (f.isDirectory) {
+                        f.name in keepFolders
+                    } else {
+                        f.absolutePath in keepFiles
+                    }
+                    if (!keep) {
+                        val ok = if (f.isDirectory) f.deleteRecursively() else f.delete()
+                        if (ok) n++
+                    }
+                } catch (_: Exception) {}
+            }
+            if (n > 0) {
+                emitLog("[清理] 暂存目录清理 " + n + " 项（保留中断续传文件 " +
+                        keepFiles.size + " 个 / " + keepFolders.size + " 个文件夹）")
+            }
+        } catch (_: Exception) {}
+    }
+
+    /** 清理超过 retentionDays 天的日志文件（自清生成文件）。 */
+    private fun cleanupLogs(retentionDays: Int) {
+        try {
+            val cutoff = System.currentTimeMillis() - retentionDays.toLong() * 86400_000L
+            val logDir = File(filesDir, "logs")
+            if (!logDir.exists()) return
+            var n = 0
+            logDir.listFiles()?.forEach { f ->
+                try {
+                    if (f.isFile && f.lastModified() < cutoff) {
+                        if (f.delete()) n++
+                    }
+                } catch (_: Exception) {}
+            }
+            if (n > 0) emitLog("[清理] 删除 " + n + " 个过期日志（>" + retentionDays + "天）")
+        } catch (_: Exception) {}
+    }
+
     override fun onCreate() {
         super.onCreate()
         instance = this
         deviceRepo = DeviceRepository()
         resumeRepo = ResumeRepository(this)
 
+        // 启动时清理自身生成的过期文件（续传 JSON 30 天 / 日志 7 天）
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                val n = resumeRepo.cleanupExpired(30)
+                if (n > 0) emitLog("[清理] 删除 " + n + " 个过期续传记录（>30天）")
+            } catch (_: Exception) {}
+            try {
+                cleanupLogs(7)
+            } catch (_: Exception) {}
+            // 智能清理私有暂存目录（发布前中转站）：
+            // 删除已完成的残留副本，保留中断中的续传文件，防止爆满又不误删。
+            cleanupStagingDir()
+        }
+
         // 关键：强制把进程绑定到 Wi-Fi，避免"Wi-Fi + 移动数据"双开时
-        // socket 从移动数据接口发出（导致局域网 IP 无法访问）
+        // 局域网 socket 从移动数据接口发出（导致局域网 IP 无法访问）
+        com.p2p.filetransfer.util.NetworkUtil.init(applicationContext)
         com.p2p.filetransfer.util.NetworkUtil.registerWifiTracker(applicationContext)
+        com.p2p.filetransfer.util.NetworkUtil.registerCellularTracker(applicationContext)
         com.p2p.filetransfer.util.NetworkUtil.bindProcessToWifi(applicationContext)
         registerWifiNetworkCallback()
+        // 诊断：打印网络全景
+        com.p2p.filetransfer.util.NetworkUtil.dumpNetworkDiagnostics(::emitLog)
 
         val saveDirProvider = { currentSaveDir() }
 
@@ -241,7 +371,12 @@ class P2PFileTransferService : Service() {
     }
 
     fun refreshOnline() {
-        serviceScope.launch { udp.removeOfflineNodes() }
+        serviceScope.launch {
+            // 1) 检查局域网设备
+            udp.removeOfflineNodes()
+            // 2) 同时刷新房间成员状态显示
+            roomMgr?.let { _roomMembers.value = it.getMembers() }
+        }
     }
 
     fun toggleAutoScan() {
@@ -267,7 +402,7 @@ class P2PFileTransferService : Service() {
     }
 
     /** 加入房间：连接信令服务器并开始全连接打洞。 */
-    fun joinRoom(server: String, room: String) {
+    fun joinRoom(server: String, room: String, reuseId: String? = null) {
         if (roomSig != null) {
             emitLog("[房间] 已在房间中，请先退出")
             return
@@ -299,8 +434,14 @@ class P2PFileTransferService : Service() {
                     }
                 }
                 roomName = room
-                // 本机 TCP 端口（统一变量，供打洞/信令/房间管理共用）
-                val tcpPort = Constants.TCP_PORT
+                // 记录最近成功加入的参数，供网络切换后自动重建
+                lastRoomServer = server.trim()
+                lastRoomName = room
+                // 房间模式专用端口（9998），与局域网文件端口 9999 分离。
+                // 原因：房间模式需要在同一端口上同时占用监听 socket + 映射观测
+                // 连接 + 打洞出站 socket；Android 的 SO_REUSEADDR 严格，若与
+                // 9999 上的文件监听共用会 EADDRINUSE，导致 pub_tcp 无法登记。
+                val tcpPort = Constants.ROOM_TCP_PORT
 
                 val mgr = RoomManager(tcpPort, serviceScope, ::emitLog)
                 mgr.onSocketReady = { peerId, sock, member ->
@@ -308,8 +449,24 @@ class P2PFileTransferService : Service() {
                     val conn = mgr.getConn(peerId)
                     val lock = conn?.ioLock ?: kotlinx.coroutines.sync.Mutex()
                     val key = mgr.getPeerDid(peerId)
+                    // epoch 键按协议区分：TCP 启动不应误杀 UDP 的接收循环
+                    val epoch = mgr.newRecvEpoch(key + ":tcp")
                     serviceScope.launch(Dispatchers.IO) {
-                        tcp.handleReceiveOnSocket(sock, lock, key)
+                        // TCP Socket 包装为 StreamSocket
+                        tcp.handleReceiveOnSocket(
+                            com.p2p.filetransfer.protocol.TcpStreamSocket(sock), lock, key,
+                            epoch, mgr)
+                    }
+                }
+                // UDP-RTP 通道就绪：启动 UDP 接收循环
+                mgr.onUdpReady = { peerId, rtp ->
+                    emitLog("[房间] UDP-RTP 通道就绪 peer=" + peerId + "，启动接收循环")
+                    val key = mgr.getPeerDid(peerId)
+                    // epoch 键按协议区分
+                    val epoch = mgr.newRecvEpoch(key + ":udp")
+                    serviceScope.launch(Dispatchers.IO) {
+                        // 用 rtp 自带的 ioLock，与发送方共用
+                        tcp.handleReceiveOnSocket(rtp, rtp.ioLock, key, epoch, mgr)
                     }
                 }
                 mgr.start()
@@ -320,6 +477,7 @@ class P2PFileTransferService : Service() {
                     lanIps = collectLanIps(), deviceId = deviceId,
                     punchLocalPort = tcpPort,
                     scope = serviceScope, log = ::emitLog,
+                    reuseId = reuseId,
                     onJoined = { list -> mgr.onJoined(list); _roomMembers.value = mgr.getMembers() },
                     onMemberJoin = { m -> mgr.onMemberJoin(m); _roomMembers.value = mgr.getMembers() },
                     onMemberLeave = { id -> mgr.onMemberLeave(id); _roomMembers.value = mgr.getMembers() },
@@ -330,6 +488,10 @@ class P2PFileTransferService : Service() {
                     }
                 )
                 mgr.signaling = sig
+                sig.onUdpHoleReady = { peerId, rtp -> mgr.onUdpHoleReady(peerId, rtp) }
+                sig.onUdpPeerDead = { peerId -> mgr.handleUdpPeerDead(peerId) }
+                sig.onUdpSyncReady = { peerId, tGo -> mgr.onUdpSyncReady(peerId, tGo) }
+                sig.onMappingReady = { mgr.markMappingReady() }
                 roomMgr = mgr
                 roomSig = sig
                 if (sig.start()) {
@@ -365,14 +527,28 @@ class P2PFileTransferService : Service() {
         }
     }
 
-    /** 退出房间。 */
-    fun leaveRoom() {
-        try { roomSig?.stop() } catch (_: Exception) {}
+    /**
+     * 退出房间。
+     * quiet=true：网络切换重建用——不发 BYE，保留服务器侧成员条目与重建参数，
+     * 对端不掉线，重建后以同一 id 回归（无感重建）。
+     */
+    fun leaveRoom(quiet: Boolean = false) {
+        // 顺序关键：先关 RoomManager（含所有 UdpReliableSocket），
+        // 再关 SignalingClient（含 udpHoleSock）。避免 keepalive 线程
+        // 使用已关闭的 socket。
         try { roomMgr?.stop() } catch (_: Exception) {}
+        try { roomSig?.stop(quiet) } catch (_: Exception) {}
         roomSig = null
         roomMgr = null
         roomName = ""
+        if (!quiet) {
+            // 清除重建参数：用户主动退出后，后续网络变化不应再重建该房间。
+            // （网络切换触发的重建保留参数，重建完成后继续可用）
+            lastRoomServer = ""
+            lastRoomName = ""
+        }
         _roomJoined.value = false
+        _roomName.value = ""
         _roomServer.value = ""
         _roomMembers.value = emptyList()
         emitLog("[房间] 已退出房间")
@@ -388,20 +564,30 @@ class P2PFileTransferService : Service() {
             val allSuccess = HashMap<String, Boolean>()
             for (item in items) allSuccess[item.path] = true
             for (pid in peerIds.distinct()) {
-                val sock = mgr.getSocket(pid)
-                if (sock == null) {
-                    emitLog("[房间发送] " + pid + " 未连接，跳过")
-                    for (item in items) allSuccess[item.path] = false
+                val key = mgr.getPeerDid(pid)
+                // 连接池：标记活跃，重置空闲计时
+                try { mgr.markActive(pid) } catch (_: Exception) {}
+                // 梯度冗余：按路径角色选路（hot → warm_safe → warm_loose）
+                val chan = mgr.getSendChannel(pid)
+                if (chan != null) {
+                    val proto = if (chan.isUdp) "UDP-RTP" else "TCP"
+                    emitLog("[房间发送] 向 " + pid + " 发送（" + proto + "，角色=" + chan.role + "）" + items.size + " 个项目")
+                    tcp.sendItemsOnSocket(
+                        chan.stream, items, key, chan.ioLock,
+                        { path, success ->
+                            emitLog("[房间发送] " + (if (success) "✓ " else "✗ ") + path)
+                            if (!success) allSuccess[path] = false
+                        },
+                        roomMgr = mgr, peerId = pid
+                    )
                     continue
                 }
-                val conn = mgr.getConn(pid)
-                val lock = conn?.ioLock ?: kotlinx.coroutines.sync.Mutex()
-                val key = mgr.getPeerDid(pid)
-                emitLog("[房间发送] 向 " + pid + " 发送 " + items.size + " 个项目")
-                tcp.sendItemsOnSocket(sock, items, key, lock) { path, success ->
-                    emitLog("[房间发送] " + (if (success) "✓ " else "✗ ") + path)
-                    if (!success) allSuccess[path] = false
-                }
+                emitLog("[房间发送] " + pid + " 无可用通道，跳过")
+                for (item in items) allSuccess[item.path] = false
+            }
+            // 连接池：传输结束再标记一次（空闲计时从此刻算起）
+            for (pid in peerIds.distinct()) {
+                try { mgr.markActive(pid) } catch (_: Exception) {}
             }
             onFinished?.invoke(allSuccess.filterValues { it }.keys)
         }
@@ -571,6 +757,7 @@ class P2PFileTransferService : Service() {
 
     // ================= 内部 =================
 
+    @Suppress("UNUSED_PARAMETER")
     private suspend fun autoConfirmOverwrite(file: File): Boolean {
         // 文件/文件夹已存在时默认覆盖；接收动作本身的确认走 requestAccept
         return true
@@ -704,6 +891,7 @@ class P2PFileTransferService : Service() {
         _logs.tryEmit(msg)
     }
 
+    @Suppress("DEPRECATION")
     private fun acquireLocks() {
         try {
             val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -808,6 +996,8 @@ class P2PFileTransferService : Service() {
         private const val KEY_DEVICE_NAME = "device_name"
         private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_SERVER_HISTORY = "server_history"
+    /** 首次使用（无历史）时预填的参考服务器地址。 */
+    const val DEFAULT_ROOM_SERVER = "42.194.133.132"
 
         /** UI 侧读取设备列表 */
         fun deviceFlow(): StateFlow<List<DeviceNode>>? = instance?.deviceRepo?.nodesFlow

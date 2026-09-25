@@ -38,10 +38,13 @@ DEFAULTS = {
     "LISTEN_IP": "0.0.0.0",    # 监听地址
     "LISTEN_PORT": 3336,       # UDP 信令端口
     "TCP_LISTEN_PORT": 3337,   # TCP 映射观测端口
+    "NAT_PROBE_PORT": 3338,    # UDP NAT 探测端口（与 3336 不同，用于对称 NAT 检测）
     "MAX_ROOM_SIZE": 16,       # 单房间最大人数
     "HEARTBEAT_TIMEOUT": 30,   # 成员心跳超时（秒）
     "CLEAN_INTERVAL": 5,       # 清理线程扫描间隔（秒）
-    "PUNCH_DELAY_MS": 300,     # 下发 punch_go 后延迟（毫秒）
+    "PUNCH_DELAY_MS": 1000,    # 下发 punch_go 后延迟（毫秒）
+                               # 需覆盖：服务器→两端 UDP 下发延迟 + 客户端处理
+                               # 太小会导致快的一端已超时、慢的一端刚开始打洞
     "MAX_PACKET": 65535,       # 单包接收缓冲
     "STATE_FILE": "server_state.json",  # 房间状态持久化文件（跨重启保持房间）
     "STATE_SAVE_INTERVAL": 5,  # 状态自动保存间隔（秒）
@@ -52,6 +55,7 @@ VER = DEFAULTS["VER"]
 LISTEN_IP = DEFAULTS["LISTEN_IP"]
 LISTEN_PORT = DEFAULTS["LISTEN_PORT"]
 TCP_LISTEN_PORT = DEFAULTS["TCP_LISTEN_PORT"]
+NAT_PROBE_PORT = DEFAULTS["NAT_PROBE_PORT"]
 MAX_ROOM_SIZE = DEFAULTS["MAX_ROOM_SIZE"]
 HEARTBEAT_TIMEOUT = DEFAULTS["HEARTBEAT_TIMEOUT"]
 CLEAN_INTERVAL = DEFAULTS["CLEAN_INTERVAL"]
@@ -66,13 +70,14 @@ _state_path = None
 # ==================== 配置加载 ====================
 def _apply_config(cfg):
     """把配置字典写入全局变量（单一来源）。"""
-    global VER, LISTEN_IP, LISTEN_PORT, TCP_LISTEN_PORT, MAX_ROOM_SIZE
+    global VER, LISTEN_IP, LISTEN_PORT, TCP_LISTEN_PORT, NAT_PROBE_PORT, MAX_ROOM_SIZE
     global HEARTBEAT_TIMEOUT, CLEAN_INTERVAL, PUNCH_DELAY_MS, MAX_PACKET
     global STATE_FILE, STATE_SAVE_INTERVAL
     VER = int(cfg.get("VER", VER))
     LISTEN_IP = str(cfg.get("LISTEN_IP", LISTEN_IP))
     LISTEN_PORT = int(cfg.get("LISTEN_PORT", LISTEN_PORT))
     TCP_LISTEN_PORT = int(cfg.get("TCP_LISTEN_PORT", TCP_LISTEN_PORT))
+    NAT_PROBE_PORT = int(cfg.get("NAT_PROBE_PORT", NAT_PROBE_PORT))
     MAX_ROOM_SIZE = int(cfg.get("MAX_ROOM_SIZE", MAX_ROOM_SIZE))
     HEARTBEAT_TIMEOUT = int(cfg.get("HEARTBEAT_TIMEOUT", HEARTBEAT_TIMEOUT))
     CLEAN_INTERVAL = int(cfg.get("CLEAN_INTERVAL", CLEAN_INTERVAL))
@@ -211,6 +216,7 @@ rooms = {}          # {room_name: {member_id: member_dict}}
 id_index = {}       # {member_id: (room_name, addr_tuple)}
 tcp_mappings = {}   # {member_id: (ip, port)}  服务器观测到的客户端 TCP 公网映射
 tcp_socks = {}      # {member_id: socket}  保持 TCP 映射存活的连接
+udp_mappings = {}   # {member_id: (ip, port)}  客户端 UDP 打洞 socket 的公网映射
 state_lock = threading.Lock()
 
 # ==================== 协议：消息类型 ====================
@@ -223,6 +229,11 @@ T_MEMBER_JOIN = "member_join"
 T_MEMBER_LEAVE = "member_leave"
 T_PUNCH_GO = "punch_go"
 T_ERROR = "error"
+T_NAT_PROBE = "nat_probe"                 # 客户端 -> 服务器：请求回复观察到的公网地址
+T_NAT_PROBE_REPLY = "nat_probe_reply"     # 服务器 -> 客户端：观察到的公网地址
+T_TIME_REQ = "time_req"                   # 客户端 -> 服务器：NTP 式时间同步请求
+T_TIME_REPLY = "time_reply"               # 服务器 -> 客户端：回显 t1 + 服务器时刻 t2
+T_UDP_HELLO = "udp_hello"                 # 客户端 -> 服务器：登记 UDP 打洞 socket 的公网映射
 
 
 # ==================== 工具函数 ====================
@@ -294,15 +305,38 @@ def make_member(name, pub_addr, lan, tcp, last_hb, did=""):
             "last_hb": last_hb, "did": did}
 
 
+def _calc_tcp_udp_offset(member_id):
+    """估算本机 NAT 的 TCP / UDP 端口分配偏移（TCP 端口 - UDP 端口）。
+
+    依据：服务器同时观测到该客户端对【同一服务器 IP】的：
+      · UDP 映射端口（udp_hello 的 recvfrom 源端口）
+      · TCP 映射端口（TCP 映射观测端口 3337 accept 的源端口）
+    若两者目标 IP 一致，其端口差可作为「该 NAT 对同一目标 IP 分配
+    TCP/UDP 端口」的偏移估计，供对端预测 TCP 打洞候选端口。
+
+    不可得时返回 None（对端退化为 ±2 盲猜，行为与旧版一致）。
+    """
+    u = udp_mappings.get(member_id)
+    t = tcp_mappings.get(member_id)
+    if not u or not t:
+        return None
+    if u[0] != t[0]:        # 目标 IP 不一致，偏移不可比
+        return None
+    return int(t[1]) - int(u[1])
+
+
 def member_for_peer(member_id, member):
-    """转成发给其他成员的精简结构，含 TCP 公网映射（IPv6 用方括号）。"""
+    """转成发给其他成员的精简结构，含 TCP / UDP 公网映射（IPv6 用方括号）。"""
     pub_tcp = tcp_mappings.get(member_id)
+    pub_udp = udp_mappings.get(member_id)
     return {
         "id": member_id,
         "did": member.get("did", ""),
         "name": member["name"],
         "pub": fmt_addr(member["pub"]),
         "pub_tcp": fmt_addr(pub_tcp) if pub_tcp else "",
+        "pub_udp": fmt_addr(pub_udp) if pub_udp else "",
+        "tcp_udp_offset": _calc_tcp_udp_offset(member_id),
         "lan": member["lan"],
         "tcp": member["tcp"],
     }
@@ -354,32 +388,82 @@ def handle_join(sock, msg, addr):
         return
 
     is_new_room = False
+    removed_dups = []   # 同一设备旧 id（网络重建遗留），需广播离开
     with state_lock:
         if room not in rooms:
             rooms[room] = {}
             is_new_room = True
         members = rooms[room]
-        if len(members) >= MAX_ROOM_SIZE:
+
+        my_did = msg.get("did", "")
+        reuse_id = str(msg.get("reuse_id", "") or "").strip()
+
+        # 决定 my_id（身份稳定 / rebind）：
+        #   · 带 reuse_id 且 did 匹配（或该 id 已不在）→ 复用它。
+        #     网络切换重建时复用旧 id，对端看到的是"同一成员回归"，
+        #     不产生掉线感，按 peer_id 缓存的状态也不会孤儿化。
+        #   · 否则生成新 id。
+        my_id = None
+        if reuse_id and len(reuse_id) <= 64:
+            old = members.get(reuse_id)
+            if old is None or (my_did and old.get("did") == my_did):
+                my_id = reuse_id
+
+        # 同 did 去重：移除该设备的【其他】旧 id（reuse_id 自身除外）。
+        # 兜底防御：万一客户端没带 reuse_id 而生成新 id，也不会残留"两个自己"。
+        if my_did:
+            for dup_id in [m for m, info in members.items()
+                           if info.get("did") == my_did and m != my_id]:
+                members.pop(dup_id, None)
+                id_index.pop(dup_id, None)
+                s = tcp_socks.pop(dup_id, None)
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                tcp_mappings.pop(dup_id, None)
+                udp_mappings.pop(dup_id, None)
+                removed_dups.append(dup_id)
+
+        if my_id is None:
+            my_id = gen_id()
+        else:
+            # 复用 id：换了网络，旧 TCP 映射 socket / NAT 映射全部失效，清掉重建
+            s = tcp_socks.pop(my_id, None)
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            tcp_mappings.pop(my_id, None)
+            udp_mappings.pop(my_id, None)
+
+        if len(members) >= MAX_ROOM_SIZE and my_id not in members:
             send_to(addr, {"type": T_ERROR, "ver": VER, "code": "ROOM_FULL"})
             print("[房间] 拒绝加入：房间 %s 已满（%d 人）" % (room, len(members)))
             return
-        my_id = gen_id()
         member = make_member(
             name=msg.get("name", "unknown"),
             pub_addr=addr,
             lan=msg.get("lan", []),
             tcp=msg.get("tcp", 0),
             last_hb=now_ms(),
-            did=msg.get("did", ""),
+            did=my_did,
         )
         members[my_id] = member
         id_index[my_id] = (room, addr)
         existing = [member_for_peer(mid, m) for mid, m in members.items() if mid != my_id]
+        targets = [(mid, m) for mid, m in members.items() if mid != my_id]
 
     send_to(addr, {"type": T_JOINED, "ver": VER, "id": my_id, "members": existing})
 
-    with state_lock:
-        targets = [(mid, m) for mid, m in members.items() if mid != my_id]
+    # 通知其他成员：被去重移除的旧 id 已离开（避免它们继续对旧 id 打洞）
+    for dup_id in removed_dups:
+        for _, m in targets:
+            send_to(m["pub"], {"type": T_MEMBER_LEAVE, "ver": VER, "id": dup_id})
+        print("[房间] 去重：同设备旧成员 %s 已移除" % dup_id)
+
     for mid, m in targets:
         send_to(m["pub"], {
             "type": T_MEMBER_JOIN, "ver": VER,
@@ -431,8 +515,23 @@ def handle_punch_req(sock, msg, addr):
     at = now_ms() + PUNCH_DELAY_MS
     send_to(addr_a, {"type": T_PUNCH_GO, "ver": VER, "peer": peer_b, "at": at})
     send_to(addr_b, {"type": T_PUNCH_GO, "ver": VER, "peer": peer_a, "at": at})
-    print("[打洞] 房间 '%s' 协调 %s ↔ %s" % (room_a,
-          member_a.get("name", me), member_b.get("name", target)))
+    print("[打洞] 房间 '%s' 协调 %s ↔ %s  at=%d（%dms 后）"
+          % (room_a, member_a.get("name", me), member_b.get("name", target),
+             at, PUNCH_DELAY_MS))
+    print("       %s 看到的 peer: pub_tcp=%s pub_udp=%s lan=%s"
+          % (member_a.get("name", me), peer_b.get("pub_tcp"),
+             peer_b.get("pub_udp"), peer_b.get("lan")))
+    print("       %s 看到的 peer: pub_tcp=%s pub_udp=%s lan=%s"
+          % (member_b.get("name", target), peer_a.get("pub_tcp"),
+             peer_a.get("pub_udp"), peer_a.get("lan")))
+    # TCP/UDP 端口分配偏移诊断：offset = TCP端口 - UDP端口（同一服务器 IP）
+    off_a = peer_a.get("tcp_udp_offset")
+    off_b = peer_b.get("tcp_udp_offset")
+    print("       [offset] %s -> %s | %s -> %s"
+          % (member_a.get("name", me),
+             ("%+d" % off_a) if off_a is not None else "N/A",
+             member_b.get("name", target),
+             ("%+d" % off_b) if off_b is not None else "N/A"))
 
 
 def handle_bye(sock, msg, addr):
@@ -453,6 +552,7 @@ def remove_member(sock, mid):
         remaining = len(others)
         s = tcp_socks.pop(mid, None)
         tcp_mappings.pop(mid, None)
+        udp_mappings.pop(mid, None)
     if s:
         try:
             s.close()
@@ -471,6 +571,58 @@ def remove_member(sock, mid):
     save_state()
 
 
+def handle_nat_probe(sock, msg, addr):
+    """NAT 探测应答：把 recvfrom 观察到的客户端公网地址原样回给客户端。
+
+    客户端分别向 UDP_LISTEN_PORT(3336) 和 NAT_PROBE_PORT(3338) 各发一次探测，
+    通过比较两次观察到的公网端口是否相同来判定 NAT 类型：
+      · 相同  -> 锥形 NAT（Cone）
+      · 不同  -> 对称 NAT（Symmetric）
+      · 都无响应 -> 无法判定（可能 UDP 被封）
+    """
+    send_to(addr, {
+        "type": T_NAT_PROBE_REPLY,
+        "ver": VER,
+        "probe": msg.get("probe", ""),     # 回显探测标识（"primary" / "alt"）
+        "pub": fmt_addr(addr),             # 服务器观察到的公网 ip:port
+    })
+
+
+def handle_time_req(sock, msg, addr):
+    """NTP 式时间同步：客户端发 t1（本地毫秒），服务器回 t1 回显 + t2（服务器毫秒）。
+
+    客户端收到后用 offset = t2 - (t1 + t3) / 2 计算与服务器的时钟偏差，
+    用于校准打洞时刻。
+    """
+    send_to(addr, {
+        "type": T_TIME_REPLY,
+        "ver": VER,
+        "t1": msg.get("t1", 0),    # 回显客户端的发送时刻
+        "t2": now_ms(),            # 服务器当前时刻
+    })
+
+
+def handle_udp_hello(sock, msg, addr):
+    """登记客户端 UDP 打洞 socket 的公网映射（服务器从 recvfrom 的 addr 观察）。
+
+    客户端加入房间后会用一个独立的本地 UDP 端口向服务器发 udp_hello，
+    服务器记录的 addr 就是该 UDP socket 的 (公网IP, 公网端口)。之后对端
+    打洞时直接用这个地址即可（前提：锥形 NAT，同一本地端口对外映射一致）。
+    """
+    mid = msg.get("id")
+    if not mid:
+        return
+    with state_lock:
+        udp_mappings[mid] = addr
+        member = None
+        info = id_index.get(mid)
+        if info:
+            member = rooms.get(info[0], {}).get(mid)
+        if member:
+            member["last_hb"] = now_ms()
+    print("[UDP] 登记打洞映射 %s -> %s" % (mid, fmt_addr(addr)))
+
+
 def dispatch(sock, data, addr):
     try:
         msg = json.loads(data.decode("utf-8"))
@@ -485,6 +637,12 @@ def dispatch(sock, data, addr):
         handle_punch_req(sock, msg, addr)
     elif t == T_BYE:
         handle_bye(sock, msg, addr)
+    elif t == T_NAT_PROBE:
+        handle_nat_probe(sock, msg, addr)
+    elif t == T_TIME_REQ:
+        handle_time_req(sock, msg, addr)
+    elif t == T_UDP_HELLO:
+        handle_udp_hello(sock, msg, addr)
 
 
 # ==================== TCP 映射观测 ====================
@@ -613,7 +771,8 @@ def _print_startup_banner():
     """
     print("=" * 64)
     print("信令服务器已启动")
-    print("  监听: UDP %s:%d  |  TCP %s:%d" % (LISTEN_IP, LISTEN_PORT, LISTEN_IP, TCP_LISTEN_PORT))
+    print("  监听: UDP %s:%d（信令）| UDP %s:%d（NAT探测）| TCP %s:%d（映射观测）"
+          % (LISTEN_IP, LISTEN_PORT, LISTEN_IP, NAT_PROBE_PORT, LISTEN_IP, TCP_LISTEN_PORT))
     print("  （0.0.0.0 表示监听本机所有网卡，下面才是实际可用地址）")
     lan_ips = get_lan_ips()
     if lan_ips:
@@ -670,6 +829,30 @@ def main():
     except Exception as e:
         print("[UDP] IPv6 监听失败（可能系统不支持）: %s" % e)
 
+    # ---------- NAT 探测端口（独立的第 2 个 UDP 端口，用于对称 NAT 判定） ----------
+    # 只接收 nat_probe 消息；回复走 _udp4/_udp6（源端口 3336 无所谓，
+    # 客户端只关心自己发出的包被服务器从哪个源端口观察到）。
+    probe4 = None
+    probe6 = None
+    try:
+        probe4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe4.bind((LISTEN_IP, NAT_PROBE_PORT))
+        print("[NAT] 探测端口已监听 UDP %s:%d（IPv4）" % (LISTEN_IP, NAT_PROBE_PORT))
+    except Exception as e:
+        print("[NAT] IPv4 探测端口 %d 监听失败: %s" % (NAT_PROBE_PORT, e))
+    try:
+        probe6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        probe6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        except Exception:
+            pass
+        probe6.bind(("::", NAT_PROBE_PORT))
+        print("[NAT] 探测端口已监听 UDP [::]:%d（IPv6）" % NAT_PROBE_PORT)
+    except Exception as e:
+        print("[NAT] IPv6 探测端口 %d 监听失败: %s" % (NAT_PROBE_PORT, e))
+
     # 先启动监听/收包线程，横幅在后台线程打印（公网 IP 探测耗时，不能阻塞收包）
     threading.Thread(target=tcp_listener_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, args=(s4,), daemon=True).start()
@@ -677,6 +860,10 @@ def main():
 
     if _udp6 is not None:
         threading.Thread(target=_udp_recv_loop, args=(s6, "v6"), daemon=True).start()
+    if probe4 is not None:
+        threading.Thread(target=_udp_recv_loop, args=(probe4, "nat4"), daemon=True).start()
+    if probe6 is not None:
+        threading.Thread(target=_udp_recv_loop, args=(probe6, "nat6"), daemon=True).start()
 
     # 主线程跑 IPv4 收包循环
     _udp_recv_loop(s4, "v4")
@@ -691,3 +878,4 @@ if __name__ == "__main__":
         print("\n[退出] 收到 Ctrl+C")
     finally:
         save_state()
+

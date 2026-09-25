@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -249,6 +250,31 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
     private val _logs = MutableStateFlow<List<String>>(emptyList())
     val logs: StateFlow<List<String>> = _logs
 
+    /**
+     * 导出当前日志到 app 私有目录下的 log 文件，返回 File（供分享）。
+     * 内容 = 内存中最后 500 行日志（带时间戳）。
+     */
+    fun exportLogs(): java.io.File? {
+        return try {
+            val ctx = getApplication<android.app.Application>()
+            val dir = java.io.File(ctx.getExternalFilesDir(null), "logs")
+            if (!dir.exists()) dir.mkdirs()
+            val stamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+                .format(java.util.Date())
+            val f = java.io.File(dir, "p2p_log_$stamp.txt")
+            val header = "P2P FileTransfer 日志\n" +
+                    "设备名: " + _deviceName.value + "\n" +
+                    "房间: " + _roomName.value + " @ " + _roomServer.value + "\n" +
+                    "导出时间: " + java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+                        .format(java.util.Date()) + "\n" +
+                    "----------------------------------------\n"
+            f.writeText(header + _logs.value.joinToString("\n"), Charsets.UTF_8)
+            f
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     private val _devices = MutableStateFlow<List<com.p2p.filetransfer.model.DeviceNode>>(emptyList())
     val devices: StateFlow<List<com.p2p.filetransfer.model.DeviceNode>> = _devices
 
@@ -324,7 +350,13 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
             }
         }
         viewModelScope.launch {
-            P2PFileTransferService.roomJoined.collect { _roomJoined.value = it }
+            P2PFileTransferService.roomJoined.collect { joined ->
+                _roomJoined.value = joined
+                // 退出房间后清空已选房间成员，避免残留选中项触发"房间发送"
+                if (!joined) {
+                    _selectedRoomPeers.value = emptySet()
+                }
+            }
         }
         viewModelScope.launch {
             P2PFileTransferService.roomNameFlow.collect { _roomName.value = it }
@@ -356,6 +388,7 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
 
     fun sendToRoom() {
         if (_sending.value) { appendLog("[UI] 正在发送中"); return }
+        if (!_roomJoined.value) { appendLog("[UI] 未加入房间"); return }
         val targets = _selectedRoomPeers.value.toList()
         if (targets.isEmpty()) { appendLog("[UI] 请先选择房间成员"); return }
         if (_items.value.isEmpty()) { appendLog("[UI] 请先添加文件或文件夹"); return }
@@ -663,7 +696,18 @@ fun RoomCard(vm: MainViewModel) {
     val members by vm.roomMembers.collectAsState()
     val serverHistory by vm.serverHistory.collectAsState()
 
-    var serverText by remember { mutableStateOf("") }
+    // 首次使用（无历史）时预填参考服务器地址；有历史则用最近一条
+    var serverText by remember {
+        mutableStateOf(serverHistory.firstOrNull()
+            ?: com.p2p.filetransfer.P2PFileTransferService.DEFAULT_ROOM_SERVER)
+    }
+    // 历史异步加载完成后：若用户尚未修改（仍是默认参考地址），补填最近一条历史
+    androidx.compose.runtime.LaunchedEffect(serverHistory) {
+        if (serverHistory.isNotEmpty()
+            && serverText == com.p2p.filetransfer.P2PFileTransferService.DEFAULT_ROOM_SERVER) {
+            serverText = serverHistory.first()
+        }
+    }
     var roomText by remember { mutableStateOf("") }
     var expanded by remember { mutableStateOf(false) }
     var historyExpanded by remember { mutableStateOf(false) }
@@ -797,6 +841,7 @@ fun MainScreen(
 ) {
     val running by P2PFileTransferService.isRunning.collectAsState()
     val service = if (running) P2PFileTransferService.instance else null
+    val context = androidx.compose.ui.platform.LocalContext.current
     val devices by vm.devices.collectAsState()
     val selected by vm.selected.collectAsState()
     val roomMembers by vm.roomMembers.collectAsState()
@@ -956,7 +1001,7 @@ fun MainScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text("文件互传 V15.2", style = MaterialTheme.typography.titleMedium)
+                        Text("文件互传 V16", style = MaterialTheme.typography.titleMedium)
                         Text(
                             text = "设备名: " + deviceName + "   ·   保存到: " + saveDirDesc,
                             style = MaterialTheme.typography.labelSmall,
@@ -1287,7 +1332,36 @@ fun MainScreen(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    Text("日志", style = MaterialTheme.typography.titleMedium)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("日志", style = MaterialTheme.typography.titleMedium)
+                        TextButton(onClick = {
+                            val f = vm.exportLogs()
+                            if (f != null) {
+                                Toast.makeText(context, "已导出: " + f.absolutePath, Toast.LENGTH_LONG).show()
+                                val uri = androidx.core.content.FileProvider.getUriForFile(
+                                    context,
+                                    context.packageName + ".fileprovider",
+                                    f
+                                )
+                                val share = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(Intent.createChooser(share, "分享日志"))
+                            } else {
+                                Toast.makeText(context, "导出失败", Toast.LENGTH_SHORT).show()
+                            }
+                        }) {
+                            Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("导出")
+                        }
+                    }
                     Spacer(Modifier.height(4.dp))
                     Box(modifier = Modifier.fillMaxWidth().height(140.dp)) {
                         LogView(logs = logs)

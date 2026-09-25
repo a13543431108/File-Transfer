@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- app 私有外部目录（getExternalFilesDir），日志导出存放位置 -->
+    <external-files-path name="logs" path="logs/" />
+    <external-files-path name="root" path="." />
+</paths>

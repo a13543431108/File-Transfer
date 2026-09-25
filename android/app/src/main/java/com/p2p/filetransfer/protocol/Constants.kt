@@ -5,8 +5,13 @@ object Constants {
 
     // 端口
     const val UDP_PORT = 9998      // 设备发现（心跳/广播/回复）
-    const val TCP_PORT = 9999      // 文件传输
+    const val TCP_PORT = 9999      // 文件传输（局域网模式）
     const val SCAN_PORT = 9997     // 扫描探测
+    // 房间模式（公网打洞）专用 TCP 端口。
+    // 必须与 LAN 用的 9999 分离：房间模式需要三个 socket 同时占用同一端口
+    // （映射观测 + 入站监听 + 打洞出站），Android 的 SO_REUSEADDR 严格，
+    // 若与文件接收监听共用 9999 会 EADDRINUSE，导致 pub_tcp 无法登记、打洞必败。
+    const val ROOM_TCP_PORT = 9998
 
     // 时间/大小
     const val NODE_TIMEOUT_MS = 600_000L          // 节点 10 分钟无响应则移除

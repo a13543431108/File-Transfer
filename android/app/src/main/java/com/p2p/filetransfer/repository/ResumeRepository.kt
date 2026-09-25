@@ -35,7 +35,8 @@ class ResumeRepository(context: Context) {
         offset: Long,
         totalSize: Long,
         mtime: Double,
-        role: String
+        role: String,
+        keyName: String? = null
     ) {
         try {
             val state = ResumeState(
@@ -46,7 +47,9 @@ class ResumeRepository(context: Context) {
                 targetIp = targetIp,
                 role = role
             )
-            resumeFile(targetIp, File(filepath).name, role).writeText(gson.toJson(state))
+            // keyName：接收方改名保存时传入发送方原始文件名，保证重试能查到记录
+            val key = keyName ?: File(filepath).name
+            resumeFile(targetIp, key, role).writeText(gson.toJson(state))
         } catch (_: Exception) {
         }
     }
@@ -57,8 +60,9 @@ class ResumeRepository(context: Context) {
      * - role = "recv":   校验目标文件存在且大小 == offset
      * 不匹配则删除记录并返回 null。
      */
-    fun loadState(targetIp: String, filepath: String, role: String): ResumeState? {
-        val f = resumeFile(targetIp, File(filepath).name, role)
+    fun loadState(targetIp: String, filepath: String, role: String, keyName: String? = null): ResumeState? {
+        val key = keyName ?: File(filepath).name
+        val f = resumeFile(targetIp, key, role)
         if (!f.exists()) return null
         return try {
             val state = gson.fromJson(f.readText(), ResumeState::class.java) ?: return null
@@ -87,9 +91,75 @@ class ResumeRepository(context: Context) {
         }
     }
 
-    fun deleteState(targetIp: String, filepath: String, role: String) {
-        val f = resumeFile(targetIp, File(filepath).name, role)
+    fun deleteState(targetIp: String, filepath: String, role: String, keyName: String? = null) {
+        val key = keyName ?: File(filepath).name
+        val f = resumeFile(targetIp, key, role)
         if (f.exists()) f.delete()
+    }
+
+    /** 按接收方原始文件名查找 recv 续传记录（供续传查询判据）。 */
+    fun loadRecvByKey(targetIp: String, keyName: String): ResumeState? {
+        val f = resumeFile(targetIp, keyName, "recv")
+        if (!f.exists()) return null
+        return try {
+            gson.fromJson(f.readText(), ResumeState::class.java)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 列出所有"接收中"单文件续传记录对应的文件绝对路径。
+     * 用于清理私有暂存目录时，保留未完成（中断）的接收文件。
+     */
+    fun listRecvFilepaths(): Set<String> {
+        val out = HashSet<String>()
+        try {
+            resumeDir.listFiles { f ->
+                f.name.startsWith("resume_recv_") && f.name.endsWith(".json")
+            }?.forEach { f ->
+                try {
+                    gson.fromJson(f.readText(), ResumeState::class.java)?.let {
+                        if (it.filepath.isNotEmpty()) out.add(it.filepath)
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+        return out
+    }
+
+    /**
+     * 列出所有"接收中"文件夹续传记录涉及的文件夹名。
+     * 用于清理私有暂存目录时，保留未完成（中断）的接收文件夹。
+     */
+    fun listFolderNames(): Set<String> {
+        val out = HashSet<String>()
+        try {
+            resumeDir.listFiles { f ->
+                f.name.startsWith("folder_resume_") && f.name.endsWith(".json")
+            }?.forEach { f ->
+                try {
+                    gson.fromJson(f.readText(), FolderResumeState::class.java)?.let {
+                        if (it.folderName.isNotEmpty()) out.add(it.folderName)
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+        return out
+    }
+
+    /** 清理超过指定天数的续传记录（自清生成文件）。 */
+    fun cleanupExpired(retentionDays: Int): Int {
+        val cutoff = System.currentTimeMillis() - retentionDays.toLong() * 86400_000L
+        var n = 0
+        resumeDir.listFiles()?.forEach { f ->
+            try {
+                if (f.isFile && f.lastModified() < cutoff) {
+                    if (f.delete()) n++
+                }
+            } catch (_: Exception) {}
+        }
+        return n
     }
 
     /** 返回所有以给定 IP 为目标的 sender 续传文件 */

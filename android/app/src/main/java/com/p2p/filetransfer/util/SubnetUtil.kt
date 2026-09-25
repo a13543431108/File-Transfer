@@ -21,7 +21,11 @@ object SubnetUtil {
                 ip.startsWith("10.") -> ip + "/24"
                 ip.startsWith("172.") -> {
                     val second = parts[1].toInt()
-                    if (second in 16..31) ip + "/12" else ip + "/24"
+                    // 用 /16 而非 /12：企业网/校园网常用 /21 /22 或 /16，
+                    // /12 覆盖 1048576 个 IP 会被 MAX_SCAN_IPS 截断到 65536
+                    // （只覆盖 172.16.0.0-172.16.255.255），反而扫不到真实网段
+                    // （如 172.20.93.x）。/16 正好 65536 个 IP，不触发截断。
+                    if (second in 16..31) ip + "/16" else ip + "/24"
                 }
                 else -> ip + "/24"
             }

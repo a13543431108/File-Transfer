@@ -19,6 +19,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.io.RandomAccessFile
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -37,6 +38,7 @@ import java.util.zip.Inflater
  *   - 文本文件 zlib 压缩
  *   - 断点续传
  */
+@Suppress("unused")
 class TcpFileTransfer(
     /**
      * 接收完成后，把文件/文件夹发布到用户期望的位置。
@@ -59,6 +61,7 @@ class TcpFileTransfer(
 ) {
 
     private var serverSocket: ServerSocket? = null
+    private var roomServerSocket: ServerSocket? = null   // 房间模式专用端口
     private var serverJob: Job? = null
     private var running = false
 
@@ -73,64 +76,97 @@ class TcpFileTransfer(
     fun startServer(parentScope: CoroutineScope) {
         if (running) return
         running = true
+        // 局域网文件端口（9999）
         serverJob = parentScope.launch(Dispatchers.IO) {
+            bindAndAccept(this, Constants.TCP_PORT, isRoomPort = false)
+        }
+        // 房间模式端口（9998）不监听。
+        //
+        // 实测证实（2026-09-24）：Android 上 ServerSocket 无法与出站 socket
+        // 用 SO_REUSEPORT 共存——一旦监听 9998，映射观测 socket 再 bind 9998
+        // 会 EADDRINUSE，退化成随机端口，导致服务器登记错误的 pub_tcp，
+        // 打洞靶子全错，比不监听更糟。故保持"只出站"策略，依赖 TCP 同时
+        // 打开（simultaneous open）。成功率是概率性的，但配合握手确认可
+        // 保证正确性（不成则回退 UDP）。
+    }
+
+    /**
+     * 通用 accept 循环。
+     * @param port 监听端口
+     * @param isRoomPort 是否为房间模式专用端口：
+     *   true  = 只接受打洞入站连接，其它一律关闭
+     *   false = 普通文件接收；若钩子识别为打洞连接则交由房间管理接管
+     */
+    private fun bindAndAccept(scope: CoroutineScope, port: Int, isRoomPort: Boolean) {
+        val ss: ServerSocket
+        try {
+            ss = ServerSocket()
+            // 关键：SO_RCVBUF 必须在 bind 之前设置。
+            // TCP window scale 在三次握手时按当时的缓冲区大小协商，
+            // accept 之后再设置对已建立连接无效。
             try {
-                val ss = ServerSocket()
-                // 关键：SO_RCVBUF 必须在 bind 之前设置。
-                // TCP window scale 在三次握手时按当时的缓冲区大小协商，
-                // accept 之后再设置对已建立连接无效 —— 这就是之前接收速度
-                // 只有 ~0.9MB/s 而电脑发送端显示 10MB/s 的根本原因。
-                try {
-                    ss.receiveBufferSize = Constants.SOCKET_BUFFER_SIZE
+                ss.receiveBufferSize = Constants.SOCKET_BUFFER_SIZE
+                if (!isRoomPort) {
                     log("[TCP] 监听 socket RCVBUF 设为 " +
                             com.p2p.filetransfer.util.SizeFormatter.humanSize(
                                 ss.receiveBufferSize.toLong()) +
                             "（期望 " + com.p2p.filetransfer.util.SizeFormatter.humanSize(
                                 Constants.SOCKET_BUFFER_SIZE.toLong()) + "）")
-                } catch (e: Exception) {
-                    log("[TCP] 设置监听 socket RCVBUF 失败: " + e.message)
                 }
-                ss.reuseAddress = true
-                ss.bind(InetSocketAddress(Constants.TCP_PORT), 50)
-                serverSocket = ss
-                log("[TCP] 监听端口 " + Constants.TCP_PORT + " 成功")
             } catch (e: Exception) {
-                log("[TCP] 端口绑定失败: " + e.message)
-                return@launch
+                if (!isRoomPort) log("[TCP] 设置监听 socket RCVBUF 失败: " + e.message)
             }
-            val server = serverSocket ?: return@launch
-            while (running) {
-                try {
-                    val conn = server.accept()
-                    SocketOptimizer.optimize(conn)
-                    // 房间模式：若是打洞入站连接，交给房间管理接管
-                    val hook = onInboundConnection
-                    if (hook != null) {
-                        val ip = conn.inetAddress?.hostAddress?.substringBefore('%') ?: ""
-                        if (hook.invoke(conn, ip, conn.port)) continue
-                    }
-                    conn.soTimeout = 15000
-                    launch(Dispatchers.IO) { handleReceive(conn) }
-                } catch (e: Exception) {
-                    if (running) Log.d("TcpFileTransfer", "accept error: " + e.message)
+            ss.reuseAddress = true
+            // 注：房间模式 9998 不监听（见 startServer 注释）。
+            // 若未来恢复房间监听，此处需对 ss 调 ReusePort.enableServerSocket(ss, log)。
+            ss.bind(InetSocketAddress(port), 50)
+            if (isRoomPort) roomServerSocket = ss else serverSocket = ss
+            log(if (isRoomPort) "[房间] 房间端口 $port 监听成功" else "[TCP] 监听端口 $port 成功")
+        } catch (e: Exception) {
+            log(if (isRoomPort) "[房间] 端口 $port 绑定失败: " + e.message
+                else "[TCP] 端口绑定失败: " + e.message)
+            return
+        }
+        while (running) {
+            try {
+                val conn = ss.accept()
+                SocketOptimizer.optimize(conn)
+                val hook = onInboundConnection
+                var taken = false
+                if (hook != null) {
+                    val ip = conn.inetAddress?.hostAddress?.substringBefore('%') ?: ""
+                    taken = hook.invoke(conn, ip, conn.port)
                 }
+                if (taken) continue
+                if (isRoomPort) {
+                    // 房间端口不接受普通文件传输
+                    try { conn.close() } catch (_: Exception) {}
+                    continue
+                }
+                conn.soTimeout = 15000
+                scope.launch(Dispatchers.IO) { handleReceive(conn) }
+            } catch (e: Exception) {
+                if (running) Log.d("TcpFileTransfer", "accept error($port): " + e.message)
             }
         }
+        try { ss.close() } catch (_: Exception) {}
     }
 
     fun stopServer() {
         running = false
         try { serverSocket?.close() } catch (_: Exception) {}
+        try { roomServerSocket?.close() } catch (_: Exception) {}
         serverJob?.cancel()
     }
 
     // ================= 接收 =================
 
-    private suspend fun handleReceive(socket: Socket) {
+    private suspend fun handleReceive(rawSocket: Socket) {
+        val socket = TcpStreamSocket(rawSocket)
         try {
-            val reader = ProtoReader(socket.getInputStream())
+            val reader = ProtoReader(socket.inputStream)
             socket.soTimeout = 0
-            val peerIp = socket.inetAddress?.hostAddress?.substringBefore('%') ?: "unknown"
+            val peerIp = rawSocket.inetAddress?.hostAddress?.substringBefore('%') ?: "unknown"
             // 循环处理同一 TCP 连接上的多条消息。
             //
             // 关键：桌面端 Python 在发送非压缩单文件时，会在同一个连接上：
@@ -148,7 +184,7 @@ class TcpFileTransfer(
                 when (flag) {
                     Constants.FLAG_FILE -> receiveSingleFile(socket, reader, peerIp)
                     Constants.FLAG_FOLDER -> receiveFolder(socket, reader, peerIp)
-                    Constants.FLAG_QUERY_OFFSET -> handleQueryOffset(socket, reader)
+                    Constants.FLAG_QUERY_OFFSET -> handleQueryOffset(socket, reader, peerIp)
                     else -> {
                         log("[接收] 未知消息类型: " + flag)
                         break
@@ -164,40 +200,42 @@ class TcpFileTransfer(
     }
 
     /** 处理续传偏移量查询 */
-    private fun handleQueryOffset(socket: Socket, reader: ProtoReader) {
+    private fun handleQueryOffset(socket: StreamSocket, reader: ProtoReader, peerIp: String) {
         try {
             val totalSize = reader.readInt64()
             val filename = reader.readLengthPrefixedString()
-            val localOffset = lookupLocalOffset(filename, totalSize)
-            val out = socket.getOutputStream()
+            val localOffset = lookupLocalOffset(filename, totalSize, peerIp)
+            val out = socket.outputStream
             out.write(longToBytes(localOffset))
             out.flush()
             log("[接收] 续传查询: " + filename + "，本地已收 " + SizeFormatter.humanSize(localOffset))
         } catch (e: Exception) {
             log("[接收] 续传查询异常: " + e.message)
             try {
-                socket.getOutputStream().write(longToBytes(0))
-                socket.getOutputStream().flush()
+                socket.outputStream.write(longToBytes(0))
+                socket.outputStream.flush()
             } catch (_: Exception) {}
         }
     }
 
-    private fun lookupLocalOffset(filename: String, totalSize: Long): Long {
-        val saveDir = saveDirProvider()
-        val f = File(saveDir, filename)
-        // 路径穿越检查
-        if (!isInside(saveDir, f)) {
-            log("[安全] 拒绝非法文件名: " + filename)
-            return 0
-        }
-        if (!f.exists()) return 0
-        val len = f.length()
-        // 本地大小 >= 总大小（说明要么已完整、要么是残留），
-        // 都返回 0 让发送方从头重传；发完 SHA-256 会校验出完整性
-        return if (len >= totalSize) 0 else len
+    private fun lookupLocalOffset(filename: String, totalSize: Long, peerIp: String): Long {
+        // 关键：以【续传记录】为唯一判据。
+        // 仅当存在匹配的 recv 续传记录（total_size 一致，且记录里实际文件大小 == offset）
+        // 时，才回报已收字节数；否则一律回报 0（视为新文件）。
+        // 这样避免"同名但不同内容"的旧文件被误判为续传起点。
+        val rec = resumeRepo.loadRecvByKey(peerIp, filename) ?: return 0
+        if (rec.totalSize != totalSize) return 0
+        val actual = File(rec.filepath)
+        if (!actual.exists() || actual.length() != rec.offset) return 0
+        return rec.offset
     }
 
-    private suspend fun receiveSingleFile(socket: Socket, reader: ProtoReader, peerIp: String) {
+    private suspend fun receiveSingleFile(socket: StreamSocket, reader: ProtoReader, peerIp: String) {
+        // 关键：进入文件接收后重置超时。
+        // handleReceiveOnSocket 每轮会设 soTimeout=500（用于检测无数据），
+        // 若传播到 receiveData，500ms 无数据即抛 SocketTimeoutException，
+        // 导致大文件/慢网络下误判中断。
+        socket.soTimeout = 0
         val filename = reader.readLengthPrefixedString()
         val flags = reader.readByte()
         val compressed = (flags and Constants.FLAG_COMPRESS) != 0
@@ -207,15 +245,17 @@ class TcpFileTransfer(
 
         val saveDir = saveDirProvider()
         saveDir.mkdirs()
-        val savePath = File(saveDir, filename)
+        var savePath = File(saveDir, filename)
         if (!isInside(saveDir, savePath)) {
             log("[安全] 拒绝非法文件名: " + filename)
-            socket.getOutputStream().write("NO".toByteArray())
-            socket.getOutputStream().flush()
+            socket.outputStream.write("NO".toByteArray())
+            socket.outputStream.flush()
             return
         }
+        // 续传记录键 = 发送方原始文件名（改名后仍用它查记录）
+        val resumeKey = filename
 
-        val out = socket.getOutputStream()
+        val out = socket.outputStream
 
         // 请求用户接受
         val accept = onAcceptIncoming(ReceiveRequest(peerIp, filename, fileSize, isFolder = false))
@@ -242,14 +282,10 @@ class TcpFileTransfer(
             }
             // 直接续传
         } else {
-            // 非续传：处理本地已有文件
+            // 非续传：同名文件已存在 → 改名 name(1).ext，不覆盖、不删除
             if (savePath.exists()) {
-                val confirmed = onConfirmOverwrite(savePath)
-                if (!confirmed) {
-                    out.write("NO".toByteArray()); out.flush()
-                    return
-                }
-                savePath.delete()
+                savePath = uniquePath(saveDir, filename)
+                log("[接收] 同名文件已存在，改名为: " + savePath.name)
             }
             offset = 0
         }
@@ -260,7 +296,7 @@ class TcpFileTransfer(
                 (if (resume) " [续传]" else "") + (if (compressed) " [压缩]" else "") +
                 " 来自 " + peerIp)
 
-        resumeRepo.saveState(peerIp, savePath.absolutePath, offset, fileSize, 0.0, "recv")
+        resumeRepo.saveState(peerIp, savePath.absolutePath, offset, fileSize, 0.0, "recv", resumeKey)
 
         val startTime = System.currentTimeMillis()
         val lastProgressSave = longArrayOf(0L)
@@ -289,7 +325,7 @@ class TcpFileTransfer(
                 if (now - lastProgressSave[0] >= 5000L || bucket != lastPercentBucket[0]) {
                     lastProgressSave[0] = now
                     lastPercentBucket[0] = bucket
-                    resumeRepo.saveState(peerIp, savePath.absolutePath, received, fileSize, 0.0, "recv")
+                    resumeRepo.saveState(peerIp, savePath.absolutePath, received, fileSize, 0.0, "recv", resumeKey)
                 }
             }
         )
@@ -303,12 +339,18 @@ class TcpFileTransfer(
             val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
             val speed = if (elapsed > 0) fileSize / elapsed else 0.0
             log("[接收] 文件 " + filename + " 校验通过 (" + SizeFormatter.formatSpeed(speed) + ")")
-            resumeRepo.deleteState(peerIp, savePath.absolutePath, "recv")
+            resumeRepo.deleteState(peerIp, savePath.absolutePath, "recv", resumeKey)
             // 发布到用户选择的位置（默认: 下载/P2PFileTransfer/）
             kotlinx.coroutines.withContext(Dispatchers.IO) {
                 val target = publisher(savePath, false)
                 if (target != null) {
                     log("[接收] 已保存到: " + target)
+                    // 关键：发布成功后删除【私有暂存副本】。
+                    // 私有目录(getExternalFilesDir/Received)只是中转站，
+                    // 若不清理会不断累积；下次接收同名文件时，第 286 行的
+                    // savePath.exists() 会命中这些残留 → 误判"重名" → 无谓
+                    // 改名 name(1).ext（而真正的保存目录并无重名）。
+                    try { savePath.delete() } catch (_: Exception) {}
                 } else {
                     log("[接收] 保存失败，文件仍在应用私有目录: " + savePath.absolutePath)
                 }
@@ -318,9 +360,21 @@ class TcpFileTransfer(
             // 关键：删除损坏的接收文件与续传状态，否则对方重传时续传协商会再次
             // 读到该文件、仅凭大小回报"已收 N 字节"，导致永远续传到错误位置、反复失败。
             try { if (savePath.exists()) savePath.delete() } catch (_: Exception) {}
-            resumeRepo.deleteState(peerIp, savePath.absolutePath, "recv")
+            resumeRepo.deleteState(peerIp, savePath.absolutePath, "recv", resumeKey)
         }
         onRecvProgress(TransferProgress(0f, statusText = "就绪"))
+    }
+
+    /** 同名文件已存在时，生成 name(1).ext / name(2).ext ... 的可用文件。 */
+    private fun uniquePath(dir: File, filename: String): File {
+        val dot = filename.lastIndexOf('.')
+        val stem = if (dot > 0) filename.substring(0, dot) else filename
+        val ext = if (dot > 0) filename.substring(dot) else ""
+        for (i in 1..9999) {
+            val cand = File(dir, stem + "(" + i + ")" + ext)
+            if (!cand.exists()) return cand
+        }
+        return File(dir, stem + "_" + System.currentTimeMillis() + ext)
     }
 
     private data class ReceiveResult(val success: Boolean, val hash: String?)
@@ -345,7 +399,7 @@ class TcpFileTransfer(
      * 续传时通过 RandomAccessFile.seek(offset) 从指定位置开始写。
      */
     private suspend fun receiveData(
-        socket: Socket,
+        socket: StreamSocket,
         destFile: File,
         fileSize: Long,
         startOffset: Long,
@@ -376,7 +430,7 @@ class TcpFileTransfer(
             }
         }
 
-        val input = socket.getInputStream()
+        val input = socket.inputStream
         // 读缓冲：动态"只扩不缩"（起始 3MB，高速时扩到 6MB/12MB）
         //   - 小缓冲 → 更多 read() 系统调用；大缓冲在高带宽链路上能一次排空内核队列
         //   - 只扩不缩，避免慢速网络陷入"缓冲变小 → 更慢"的负反馈
@@ -516,35 +570,60 @@ class TcpFileTransfer(
      * 返回成功发送的项目数；连接损坏时提前停止。
      */
     suspend fun sendItemsOnSocket(
-        socket: Socket,
+        socket: StreamSocket,
         items: List<TransferItem>,
         targetKey: String,
         ioLock: Mutex,
-        onItemDone: (String, Boolean) -> Unit
+        onItemDone: (String, Boolean) -> Unit,
+        roomMgr: com.p2p.filetransfer.room.RoomManager? = null,
+        peerId: String? = null
     ): Int = withContext(Dispatchers.IO) {
+        val MAX_SWITCH = 3
         var ok = 0
+        var curSock = socket
+        var curLock = ioLock
+        val used = HashSet<Int>()
         for (item in items) {
-            try {
-                ioLock.withLock {
-                    if (item.isFolder) {
-                        sendFolder(socket, File(item.path), targetKey)
-                    } else {
-                        sendSingleFileOnSocket(socket, File(item.path), targetKey)
+            var sentOk = false
+            for (switch in 0..MAX_SWITCH) {
+                try {
+                    curLock.withLock {
+                        if (item.isFolder) {
+                            sendFolder(curSock, File(item.path), targetKey)
+                        } else {
+                            sendSingleFileOnSocket(curSock, File(item.path), targetKey)
+                        }
                     }
+                    sentOk = true
+                    break
+                } catch (e: Exception) {
+                    used.add(System.identityHashCode(curSock))
+                    log("[房间发送] 通道失败: " + e.message)
+                    if (roomMgr == null || peerId == null || switch >= MAX_SWITCH) break
+                    val alt = roomMgr.getSendChannel(peerId, used)
+                    if (alt == null) {
+                        log("[房间发送] 无其他可用通道，放弃 " + item.path)
+                        break
+                    }
+                    curSock = alt.stream
+                    curLock = alt.ioLock
+                    log("[房间发送] 换路续传 " + item.path +
+                            " -> " + (if (alt.isUdp) "UDP-RTP" else "TCP") + "（角色=" + alt.role + "）")
                 }
+            }
+            if (sentOk) {
                 ok++
                 onItemDone(item.path, true)
-            } catch (e: Exception) {
-                log("[房间发送] " + item.path + " 失败: " + e.message)
+            } else {
                 onItemDone(item.path, false)
-                break  // 连接可能已损坏，停止后续
+                break
             }
         }
         ok
     }
 
     /** 房间模式：在已有 socket 上发送单文件（跳过临时连接的续传协商，用本地状态）。 */
-    private suspend fun sendSingleFileOnSocket(socket: Socket, file: File, targetKey: String) {
+    private suspend fun sendSingleFileOnSocket(socket: StreamSocket, file: File, targetKey: String) {
         val totalSize = file.length()
         val filename = file.name
         val compressRequested = Constants.isTextFile(filename)
@@ -573,13 +652,23 @@ class TcpFileTransfer(
      * 用 ioLock 串行化：仅在短超时内可读时持锁读一帧，否则释放锁让发送方使用。
      */
     suspend fun handleReceiveOnSocket(
-        socket: Socket,
+        socket: StreamSocket,
         ioLock: Mutex,
-        peerKey: String
+        peerKey: String,
+        epoch: Int = -1,
+        roomMgr: com.p2p.filetransfer.room.RoomManager? = null
     ): Unit = withContext(Dispatchers.IO) {
-        val reader = ProtoReader(socket.getInputStream())
+        val reader = ProtoReader(socket.inputStream)
+        // epoch 键按协议区分（与启动侧一致）
+        val isUdp = (socket as? com.p2p.filetransfer.room.UdpReliableSocket) != null
+        val epochKey = peerKey + (if (isUdp) ":udp" else ":tcp")
         try {
             while (true) {
+                // 代际检查：若【同协议】通道已被替换，旧循环退出（避免双重写盘）
+                if (roomMgr != null && epoch >= 0 && !roomMgr.isCurrentEpoch(epochKey, epoch)) {
+                    log("[房间接收] " + epochKey + " 已被新通道接管，旧接收循环退出")
+                    break
+                }
                 var stop = false
                 ioLock.withLock {
                     socket.soTimeout = 500
@@ -593,10 +682,15 @@ class TcpFileTransfer(
                     }
                     if (flag < 0) return@withLock
                     socket.soTimeout = 0
+                    // 写盘前再确认代际
+                    if (roomMgr != null && epoch >= 0 && !roomMgr.isCurrentEpoch(epochKey, epoch)) {
+                        stop = true
+                        return@withLock
+                    }
                     when (flag) {
                         Constants.FLAG_FILE -> receiveSingleFile(socket, reader, peerKey)
                         Constants.FLAG_FOLDER -> receiveFolder(socket, reader, peerKey)
-                        Constants.FLAG_QUERY_OFFSET -> handleQueryOffset(socket, reader)
+                        Constants.FLAG_QUERY_OFFSET -> handleQueryOffset(socket, reader, peerKey)
                         else -> stop = true
                     }
                 }
@@ -616,7 +710,7 @@ class TcpFileTransfer(
                 if (item.isFolder) {
                     val s = openSocket(targetIp)
                     socket = s
-                    sendFolder(s, File(item.path), targetIp)
+                    sendFolder(TcpStreamSocket(s), File(item.path), targetIp)
                 } else {
                     sendSingleFile(targetIp, File(item.path))
                 }
@@ -709,14 +803,14 @@ class TcpFileTransfer(
 
         val socket = openSocket(targetIp)
         try {
-            sendSingleFileWithSocket(socket, file, targetIp, filename, totalSize, offset, compressedBytes)
+            sendSingleFileWithSocket(TcpStreamSocket(socket), file, targetIp, filename, totalSize, offset, compressedBytes)
         } finally {
             try { socket.close() } catch (_: Exception) {}
         }
     }
 
     private suspend fun sendSingleFileWithSocket(
-        socket: Socket,
+        socket: StreamSocket,
         file: File,
         targetIp: String,
         filename: String,
@@ -724,6 +818,9 @@ class TcpFileTransfer(
         offset: Long,
         compressedBytes: ByteArray?
     ) {
+        // 重置读超时：接收循环可能把它设为 500ms（用于检测无数据），
+        // 若发送方读取 ACK 时继承该超时，会立刻 SocketTimeoutException。
+        socket.soTimeout = 0
         val compress = compressedBytes != null
         val sendSize = compressedBytes?.size?.toLong() ?: totalSize
         var flags = 0
@@ -735,7 +832,7 @@ class TcpFileTransfer(
             useOffset = 0
         }
 
-        val out = socket.getOutputStream()
+        val out = socket.outputStream
         val writer = ProtoWriter(out)
         writer.writeByte(Constants.FLAG_FILE)
         writer.writeLengthPrefixedString(filename)
@@ -744,7 +841,7 @@ class TcpFileTransfer(
         if ((flags and Constants.FLAG_RESUME) != 0) writer.writeInt64(useOffset)
         writer.flush()
 
-        val ack = ProtoReader(socket.getInputStream()).readFixedAscii(2)
+        val ack = ProtoReader(socket.inputStream).readFixedAscii(2)
         if (ack != "OK") {
             log("[发送] 对方拒绝接收文件")
             return
@@ -793,7 +890,7 @@ class TcpFileTransfer(
         out.write(hash.toByteArray(Charsets.UTF_8))
         out.flush()
 
-        val result = ProtoReader(socket.getInputStream()).readFixedAscii(10)
+        val result = ProtoReader(socket.inputStream).readFixedAscii(10)
         val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
         val speed = if (elapsed > 0) sendSize / elapsed else 0.0
         if (result == "MATCH") {
@@ -860,7 +957,7 @@ class TcpFileTransfer(
      *     < 5MB/s   -> 256KB, < 20MB/s -> 512KB, < 50MB/s -> 1MB, 否则 2MB
      */
     private suspend fun sendFileDataFast(
-        socket: Socket,
+        socket: StreamSocket,
         file: File,
         fileSize: Long,
         offset: Long,
@@ -877,7 +974,7 @@ class TcpFileTransfer(
                 if (skipped <= 0) { input.read(); remaining-- } else remaining -= skipped
             }
         }
-        val out = socket.getOutputStream()
+        val out = socket.outputStream
         // 大块发送：初始 1MB，随速度动态调整（上限 4MB）
         var adaptiveChunk = Constants.BUFFER_SIZE           // 初始 1MB（之前 256KB）
         var buf = ByteArray(adaptiveChunk)
@@ -940,14 +1037,16 @@ class TcpFileTransfer(
         return result
     }
 
-    private suspend fun sendFolder(socket: Socket, folder: File, targetIp: String) {
+    private suspend fun sendFolder(socket: StreamSocket, folder: File, targetIp: String) {
+        // 重置读超时（同 sendSingleFileWithSocket，避免继承接收循环的 500ms）
+        socket.soTimeout = 0
         val folderName = folder.name
         val manifest = getFolderManifest(folder)
         val fileCount = manifest.size
         val totalBytes = manifest.sumOf { it.size }
         log("[发送] 文件夹: " + folderName + " (" + fileCount + " 个文件, " + SizeFormatter.humanSize(totalBytes) + ")")
 
-        val out = socket.getOutputStream()
+        val out = socket.outputStream
         val writer = ProtoWriter(out)
         writer.writeByte(Constants.FLAG_FOLDER)
         writer.writeLengthPrefixedString(folderName)
@@ -955,7 +1054,7 @@ class TcpFileTransfer(
         writer.writeInt64(totalBytes)
         writer.flush()
 
-        val reader = ProtoReader(socket.getInputStream())
+        val reader = ProtoReader(socket.inputStream)
         val ack = reader.readFixedAscii(2)
         if (ack != "OK") {
             log("[发送] 对方拒绝传输（文件夹已存在且不覆盖）")
@@ -992,7 +1091,6 @@ class TcpFileTransfer(
         }
 
         var sentTotal = 0L
-        val startTime = System.currentTimeMillis()
         var failed = 0
 
         for (idx in 0 until fileCount) {
@@ -1044,7 +1142,7 @@ class TcpFileTransfer(
                     if ((flags and Constants.FLAG_RESUME) != 0) writer.writeInt64(useOffset)
                     writer.flush()
 
-                    val a = ProtoReader(socket.getInputStream()).readFixedAscii(2)
+                    val a = ProtoReader(socket.inputStream).readFixedAscii(2)
                     if (a != "OK") {
                         log("[发送] 对方拒绝接收文件")
                         return
@@ -1077,7 +1175,7 @@ class TcpFileTransfer(
                     out.write(hash.toByteArray(Charsets.UTF_8))
                     out.flush()
 
-                    val res = ProtoReader(socket.getInputStream()).readFixedAscii(10)
+                    val res = ProtoReader(socket.inputStream).readFixedAscii(10)
                     if (res == "MATCH") {
                         log("[发送]   ✓ " + entry.relPath)
                         sentTotal += entry.size
@@ -1086,48 +1184,41 @@ class TcpFileTransfer(
                         break
                     } else {
                         log("[发送]   ✗ " + entry.relPath + " 校验失败")
-                        // 清除续传状态，重试时从头传
-                        resumeRepo.deleteFolderState(targetIp, folderName, entry.relPath)
                     }
                 } catch (e: Exception) {
-                    log("[发送]   ✗ " + entry.relPath + " 发送异常: " + e.message)
-                    // 重连
-                    break
+                    log("[发送]   ✗ " + entry.relPath + " 异常: " + e.message)
                 }
             }
-            if (!fileOk) {
-                log("[发送]   ✗ " + entry.relPath + " 重试 " + Constants.MAX_RETRIES + " 次均失败，放弃")
-                failed++
-            }
+            if (!fileOk) failed++
         }
 
-        val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
-        val speed = if (elapsed > 0) sentTotal / elapsed else 0.0
         if (failed == 0) {
-            log("[发送] 文件夹 " + folderName + " 发送完成，全部文件校验通过 (" + SizeFormatter.formatSpeed(speed) + ")")
+            log("[发送] 文件夹 " + folderName + " 发送完成 ✓ (共 " + fileCount + " 个文件)")
         } else {
-            log("[发送] 文件夹 " + folderName + " 发送完成，" + failed + " 个文件失败")
+            log("[发送] 文件夹 " + folderName + " 发送完成，$failed 个文件失败")
         }
         onSendProgress(TransferProgress(0f, statusText = "就绪"))
     }
 
-    // ================= 接收文件夹 =================
+    // ================= 文件夹接收 =================
 
-    private suspend fun receiveFolder(socket: Socket, reader: ProtoReader, peerIp: String) {
+    private suspend fun receiveFolder(socket: StreamSocket, reader: ProtoReader, peerIp: String) {
+        // 同 receiveSingleFile：重置超时，避免 500ms 检测超时传播到数据接收
+        socket.soTimeout = 0
         val folderName = reader.readLengthPrefixedString()
         val fileCount = reader.readInt32()
         val totalBytes = reader.readInt64()
 
-        val saveDir = saveDirProvider()
-        val targetDir = File(saveDir, folderName)
-        if (!isInside(saveDir, targetDir)) {
+        val rootDir = saveDirProvider()
+        val saveDir = File(rootDir, folderName)
+        if (!isInside(rootDir, saveDir)) {
             log("[安全] 拒绝非法文件夹名: " + folderName)
-            socket.getOutputStream().write("NO".toByteArray())
-            socket.getOutputStream().flush()
+            socket.outputStream.write("NO".toByteArray())
+            socket.outputStream.flush()
             return
         }
 
-        val out = socket.getOutputStream()
+        val out = socket.outputStream
 
         // 请求用户接受
         val accept = onAcceptIncoming(ReceiveRequest(peerIp, folderName, totalBytes, isFolder = true))
@@ -1137,57 +1228,53 @@ class TcpFileTransfer(
             return
         }
 
-        if (targetDir.exists()) {
-            val confirmed = onConfirmOverwrite(targetDir)
-            if (!confirmed) {
-                out.write("NO".toByteArray()); out.flush()
-                return
-            }
-        }
         out.write("OK".toByteArray()); out.flush()
-        targetDir.mkdirs()
-        val basePath = targetDir.canonicalFile
-
-        log("[接收] 文件夹: " + folderName + " (" + fileCount + " 个文件, " + SizeFormatter.humanSize(totalBytes) + ") 来自 " + peerIp)
+        saveDir.mkdirs()
+        log("[接收] 文件夹: " + folderName + " (" + fileCount + " 个文件, " +
+                SizeFormatter.humanSize(totalBytes) + ") 来自 " + peerIp)
 
         // 接收清单
-        val manifest = mutableListOf<ManifestEntry>()
+        val manifest = mutableListOf<Triple<String, Long, Double>>()
         for (i in 0 until fileCount) {
-            val rel = reader.readLengthPrefixedString()
+            val relPath = reader.readLengthPrefixedString()
             val size = reader.readInt64()
             val mtime = reader.readDouble()
-            manifest.add(ManifestEntry(rel, size, mtime))
+            manifest.add(Triple(relPath, size, mtime))
         }
 
-        // 决定处理方式
+        // 决定每个文件的处理方式
         val actions = mutableListOf<Pair<String, Long>>()
-        for (e in manifest) {
-            val dest = File(targetDir, e.relPath)
-            if (!isInside(basePath, dest)) {
-                log("[安全] 拒绝非法路径: " + e.relPath)
-                out.write(byteArrayOf(0x00))
-                out.flush()
+        for ((relPath, size, mtime) in manifest) {
+            val dest = File(saveDir, relPath)
+            if (!isInside(saveDir, dest)) {
+                log("[安全] 拒绝非法路径: " + relPath)
+                out.write(byteArrayOf(0x00)); out.flush()
                 return
             }
             if (dest.exists()) {
                 val localSize = dest.length()
                 val localMtime = dest.lastModified() / 1000.0
-                when {
-                    localSize == e.size && Math.abs(localMtime - e.mtime) < 0.1 -> actions.add(Pair("skip", 0L))
-                    localSize < e.size -> actions.add(Pair("resume", localSize))
-                    else -> actions.add(Pair("full", 0L))
+                if (localSize == size && Math.abs(localMtime - mtime) < 0.1) {
+                    actions.add(Pair("skip", 0L))
+                } else if (localSize < size) {
+                    actions.add(Pair("resume", localSize))
+                } else {
+                    actions.add(Pair("full", 0L))
                 }
             } else {
                 actions.add(Pair("full", 0L))
             }
         }
 
-        out.write(byteArrayOf(0x01))
+        // 回复清单处理成功
+        out.write(byteArrayOf(0x01)); out.flush()
+
+        // 发送每个文件的处理指令
         for ((act, off) in actions) {
             when (act) {
                 "skip" -> out.write(byteArrayOf(0x00))
                 "full" -> out.write(byteArrayOf(0x01))
-                else -> {
+                "resume" -> {
                     out.write(byteArrayOf(0x02))
                     out.write(longToBytes(off))
                 }
@@ -1195,155 +1282,118 @@ class TcpFileTransfer(
         }
         out.flush()
 
+        // 逐个接收文件（最多重试 Constants.MAX_RETRIES 次）
         var receivedGlobal = 0L
         var failed = 0
-        val startTime = System.currentTimeMillis()
 
         for (idx in 0 until fileCount) {
-            val entry = manifest[idx]
+            val (relPath, size, _) = manifest[idx]
             val (act, _) = actions[idx]
             if (act == "skip") {
-                log("[接收]   ✓ " + entry.relPath + " (已存在，跳过)")
+                log("[接收]   ✓ " + relPath + " (已存在，跳过)")
                 continue
             }
-            val destPath = File(targetDir, entry.relPath)
-            destPath.parentFile?.mkdirs()
 
             var fileOk = false
             for (attempt in 0 until Constants.MAX_RETRIES) {
                 try {
-                    val relPath = reader.readLengthPrefixedString()
+                    // 接收文件头
+                    val rp = reader.readLengthPrefixedString()
                     val flags = reader.readByte()
                     val compressed = (flags and Constants.FLAG_COMPRESS) != 0
                     val resume = (flags and Constants.FLAG_RESUME) != 0
                     val fileSize = reader.readInt64()
-                    var offset = if (resume) reader.readInt64() else 0L
+                    var curOffset = if (resume) reader.readInt64() else 0L
 
-                    if (!isInside(basePath, destPath)) {
-                        log("[安全] 拒绝非法路径: " + relPath)
+                    val dest = File(saveDir, rp)
+                    if (!isInside(saveDir, dest)) {
+                        log("[安全] 拒绝非法路径: " + rp)
                         out.write("NO".toByteArray()); out.flush()
                         return
                     }
+                    dest.parentFile?.mkdirs()
 
-                    if (act == "full" && destPath.exists()) destPath.delete()
-                    else if (act == "resume") {
-                        if (!destPath.exists()) offset = 0
-                        else if (destPath.length() != offset) {
-                            offset = 0
-                            destPath.delete()
+                    if (act == "full" && dest.exists()) {
+                        dest.delete()
+                        curOffset = 0L
+                    } else if (act == "resume") {
+                        if (!dest.exists()) {
+                            curOffset = 0L
+                        } else if (dest.length() != curOffset) {
+                            log("[接收] 续传偏移不匹配，从头发送 " + rp)
+                            curOffset = 0L
+                            dest.delete()
                         }
-                    }
-                    if (offset > 0) {
-                        // 保留已有部分
-                    } else if (destPath.exists()) {
-                        destPath.delete()
                     }
 
                     out.write("OK".toByteArray()); out.flush()
-
-                    log("[接收]   (" + (idx + 1) + "/" + fileCount + ") " + relPath +
+                    log("[接收]   (" + (idx + 1) + "/" + fileCount + ") " + rp +
                             " (" + SizeFormatter.humanSize(fileSize) + ")" +
-                            (if (offset > 0) " [续传 " + SizeFormatter.humanSize(offset) + "]" else "") +
+                            (if (resume) " [续传]" else "") +
                             (if (compressed) " [压缩]" else ""))
 
-                    resumeRepo.saveFolderState(peerIp, folderName, relPath, offset, fileSize, 0.0)
+                    resumeRepo.saveFolderState(peerIp, folderName, rp, curOffset, fileSize, 0.0)
 
-                    val lastProgressSave = longArrayOf(0L)
-                    val lastPercentBucket = intArrayOf(-1)
                     val result = receiveData(
                         socket = socket,
-                        destFile = destPath,
+                        destFile = dest,
                         fileSize = fileSize,
-                        startOffset = offset,
+                        startOffset = curOffset,
                         compressed = compressed,
                         progressCallback = { received ->
-                            // 进度条 = **当前文件**的进度（received 含续传起点 offset）
-                            // statusText 同时显示当前文件 + 全局字节进度
-                            val globalBase = receivedGlobal
-                            val filePercent = if (fileSize > 0)
-                                (received * 100f / fileSize).coerceIn(0f, 100f) else 0f
-                            val globalRecv = globalBase + received
-                            val globalPercent = if (totalBytes > 0)
-                                (globalRecv * 100f / totalBytes).coerceIn(0f, 100f) else 0f
+                            val percent = if (fileSize > 0) (received * 100.0 / fileSize).toFloat() else 0f
                             onRecvProgress(TransferProgress(
-                                percent = filePercent,
-                                statusText = "当前: " + relPath + "  (" +
-                                        SizeFormatter.humanSize(received) + " / " + SizeFormatter.humanSize(fileSize) + ")  ·  " +
-                                        "整体: " + String.format("%.1f%%", globalPercent) + "  (" +
-                                        SizeFormatter.humanSize(globalRecv) + " / " + SizeFormatter.humanSize(totalBytes) + ")"
+                                percent = percent,
+                                statusText = "接收 " + rp + ": " + SizeFormatter.humanSize(received) +
+                                        " / " + SizeFormatter.humanSize(fileSize)
                             ))
-                            val now = System.currentTimeMillis()
-                            val bucket = if (fileSize > 0) ((received * 10) / fileSize).toInt() else 0
-                            if (now - lastProgressSave[0] >= 5000L || bucket != lastPercentBucket[0]) {
-                                lastProgressSave[0] = now
-                                lastPercentBucket[0] = bucket
-                                resumeRepo.saveFolderState(peerIp, folderName, relPath, received, fileSize, 0.0)
-                            }
                         }
                     )
 
                     val remoteHash = reader.readFixedAscii(64)
-                    val matched = result.success && result.hash == remoteHash
-                    out.write((if (matched) "MATCH     " else "MISMATCH  ").toByteArray())
-                    out.flush()
-
-                    if (matched) {
-                        log("[接收]   ✓ " + relPath)
-                        receivedGlobal += fileSize
+                    if (result.success && result.hash == remoteHash) {
+                        out.write("MATCH     ".toByteArray()); out.flush()
                         fileOk = true
-                        resumeRepo.deleteFolderState(peerIp, folderName, relPath)
+                        receivedGlobal += size
+                        resumeRepo.deleteFolderState(peerIp, folderName, rp)
                         break
                     } else {
-                        log("[接收]   ✗ " + relPath)
-                        // 删除损坏文件 + 续传状态（否则重传时仍续传到错误位置）
-                        try { if (destPath.exists()) destPath.delete() } catch (_: Exception) {}
-                        resumeRepo.deleteFolderState(peerIp, folderName, relPath)
+                        out.write("MISMATCH  ".toByteArray()); out.flush()
+                        try { if (dest.exists()) dest.delete() } catch (_: Exception) {}
                     }
                 } catch (e: Exception) {
-                    log("[接收]   ✗ " + entry.relPath + " 接收异常: " + e.message)
-                    break
+                    log("[接收]   ✗ " + relPath + " 异常: " + e.message)
+                    try { out.write("MISMATCH  ".toByteArray()); out.flush() } catch (_: Exception) {}
                 }
             }
-            if (!fileOk) {
-                log("[接收]   ✗ " + entry.relPath + " 重试 " + Constants.MAX_RETRIES + " 次均失败，放弃")
-                failed++
-            }
+            if (!fileOk) failed++
         }
 
-        val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
-        val speed = if (elapsed > 0) receivedGlobal / elapsed else 0.0
         if (failed == 0) {
-            log("[接收] 文件夹 " + folderName + " 接收完成，全部文件校验通过 (" + SizeFormatter.formatSpeed(speed) + ")")
-            // 发布到用户选择的位置
+            log("[接收] 文件夹 " + folderName + " 接收完成 ✓")
             kotlinx.coroutines.withContext(Dispatchers.IO) {
-                val target = publisher(targetDir, true)
-                if (target != null) {
-                    log("[接收] 已保存到: " + target)
-                } else {
-                    log("[接收] 保存失败，文件夹仍在应用私有目录: " + targetDir.absolutePath)
-                }
+                val target = publisher(saveDir, true)
+                if (target != null) log("[接收] 已保存到: " + target)
             }
         } else {
-            log("[接收] 文件夹 " + folderName + " 接收完成，" + failed + " 个文件失败")
+            log("[接收] 文件夹 " + folderName + " 接收完成，$failed 个文件失败")
         }
         onRecvProgress(TransferProgress(0f, statusText = "就绪"))
     }
 
     // ================= 工具 =================
 
-    private fun isInside(base: File, child: File): Boolean {
+    private fun longToBytes(v: Long): ByteArray =
+        java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.BIG_ENDIAN).putLong(v).array()
+
+    /** 检查 file 是否位于 dir 内（防路径穿越）。 */
+    private fun isInside(dir: File, file: File): Boolean {
         return try {
-            val basePath = base.canonicalPath
-            val childPath = child.canonicalPath
-            childPath == basePath || childPath.startsWith(basePath + File.separator)
+            val dirPath = dir.canonicalPath
+            val filePath = file.canonicalPath
+            filePath == dirPath || filePath.startsWith(dirPath + File.separator)
         } catch (_: Exception) {
             false
         }
-    }
-
-    private fun longToBytes(value: Long): ByteArray {
-        val buf = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.BIG_ENDIAN)
-        buf.putLong(value)
-        return buf.array()
     }
 }

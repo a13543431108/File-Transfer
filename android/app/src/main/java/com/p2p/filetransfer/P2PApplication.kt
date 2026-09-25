@@ -9,6 +9,13 @@ class P2PApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // 强制 JVM 使用 IPv4 Socket，避免 IPv6 双栈导致 connect IPv4 服务器
+        // 时报 EADDRNOTAVAIL（内核在 IPv6 地址空间找不到源地址）。
+        // 必须在任何网络操作之前设置。
+        try {
+            System.setProperty("java.net.preferIPv4Stack", "true")
+            System.setProperty("java.net.preferIPv6Addresses", "false")
+        } catch (_: Throwable) {}
         createNotificationChannels()
     }
 
