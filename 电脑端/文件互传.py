@@ -59,7 +59,7 @@ def _materialize_embedded_icon():
 # ================================================================================
 
 # ---------- 房间模块配置（单一来源，改这里全局生效） ----------
-RM_VER = 1                       # 协议版本
+RM_VER = 2                       # 协议版本（2 = 支持房间密码）
 # 消息类型：客户端 -> 服务器
 RM_T_JOIN = "join"
 RM_T_HB = "hb"
@@ -109,6 +109,9 @@ RM_PUNCH_HANDSHAKE_MAGIC = b"P2PH"  # 握手魔数（两端一致，4 字节）
                                     # 才能确认双向可达。
 # 连接保活
 RM_NAT_KEEPALIVE_INTERVAL = 15      # 维持 NAT 映射的间隔（秒）
+# B：保活健壮性 —— 新建连接宽限期内不判死；连续失败 N 次才判死（抗抖动）
+RM_TCP_KEEPALIVE_GRACE = 10.0        # 新建 TCP 连接宽限期（秒）
+RM_TCP_KEEPALIVE_FAIL_THRESHOLD = 2  # 连续探测失败次数阈值
 # 房间模式专用 TCP 端口
 # 必须与局域网 TCP_PORT(9999) 分离：Android 的 SO_REUSEADDR 比 Windows 严格，
 # 若映射观测连接与文件接收监听绑同一端口会 EADDRINUSE，导致无法登记公网映射、
@@ -563,12 +566,16 @@ class RmSignalingClient:
                  on_joined=None, on_member_join=None, on_member_leave=None,
                  on_punch_go=None, on_error=None, log=None,
                  server_tcp_port=None, punch_local_port=None, device_id=None,
-                 on_udp_hole_ready=None, on_mapping_ready=None, reuse_id=None):
+                 on_udp_hole_ready=None, on_mapping_ready=None, reuse_id=None,
+                 password=None):
         self.server_ip = server_ip
         self.server_port = server_port
         self.server_tcp_port = server_tcp_port or RM_DEFAULT_SERVER_TCP_PORT
         self.room = str(room)
         self.name = name
+        # 房间密码（可选）：空串/None = 开放房间。仅存内存，随 join 发送，
+        # 网络切换重建时一并重发。
+        self.password = str(password) if password else ""
         self.tcp_port = tcp_port
         self.lan_ips = list(lan_ips or [])
         self.device_id = device_id or ""
@@ -594,6 +601,10 @@ class RmSignalingClient:
         self._running = False
         self._recv_thread = None
         self._hb_thread = None
+        # 房间级拒绝码（服务器明确回了 error）：NEED_PASSWORD / BAD_PASSWORD /
+        # ROOM_OPEN / ROOM_FULL 等。非空表示"服务器可达但拒绝加入"，
+        # 区别于"超时无响应"（服务器不可达）。供 start() 区分错误提示。
+        self.last_join_error = None
         # UDP 打洞与可靠通道
         self.udp_hole_sock = None
         self._udp_hole_thread = None
@@ -612,22 +623,37 @@ class RmSignalingClient:
         self.sock = socket.socket(fam, socket.SOCK_DGRAM)
         self.sock.settimeout(RM_RECV_TIMEOUT)
         self._running = True
+        self.last_join_error = None
         self._send_join()
         if not self._wait_joined():
             self._running = False
-            err = ("[信令] 无法连接信令服务器 %s:%d（10 秒内无响应）。"
-                   "请检查：服务器是否已启动、地址是否正确、"
-                   "防火墙是否放行 UDP %d。"
-                   "提示：若服务器与本机在同一台机器/同一局域网，"
-                   "请填局域网 IP（如 127.0.0.1 或服务器的局域网地址），"
-                   "不要填公网 IP（多数路由器不支持从内网访问自己的公网 IP）。"
-                   % (self.server_ip, self.server_port, self.server_port))
-            self.log(err)
-            if self.on_error:
-                try:
-                    self.on_error("CONNECT_FAILED")
-                except Exception:
-                    pass
+            if self.last_join_error:
+                # 服务器可达，但明确拒绝了加入（密码错/房间满等）。
+                # 错误详情已由 on_error 回调上报，这里【不再】误报"无法连接"，
+                # 也【不再】发 CONNECT_FAILED（那会让 UI 提示去查网络，误导用户）。
+                code = self.last_join_error
+                _hint = {
+                    "NEED_PASSWORD": "该房间需要密码，请填写房间密码后重试",
+                    "BAD_PASSWORD": "房间密码错误，请检查后重试",
+                    "ROOM_OPEN": "该房间是开放房间（无密码），请清空密码栏后重试",
+                    "ROOM_FULL": "房间人数已满",
+                }.get(code, "服务器拒绝了加入请求")
+                self.log("[信令] 加入房间被拒绝（%s）：%s" % (code, _hint))
+            else:
+                # 真正连不上：超时无响应
+                err = ("[信令] 无法连接信令服务器 %s:%d（10 秒内无响应）。"
+                       "请检查：服务器是否已启动、地址是否正确、"
+                       "防火墙是否放行 UDP %d。"
+                       "提示：若服务器与本机在同一台机器/同一局域网，"
+                       "请填局域网 IP（如 127.0.0.1 或服务器的局域网地址），"
+                       "不要填公网 IP（多数路由器不支持从内网访问自己的公网 IP）。"
+                       % (self.server_ip, self.server_port, self.server_port))
+                self.log(err)
+                if self.on_error:
+                    try:
+                        self.on_error("CONNECT_FAILED")
+                    except Exception:
+                        pass
             try:
                 self.sock.close()
             except Exception:
@@ -869,6 +895,10 @@ class RmSignalingClient:
         # 网络重建时携带旧 id，服务器复用之（协议向后兼容：旧服务器忽略该字段）
         if self.reuse_id:
             msg["reuse_id"] = self.reuse_id
+        # 房间密码：仅在【有密码时】才带该字段。无密码时不发 pwd，
+        # 报文与旧版完全一致 → 开放房间零兼容风险。
+        if self.password:
+            msg["pwd"] = self.password
         self._send(msg)
 
     def _sync_time(self):
@@ -989,10 +1019,17 @@ class RmSignalingClient:
             if t == RM_T_JOINED:
                 self.my_id = msg.get("id")
                 self._joined_members = msg.get("members", [])
+                # 房间是否开放（服务器 ver>=2 才带此字段）：
+                # 有密码但服务器却回开放 → 说明密码未生效，上层据此提示用户。
+                self.room_open = msg.get("room_open", None)
+                self.server_ver = msg.get("ver", 1)
                 return True
             elif t == RM_T_ERROR:
+                code = msg.get("code", "UNKNOWN")
+                # 记录房间级拒绝码：供 start() 区分"服务器明确拒绝"与"超时不可达"
+                self.last_join_error = code
                 if self.on_error:
-                    self.on_error(msg.get("code", "UNKNOWN"))
+                    self.on_error(code)
                 self._running = False
                 return False
         return False
@@ -1043,7 +1080,7 @@ class RmSignalingClient:
 class RmConn:
     """单条到某成员的长连接。io_lock 串行化收发。"""
 
-    __slots__ = ("state", "sock", "addr", "member", "io_lock")
+    __slots__ = ("state", "sock", "addr", "member", "io_lock", "created_at")
 
     def __init__(self, member):
         self.state = RM_STATE_CONNECTING
@@ -1051,6 +1088,8 @@ class RmConn:
         self.addr = None
         self.member = member
         self.io_lock = threading.Lock()
+        # B：建连时间戳 —— 保活宽限期内不判死，避免刚连上被误杀
+        self.created_at = time.time()
 
 
 # ==================== 梯度冗余多路径调度（叠加层） ====================
@@ -1096,6 +1135,15 @@ class RmKeepaliveScheduler:
         total = self.success_count + self.fail_count
         if total >= 5 and self.fail_count / (total + 1) > 0.05:
             self.stable = True
+            return
+        # C 修复：纯成功（无任何失败样本）时，间隔不应无限翻倍到 3600s。
+        # 没有失败样本就无从"逼近 NAT 超时边界"，继续翻倍只会让保活越来越稀疏，
+        # 反而拖慢断线感知。此处封顶为当前角色的探测上限：
+        #   · hot 需要最快感知断线 → 保持 floor*2（不增长）
+        #   · warm_safe/warm_loose 允许适度增长，但不超过各自钳制上限
+        if self.fail_count == 0:
+            cap = self.floor * 2 if self.role == "hot" else self.safe_cap
+            self.current_interval = self._clamp(min(self.current_interval * 2, cap))
             return
         c = int(self.current_interval * 2 * RM_ROLE_FACTOR.get(self.role, 1.0))
         if self.lower_bound is not None:
@@ -1276,6 +1324,8 @@ class RmRoomManager:
         # 接收代际：{peer_key: int} —— 新通道接管时递增，旧接收循环据此退出，
         # 避免换路时新旧两个接收循环同时写盘（竞态）
         self._recv_epoch = {}
+        # B：TCP 保活连续失败计数 {peer_id: int}
+        self._tcp_alive_fail = {}
 
     def _get_path_sched(self, peer_id):
         """取（或创建）某 peer 的路径调度器。"""
@@ -1621,6 +1671,7 @@ class RmRoomManager:
             self._path_schedulers.pop(peer_id, None)
             # 连接池：清理空闲记录
             self._peer_last_active.pop(peer_id, None)
+            self._tcp_alive_fail.pop(peer_id, None)
             # UDP 连接也要清理（否则成员离开后仍占资源）
             rtp = self.udp_conns.pop(peer_id, None)
         if rtp:
@@ -1879,6 +1930,20 @@ class RmRoomManager:
                 # 重读最新 peer（含可能刚更新过的 pub_tcp）
                 with self.lock:
                     latest = self.members.get(peer_id) or peer
+                # D 修复：pub_tcp 为空说明对端 TCP 公网映射尚未登记，
+                # 此时重试再多次也无候选可用（日志"pub_tcp="空硬打 3 轮"）。
+                # 主动再发一次 punch_req，让服务器重新下发带 pub_tcp 的 punch_go。
+                if not latest.get("pub_tcp"):
+                    try:
+                        if self.signaling:
+                            self.log("[打洞] peer=%s pub_tcp 为空，重新请求映射"
+                                     % peer_id)
+                            self.signaling.request_punch(peer_id)
+                            time.sleep(0.3)
+                            with self.lock:
+                                latest = self.members.get(peer_id) or latest
+                    except Exception:
+                        pass
                 if attempt == 1:
                     self.log("[打洞] 任务启动 peer=%s 本地端口=%d"
                              % (peer_id, self._puncher.local_tcp_port))
@@ -2027,12 +2092,10 @@ class RmRoomManager:
                 with sched.lock:
                     items = list(sched.paths.items())
                 idle_factor = self._idle_factor(pid, now)
-                live_ids = set()
                 for path_id, p in items:
                     # A) 跳过 dead 路径（不再无谓探测，等重连时 register 替换）
                     if p.role == "dead":
                         continue
-                    live_ids.add(path_id)
                     if now < _next_due.get(path_id, 0):
                         continue
                     ok = self._probe_path(pid, path_id, p)
@@ -2045,35 +2108,69 @@ class RmRoomManager:
                                  % (path_id, p.scheduler.current_interval))
                     # 连接池：空闲降频（间隔 ×idle_factor）
                     _next_due[path_id] = now + p.scheduler.current_interval * idle_factor
-                # B) 清理已移除路径的 _next_due 条目（避免长期累积）
-                for stale_id in [k for k in _next_due if k not in live_ids]:
-                    _next_due.pop(stale_id, None)
+            # B) 清理已移除路径的 _next_due 条目。
+            #    注意：必须在【所有 peer】处理完后统一清理——此前 live_ids 是
+            #    每个 peer 独立的局部变量，用它清理全局 _next_due 会把【其他
+            #    peer 的到期时间】误删，导致那些路径每秒被重复探测、保活间隔
+            #    指数膨胀到 3600s（实测日志 [保活] 间隔=3600s 的根因）。
+            all_live = set()
+            for pid2 in list(self._path_schedulers.keys()):
+                sched2 = self._path_schedulers.get(pid2)
+                if not sched2:
+                    continue
+                with sched2.lock:
+                    for path_id2, p2 in sched2.paths.items():
+                        if p2.role != "dead":
+                            all_live.add(path_id2)
+            for stale_id in [k for k in _next_due if k not in all_live]:
+                _next_due.pop(stale_id, None)
 
             # ---- 2) TCP 长连接存活检查（兜底，快速感知） ----
+            # B：健壮性改进 ——
+            #   ① 宽限期：新建连接 RM_TCP_KEEPALIVE_GRACE 秒内不判死。
+            #      刚 connect（尤其半开/握手未完成）时 MSG_PEEK 可能瞬时异常，
+            #      立即判死会误杀本可用的连接（实测"建连即失效"）。
+            #   ② 连续失败阈值：单次探测失败不判死，需连续 N 次（默认 2）才判，
+            #      抗瞬时抖动。
             with self.lock:
                 tcp_items = [(pid, conn) for pid, conn in self.connections.items()
                              if conn.state == RM_STATE_CONNECTED]
             for pid, conn in tcp_items:
-                if not self._alive(conn.sock):
-                    self.log("[保活] %s TCP 通道失效，重新打洞" % pid)
-                    dead = False
-                    with self.lock:
-                        cur = self.connections.get(pid)
-                        if cur is conn:
-                            self._close_sock(cur)
-                            cur.state = RM_STATE_FAILED
-                            dead = True
-                    if not dead:
-                        continue
-                    try:
-                        self._on_path_failure(pid, "tcp")
-                    except Exception:
-                        pass
-                    # 关键修复：TCP 死亡【不能】走 _handle_udp_peer_dead ——
-                    # 那会销毁健康的 UDP 通道（可能是刚上位的热备）。
-                    # 只请求重建 TCP，绝不触碰其他路径。
-                    self._request_rebuild(pid)
-                    state_changed = True
+                # ① 宽限期：连接太新，跳过判活
+                if now - getattr(conn, "created_at", 0) < RM_TCP_KEEPALIVE_GRACE:
+                    continue
+                if self._alive(conn.sock):
+                    # 探测成功 → 清空失败计数
+                    self._tcp_alive_fail.pop(pid, None)
+                    continue
+                # ② 失败累计：未达阈值先记账，不判死
+                fail_n = self._tcp_alive_fail.get(pid, 0) + 1
+                if fail_n < RM_TCP_KEEPALIVE_FAIL_THRESHOLD:
+                    self._tcp_alive_fail[pid] = fail_n
+                    self.log("[保活] %s TCP 探测失败（%d/%d），暂不判死"
+                             % (pid, fail_n, RM_TCP_KEEPALIVE_FAIL_THRESHOLD))
+                    continue
+                # 达阈值 → 判死
+                self.log("[保活] %s TCP 通道失效（连续 %d 次），重新打洞" % (pid, fail_n))
+                dead = False
+                with self.lock:
+                    cur = self.connections.get(pid)
+                    if cur is conn:
+                        self._close_sock(cur)
+                        cur.state = RM_STATE_FAILED
+                        dead = True
+                self._tcp_alive_fail.pop(pid, None)
+                if not dead:
+                    continue
+                try:
+                    self._on_path_failure(pid, "tcp")
+                except Exception:
+                    pass
+                # 关键修复：TCP 死亡【不能】走 _handle_udp_peer_dead ——
+                # 那会销毁健康的 UDP 通道（可能是刚上位的热备）。
+                # 只请求重建 TCP，绝不触碰其他路径。
+                self._request_rebuild(pid)
+                state_changed = True
 
             # ---- 3) UDP-RTP 存活检查 ----
             with self.lock:
@@ -2387,6 +2484,8 @@ def get_subnet_for_ip(ip_str):
             # /12 覆盖 1048576 个 IP，会被 MAX_SCAN_IPS 截断到 65536
             # （只覆盖 172.16.0.0-172.16.255.255），反而扫不到真实网段
             # （如 172.20.93.x）。/16 正好 65536 个 IP，不触发截断。
+            # 注：此函数同时用于【广播地址推断】，需保持较宽范围；
+            #     【主动扫描】改用 get_scan_subnets()（见下）以 /24 提速。
             return f'{ip_str}/16'
         else:
             return f'{ip_str}/24'
@@ -2399,6 +2498,30 @@ def get_all_subnets():
         cidr = get_subnet_for_ip(ip)
         if cidr:
             subnets.add(cidr)
+    return list(subnets)
+
+
+def get_scan_subnets():
+    """返回【主动扫描】用的子网列表（/24 粒度）。
+
+    与 get_all_subnets() 的区别：后者用于广播推断（保留 /16 等宽范围），
+    本函数专供 scan_subnet() 主动扫描使用——把大网段收敛到 /24（254 个 IP），
+    避免每 20 秒遍历 6.5 万个地址却常发现 0 个设备。
+
+    跨 /24 的设备由「广播搜索」(broadcast_search，走宽范围广播) 负责发现。
+    """
+    subnets = set()
+    for ip in get_all_local_ips(ipv6=False):
+        if ':' in ip:
+            continue
+        try:
+            octets = ip.split('.')
+            if len(octets) != 4:
+                continue
+            # 统一收敛到该 IP 所在 /24
+            subnets.add("%s.%s.%s.0/24" % (octets[0], octets[1], octets[2]))
+        except Exception:
+            continue
     return list(subnets)
 
 def get_broadcast_addrs():
@@ -3215,7 +3338,8 @@ class Node(threading.Thread):
             return
         self.scanning = True
         self.gui.log("[扫描] 开始自动扫描所有子网...")
-        subnets = get_all_subnets()
+        # E：主动扫描用 /24 粒度（快），跨 /24 由广播搜索兜底
+        subnets = get_scan_subnets()
         if not subnets:
             self.gui.log("[扫描] 未找到任何有效子网")
             self.scanning = False
@@ -4821,7 +4945,7 @@ class P2PApp:
                 self.root = tk.Tk()
         else:
             self.root = tk.Tk()
-        self.root.title("文件互传 V16-全网通")
+        self.root.title("文件互传 V16.1-全网通")
         self.root.geometry("1200x700")
         self.root.resizable(True, True)
 
@@ -4855,6 +4979,7 @@ class P2PApp:
         self.room_sig = None          # SignalingClient 实例
         self.room_mgr = None          # RoomManager 实例
         self.room_name = ""           # 当前房间号
+        self._last_room_password = ""  # 缓存的房间密码（供网络重建重发）
         self.room_server = ""         # 信令服务器地址
         self.room_server_port = 0     # 信令服务器 UDP 端口
         self.room_members = []        # 房间成员（供 UI 展示）
@@ -4992,6 +5117,14 @@ class P2PApp:
         self.room_name_var = tk.StringVar(value="")
         ttk.Entry(frame, textvariable=self.room_name_var, width=12).pack(side=tk.LEFT, padx=2)
 
+        # 房间密码（可选）：留空 = 开放房间（任何人凭房间号可进）；
+        # 填写 = 受保护房间（必须密码匹配才能进）。仅房间创建者决定性质。
+        ttk.Label(frame, text="密码:").pack(side=tk.LEFT, padx=2)
+        self.room_pwd_var = tk.StringVar(value="")
+        ttk.Entry(frame, textvariable=self.room_pwd_var, width=12, show="*").pack(side=tk.LEFT, padx=2)
+        ttk.Label(frame, text="(留空=开放)", font=('', 8),
+                  foreground='gray').pack(side=tk.LEFT, padx=(0, 6))
+
         self.room_join_btn = ttk.Button(frame, text="加入房间", command=self.toggle_room)
         self.room_join_btn.pack(side=tk.LEFT, padx=5)
 
@@ -5026,15 +5159,17 @@ class P2PApp:
             return
         server = self.room_server_var.get().strip()
         room = self.room_name_var.get().strip()
+        pwd = self.room_pwd_var.get().strip()
         if not server or not room:
             messagebox.showwarning("参数缺失", "请输入服务器地址与房间号")
             return
-        self.join_room(server, room)
+        self.join_room(server, room, password=pwd)
 
-    def join_room(self, server, room, reuse_id=None):
+    def join_room(self, server, room, reuse_id=None, password=None):
         """连接信令服务器并加入房间。
 
         reuse_id：网络切换重建时传入上次的 my_id，让服务器复用（不换 id）。
+        password：房间密码（可选）。空/None = 开放房间。
         """
         try:
             # 支持三种格式：host / host:port / [ipv6]:port / 纯 IPv6
@@ -5062,6 +5197,10 @@ class P2PApp:
             # 记录原始输入，供网络切换后自动重建
             self._last_room_server_raw = server.strip()
             self._last_room_name = room
+            # 缓存密码：网络切换重建时一并重发（重建不带密码会连不上受保护房间）
+            if password is not None:
+                self._last_room_password = password
+            password = getattr(self, "_last_room_password", "")
 
             # 单一来源：设备标识统一从 Node.device_id 取（Node 启动时已生成/持久化）
             device_id = self.node.device_id
@@ -5097,6 +5236,7 @@ class P2PApp:
                 on_udp_hole_ready=self._on_udp_hole_ready,
                 on_mapping_ready=self.room_mgr.mark_mapping_ready,
                 reuse_id=reuse_id,
+                password=password,
             )
             self.room_mgr.signaling = self.room_sig
             ok = self.room_sig.start()
@@ -5153,6 +5293,7 @@ class P2PApp:
             # （网络切换触发的重建保留参数，重建完成后继续可用）
             self._last_room_server_raw = ""
             self._last_room_name = ""
+            self._last_room_password = ""   # 主动退出：清空密码缓存
         with self._room_lock:
             self.room_members = []
         self.selected_room_peers = set()
@@ -5239,6 +5380,15 @@ class P2PApp:
         self.log(f"[房间] 服务器返回错误: {code}")
         if code == "ROOM_FULL":
             self.root.after(0, lambda: messagebox.showwarning("房间已满", "该房间人数已达上限"))
+        elif code == "NEED_PASSWORD":
+            self.root.after(0, lambda: messagebox.showerror(
+                "需要密码", "该房间已设置密码，请填写正确的房间密码后重试"))
+        elif code == "BAD_PASSWORD":
+            self.root.after(0, lambda: messagebox.showerror(
+                "密码错误", "房间密码不正确，无法加入"))
+        elif code == "ROOM_OPEN":
+            self.root.after(0, lambda: messagebox.showwarning(
+                "开放房间", "该房间是开放房间（无密码）。\n请清空密码栏后再加入。"))
 
     def _on_room_socket_ready(self, peer_id, sock, member):
         """打洞成功：启动长连接的收发循环（收发共用同一 socket，用 io_lock 串行化）。"""

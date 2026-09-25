@@ -20,6 +20,9 @@ class RoomConn(
 ) {
     /** 读写锁（协程 Mutex）：发送时持锁，接收循环空闲时持锁读，串行化收发。 */
     val ioLock = kotlinx.coroutines.sync.Mutex()
+
+    /** B：建连时间戳 —— 保活宽限期内不判死，避免刚连上被误杀。 */
+    val createdAt: Long = System.currentTimeMillis()
 }
 
 /**
@@ -71,6 +74,11 @@ class RoomManager(
 
     // 接收代际：{peerKey: int} —— 新通道接管时递增，旧接收循环据此退出
     private val recvEpoch = HashMap<String, Int>()
+
+    // B：TCP 保活健壮性 —— 连续失败计数 + 新建连接宽限期
+    private val tcpAliveFail = HashMap<String, Int>()
+    private val TCP_KEEPALIVE_GRACE_MS = 10_000L
+    private val TCP_KEEPALIVE_FAIL_THRESHOLD = 2
 
     /** 取（或创建）某 peer 的路径调度器。 */
     private fun getPathSched(peerId: String): PeerPathScheduler = synchronized(this) {
@@ -351,6 +359,7 @@ class RoomManager(
             peerLastActive.remove(peerId)   // 连接池：清理空闲记录
             rebuildCooldown.remove(peerId)  // 清理重建冷却
             recvEpoch.remove(peerId)        // 清理接收代际
+            tcpAliveFail.remove(peerId)     // B：清理保活失败计数
             rtp = udpConns.remove(peerId)   // UDP 连接也要清理
         }
         try { rtp?.close() } catch (_: Exception) {}
@@ -559,7 +568,20 @@ class RoomManager(
                     return
                 }
                 // 重读最新成员信息
-                val latest = synchronized(this) { members[pid] } ?: peer
+                var latest = synchronized(this) { members[pid] } ?: peer
+                // D 修复：pub_tcp 为空说明对端 TCP 公网映射尚未登记，
+                // 此时再重试也无候选可用。主动再发一次 punch_req，
+                // 让服务器重新下发带 pub_tcp 的 punch_go。
+                if (latest.pubTcp.isEmpty()) {
+                    try {
+                        signaling?.let {
+                            log("[打洞] peer=" + pid + " pub_tcp 为空，重新请求映射")
+                            it.requestPunch(pid)
+                            delay(300)
+                            latest = synchronized(this) { members[pid] } ?: latest
+                        }
+                    } catch (_: Exception) {}
+                }
                 if (attempt == 1) {
                     log("[打洞] 任务启动 peer=" + pid + " 本地端口=" + localTcpPort)
                 } else {
@@ -675,11 +697,9 @@ class RoomManager(
             val schedSnapshot = synchronized(this) { pathSchedulers.toMap() }
             for ((spid, sched) in schedSnapshot) {
                 val factor = idleFactor(spid, nowMs)
-                val liveIds = HashSet<String>()
                 for (p in sched.snapshot()) {
                     // A) 跳过 dead 路径
                     if (p.role == "dead") continue
-                    liveIds.add(p.pathId)
                     val due = nextDue[p.pathId] ?: 0L
                     if (nowMs < due) continue
                     val ok = probePath(spid, p)
@@ -688,36 +708,57 @@ class RoomManager(
                     // 连接池：空闲降频（间隔 ×factor）
                     nextDue[p.pathId] = nowMs + p.scheduler.currentInterval * 1000L * factor
                 }
-                // B) 清理已移除路径的 nextDue 条目
-                nextDue.keys.removeAll { it !in liveIds && it.startsWith(spid) }
             }
+            // B) 清理已移除路径的 nextDue 条目。
+            //    必须在【所有 peer】处理完后统一按【全局存活集】清理——
+            //    pathId 形如 "tcp:<peerId>"，并不以 peerId 开头，原来的
+            //    startsWith(spid) 判据恒为 false，导致条目永不清理、无限增长。
+            val allLive = HashSet<String>()
+            synchronized(this) { pathSchedulers.values.toList() }.forEach { s ->
+                for (p in s.snapshot()) if (p.role != "dead") allLive.add(p.pathId)
+            }
+            nextDue.keys.removeAll { it !in allLive }
             // 1) 检查 TCP 长连接
             val snapshot = synchronized(this) {
                 connections.filterValues { it.state == RoomConnState.CONNECTED }.toMap()
             }
             for ((pid, c) in snapshot) {
+                // B① 宽限期：连接太新，跳过判活（避免刚连上被误杀）
+                if (nowMs - c.createdAt < TCP_KEEPALIVE_GRACE_MS) continue
                 val s = c.socket
-                if (s == null || s.isClosed || !s.isConnected) {
-                    log("[保活] " + pid + " TCP 通道失效，重新打洞")
-                    // 关键：仅当快照里的 c 仍是【当前】连接时才处理。
-                    // 若期间已被其他任务替换成新连接，说明旧 socket 是被主动
-                    // 替换掉的，不能误判新连接失效、也不应多余触发重建。
-                    var dead = false
-                    synchronized(this) {
-                        if (connections[pid] === c) {
-                            closeConn(c)
-                            c.state = RoomConnState.FAILED
-                            dead = true
-                        }
-                    }
-                    if (!dead) continue
-                    // 梯度冗余：通知调度器 TCP 热备失效，触发角色轮转
-                    try { pathSchedulers[pid]?.promoteOnHotFailure() } catch (_: Exception) {}
-                    // 关键修复：TCP 死亡【不能】走 handleUdpPeerDead ——
-                    // 那会销毁健康的 UDP 通道（可能是刚上位的热备）。
-                    // 只请求重建 TCP，绝不触碰其他路径。
-                    requestRebuild(pid)
+                val bad = s == null || s.isClosed || !s.isConnected
+                if (!bad) {
+                    tcpAliveFail.remove(pid)
+                    continue
                 }
+                // B② 连续失败阈值：未达阈值先记账，不判死（抗瞬时抖动）
+                val failN = (tcpAliveFail[pid] ?: 0) + 1
+                if (failN < TCP_KEEPALIVE_FAIL_THRESHOLD) {
+                    tcpAliveFail[pid] = failN
+                    log("[保活] " + pid + " TCP 探测失败（" + failN + "/" +
+                            TCP_KEEPALIVE_FAIL_THRESHOLD + "），暂不判死")
+                    continue
+                }
+                log("[保活] " + pid + " TCP 通道失效（连续 " + failN + " 次），重新打洞")
+                tcpAliveFail.remove(pid)
+                // 关键：仅当快照里的 c 仍是【当前】连接时才处理。
+                // 若期间已被其他任务替换成新连接，说明旧 socket 是被主动
+                // 替换掉的，不能误判新连接失效、也不应多余触发重建。
+                var dead = false
+                synchronized(this) {
+                    if (connections[pid] === c) {
+                        closeConn(c)
+                        c.state = RoomConnState.FAILED
+                        dead = true
+                    }
+                }
+                if (!dead) continue
+                // 梯度冗余：通知调度器 TCP 热备失效，触发角色轮转
+                try { pathSchedulers[pid]?.promoteOnHotFailure() } catch (_: Exception) {}
+                // 关键修复：TCP 死亡【不能】走 handleUdpPeerDead ——
+                // 那会销毁健康的 UDP 通道（可能是刚上位的热备）。
+                // 只请求重建 TCP，绝不触碰其他路径。
+                requestRebuild(pid)
             }
             // 2) 检查 UDP-RTP 连接
             val udpSnapshot = synchronized(this) { udpConns.toMap() }

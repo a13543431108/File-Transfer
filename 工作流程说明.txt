@@ -6,7 +6,7 @@
 一、系统概述
 ================================================================================
 
-  系统名称: 全环境极速传输 V14.0
+  系统名称: 全环境极速传输 V16.1
   协议类型: P2P 局域网/广域网文件传输协议
   核心架构: UDP 设备发现 + TCP 文件传输
   源码文件: 文件互传.py (2363行, Python, tkinter GUI)
@@ -1313,7 +1313,7 @@ D.4 必须注意的平台差异
   | socket SO_BROADCAST | 直接设              | 某些 ROM 可能阻止     |
 
 ================================================================================
-十一、公网房间模式（V15.2 新增）
+十一、公网房间模式（V16 打洞优化版）
 ================================================================================
 
   11.1 概述
@@ -1330,27 +1330,50 @@ D.4 必须注意的平台差异
   11.2 端口
 
     信令服务器：
-      UDP 3336   信令交互（join / hb / punch_req / bye）
+      UDP 3336   信令交互（join / hb / punch_req / bye / nat_probe / time_req）
       TCP 3337   TCP 映射观测（客户端连此端口以暴露 TCP 公网映射）
+      UDP 3338   NAT 类型探测（对称 NAT 检测）
 
-    客户端本地（沿用局域网端口）：
-      TCP 9999   既作为文件接收监听端口，也作为打洞绑定端口
+    客户端本地（房间模式专用，与局域网端口隔离）：
+      TCP 9998   房间模式 TCP 打洞 / 映射观测（【不监听】，SO_REUSEPORT 复用）
+      UDP 9996   房间模式 UDP 打洞 / UDP-RTP 可靠通道
+      （局域网端口 9997/9998/9999 保持不变；房间模式必须独立端口：
+         Android 的 SO_REUSEADDR 严格，映射观测/打洞/文件监听不能共用 9999）
 
   11.3 信令协议（UDP + JSON UTF-8，单包 <= 1400B）
 
     客户端 -> 服务器：
-      join      {"type":"join","ver":1,"room":房间号,"name":设备名,
-                 "tcp":9999,"lan":[本机IP列表],"did":稳定设备ID}
-      hb        {"type":"hb","ver":1,"id":自己ID}      每 20 秒
-      punch_req {"type":"punch_req","ver":1,"id":自己ID,"target":对方ID}
-      bye       {"type":"bye","ver":1,"id":自己ID}
+      join      {"type":"join","ver":2,"room":房间号,"name":设备名,
+                 "tcp":9999,"lan":[本机IP列表],"did":稳定设备ID,
+                 "pwd":房间密码(可选，仅填了密码时才带此字段)}
+      hb        {"type":"hb","ver":2,"id":自己ID}      每 20 秒
+      punch_req {"type":"punch_req","ver":2,"id":自己ID,"target":对方ID}
+      bye       {"type":"bye","ver":2,"id":自己ID}
 
     服务器 -> 客户端：
-      joined        {"type":"joined","id":自己ID,"members":[成员列表]}
+      joined        {"type":"joined","id":自己ID,"members":[成员列表],
+                     "room_open":true/false(房间是否开放，ver>=2 才带)}
       member_join   {"type":"member_join","member":新成员}
       member_leave  {"type":"member_leave","id":离开者ID}
       punch_go      {"type":"punch_go","peer":对端信息,"at":统一打洞时刻(ms)}
       error         {"type":"error","code":"ROOM_FULL" 等}
+
+  11.3.1 房间密码（V16.1 新增，信令协议 ver=2）
+
+    房间的"开放/受保护"性质由【首个加入者】决定：
+      · 不带 pwd 创建 → 开放房间，任何人凭房间号直接进（与旧版一致）
+      · 带 pwd 创建   → 受保护房间，后续加入必须密码匹配
+
+    兼容性：不填密码时不发 pwd 字段，join 报文与旧版逐字节一致 → 零兼容风险。
+
+    服务器校验（锁内原子完成，防并发创建 TOCTOU）：
+      · 房间开放、客户端却带 pwd   → error code=ROOM_OPEN
+      · 房间受保护、客户端未带 pwd → error code=NEED_PASSWORD
+      · 密码不匹配                 → error code=BAD_PASSWORD
+    服务器只存 sha256("room:pwd")，不回传、不落明文；房间空了密码一并删除。
+
+    客户端：加入被服务器拒绝（收到上述 error）时，不再误报"无法连接信令服务器"，
+    而是给出准确提示（需要密码 / 密码错误 / 开放房间请清空密码）。
 
     成员信息结构：
       {"id":"B2","did":"稳定ID","name":"设备名",
@@ -1428,16 +1451,20 @@ D.4 必须注意的平台差异
       4. 稍等(200ms)让服务器登记映射
       5. 触发 on_joined（对房间现有成员发起打洞请求）
 
-    【打洞流程】
-      1. 收到 punch_go（含对端 pub_tcp + 统一 at 时刻）
-      2. 等待到 at 时刻
-      3. 依次尝试候选地址：
-         内网地址(对端 lan + 本地 TCP 端口) -> 优先
+    【打洞流程（V16 优化版）】
+      1. 触发源（任一）：服务器 punch_go / 对端 TCP_READY / SYNC_COMMIT 约定时刻
+      2. 等待到约定时刻
+      3. 构造候选地址（#4）：
+         内网地址(对端 lan + 本地 TCP 端口)
          TCP 公网映射(pub_tcp)
-         用同一本地端口(9999) bind 后 connect，超时 300ms
-      4. 成功则得到一条已连接 socket（保持打开）
-      5. 失败按 2/4/8 秒退避重试，最多 3 次
-      6. 受 Semaphore(6) 限制并发打洞数
+         若 pub_tcp 为空 -> 用 UDP 打洞端口 ±2 预测（仅 IPv4）
+      4. #3 所有候选【并行】connect（Barrier 对齐起跑），谁先成功用谁
+         用同一本地端口(9998) bind 后 connect，超时自适应(#9)
+      5. 成功则得到一条已连接 socket（保持打开）
+      6. 失败则 #2 轮次对齐重试：my_id<peer 主导下发下一轮时刻，
+         另一端跟随；无 UDP 通道则本地退避。最多 3 轮
+      7. 受 Semaphore(6) 限制并发打洞数
+      8. 彻底失败：#8 发 PUNCH_FAIL 通知对端（守卫：仅未连接时才标失败/发通知）
 
     【长连接收发】
       · 打洞得到的长连接保持打开
@@ -1565,6 +1592,146 @@ D.4 必须注意的平台差异
       SignalingClient.kt   # 信令客户端
       HolePuncher.kt       # TCP 打洞
       RoomManager.kt       # 房间管理
+
+  11.10 UDP-RTP 可靠通道 + SYNC 校时（V16）
+
+    【UDP-RTP 包头】12 字节定长，大端：
+      [1B type][4B seq][4B ack][2B length][1B reserved]
+      type 定义：
+        0=DATA  1=ACK  2=FIN  3=KEEPALIVE
+        4=SYNC_REQ  5=SYNC_ACK  6=SYNC_COMMIT    (校时 + 约定打洞时刻)
+        7=PUNCH_ROUND                            (打洞轮次对齐)
+        8=TCP_READY                              (TCP 映射就绪信号)
+        9=PUNCH_FAIL                             (打洞失败通知)
+      窗口 WINDOW=64、MAX_PAYLOAD=1200、RTO=300ms、重传扫描 50ms。
+      累积确认：ack = 期望收到的下一个 seq。
+
+    【共享 socket】所有 peer 共用一个本地 UDP 9996 socket：
+      发送 send_udp_to(peer_addr, data)
+      接收全局单循环 _udp_global_recv_loop -> 按源地址分发到对应
+           UdpReliableSocket.on_packet()
+
+    【SYNC 校时 + 约定打洞时刻】
+      · my_id < peer_id 一方作为 initiator 发起 SYNC
+      · 采样 4 次：SYNC_REQ(t1, ver) -> 对端回 SYNC_ACK(t1,t2,t3, ver)
+      · 算 RTT / offset（NTP 公式），取最小 RTT 那次
+      · 发 SYNC_COMMIT 约定打洞时刻（见 #1）
+
+  11.11 打洞成功率优化（P2 #1~#9，V16 新增）
+
+    PROTO_VER = 2；全部经 UDP-RTP 通道两端直连，不经服务器。
+    信令服务器【无需重新部署】。
+
+    #1 COMMIT 可靠化 + 版本协商
+       · SYNC_REQ payload = t1(8B) + PROTO_VER(1B)
+       · SYNC_ACK payload = t1,t2,t3(各8B) + PROTO_VER(1B)，两端互学 peer_ver
+       · COMMIT v2 = t_go_R(对端钟绝对毫秒) + commit_id，重传 3 次(幂等)，
+         响应方按 commit_id 去重；peer_ver<2 回退 v1(delta 单发)
+
+    #2 打洞轮次确定性对齐
+       · PUNCH_ROUND = round_no + t_go_R
+       · my_id < peer_id 主导：下发下一轮绝对时刻(对端钟)
+       · my_id > peer_id 跟随：等待并 sleep 到该时刻；收不到则本地退避
+
+    #3 候选并行连接
+       · 所有候选(内网 + pub_tcp + UDP 预测)同时 connect，谁先成功用谁
+       · Windows 必须用非阻塞 connect + select + getsockopt(SO_ERROR)
+
+    #4 UDP 端口预测 TCP 候选
+       · UDP 打洞成功记录对端 UDP 公网地址
+       · pub_tcp 为空时追加预测候选 port, port±1, port±2 (仅 IPv4)
+
+    #6 TCP 映射就绪信号
+       · 映射观测建立成功 -> 广播 TCP_READY
+       · 对端收到立即发起打洞(无需等 punch_go)；新建通道且已就绪时补发
+
+    #8 打洞失败即时通知
+       · 多轮彻底失败发 PUNCH_FAIL；对端收到标记 FAILED 回退 UDP
+       · 【守卫】任务结束仅当 peer 当前【非 CONNECTED】才标失败/发通知，
+         已被其他任务连接则静默退出
+
+    #9 自适应连接超时
+       · SYNC 完成后 connect 超时 = clamp(SYNC_RTT × 4, 3s, 8s)
+
+  11.12 V16 实测修复的 bug / 竞态
+
+    B1 版本协商失效：只有 SYNC_REQ 带 ver，SYNC_ACK 不带 -> 新端被判 v1。
+       修复：SYNC_ACK 尾部补带 PROTO_VER，initiator 收 ACK 时读取。
+    B2 保活线程崩溃(Python)：_alive() 缺 except，socket 被并发关闭时
+       setblocking 抛 WinError 10038 逃逸 -> 线程崩溃。
+       修复：setblocking 加 except 兜底返回失效。
+    B3 保活误伤新连接：快照 conn 被替换后失效处理作用到当前连接，误关新连接。
+       修复：仅当快照对象仍是当前连接时才处理(cur is conn / === c)。
+    B4 入站连接覆盖 fd 泄漏：on_inbound 覆盖已存在连接时未关旧 socket。
+       修复：覆盖前先 close 旧 socket。
+    B5 安卓 createIpv4Socket 实际创建 IPv6 套接字(根因 bug)：
+       依赖 preferIPv4Stack 但设置晚于 InetAddress 初始化(只读一次) ->
+       localSocket=:: -> 映射观测失败(EADDRNOTAVAIL) + 打洞无路由(NoRouteToHost)。
+       修复：反射创建真 AF_INET(SocketChannel.open(StandardProtocolFamily.INET))。
+
+  11.13 梯度冗余多路径调度（V16）
+
+    打洞成功后，同一 peer 维护多条路径，按 RTT 分级、按角色保活、可换路续传。
+
+    【路径角色】
+      热备 hot          传数据；保活最积极（快速感知断线）
+      保守暖备 warm_safe 不传数据；保活间隔硬性钳制 <= 协议安全上限，
+                        确保热备一断即可立即接管
+      宽松暖备 warm_loose 不传数据；保活贪心探测到极致，省电优先
+
+    【保活：软性探测 + 硬性下限】
+      PROTO_FLOOR    = {tcp: 30, udp: 15}      秒（任何路径不得低于）
+      PROTO_SAFE_CAP = {tcp: 3600, udp: 60}    秒（保守暖备不得高于）
+      ROLE_FACTOR    = {hot: 1.0, warm_safe: 1.5, warm_loose: 4.0}
+      · 成功 -> 间隔指数增长（逼近 NAT 超时边界）
+      · 失败 -> 与已知成功值二分收敛
+      · 硬性下限兜底；保守暖备硬性钳制 <= PROTO_SAFE_CAP
+      · 收敛判据：成功率 > 95% 才继续增长
+
+    【热备断裂 -> 立即重建】
+      1) 保守暖备上位为热备（< 100ms，NAT 映射有效）
+      2) 宽松暖备验证后升级为保守暖备（验证失败则重建）
+      3) 后台【立即重建】补足宽松暖备
+      4) 跨路径重传未确认部分
+
+    【连接池跨传输复用 + 空闲降频】
+      · 传输结束【不关连接】，下次发送直接复用（无需重新打洞）
+      · 空闲越久保活越稀疏：<60s ×1 / <10min ×4 / <1h ×16 / 更久 ×64
+      · mark_active() 在传输开始/结束时重置空闲计时
+
+    【按角色选路发送】
+      get_send_channel(peer_id, exclude_socks)：
+        优先 hot -> warm_safe -> warm_loose -> 回退任意可用
+        · exclude_socks：已失败 socket（避免重复取死路）
+        · 通道存活检查：已关闭的 socket 不再返回
+
+    【跨路径换路续传】
+      某通道发送失败 -> 自动换另一条可用路径重发（最多 3 次）：
+        · 单文件：重新走 QUERY_OFFSET 协商，从断点继续
+        · 文件夹：重新握手，接收端按本地文件状态 skip/resume/full
+      关键：
+        · 换路前清理旧路径的 .tmp 临时文件（避免残留累积）
+        · UDP-RTP 收发必须用【同一把 io_lock】（与 TCP 的 RoomConn.io_lock 对齐）
+
+    【打洞并发限制】
+      同一 peer 最多 2 个 _punch_task 并发（_punch_active 计数）
+      · per-round 守卫：已连接则本任务退出
+      · 结尾守卫：仅未连接时才标失败/发 PUNCH_FAIL
+
+    【日志降噪】
+      RmHolePuncher.verbose 默认 False：逐候选失败/超时/尝试日志不输出
+      成功与最终汇总日志始终输出
+
+  11.14 V16 实测修复的 bug
+
+    B6 UDP-RTP 收发 io_lock 不一致（Python 端）：
+       发送侧 get_send_channel 对 UDP 返回 io_lock=None，接收侧却新建一把
+       独立的 Lock。结果"发送整个文件"与"接收循环读一帧"无互斥。
+       修复：UdpReliableSocket 内置 io_lock，收发两侧统一使用它。
+    B7 文件夹换路时 .tmp 残留：失败分支只删 dest_path，未删 .tmp。
+       修复：失败分支同时清理 .tmp。
+    B8 换路后旧通道被再次选中：旧接收循环 close 了 socket，但连接表仍留着，
+       get_send_channel 可能再次返回它。修复：通道存活检查 + exclude 已失败。
 
   说明：电脑端为便于"单文件即拖即用"，把原 net/ 模块（config/signaling/
         holepunch/room）内联进 文件互传.py，类名统一加 Rm 前缀避免与主程序

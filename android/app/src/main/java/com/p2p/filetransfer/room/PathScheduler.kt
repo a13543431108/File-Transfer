@@ -50,6 +50,16 @@ class KeepaliveScheduler(val role: String, val proto: String) {
             stable = true
             return
         }
+        // C 修复：纯成功（无任何失败样本）时，间隔不应无限翻倍到 3600s。
+        // 没有失败样本就无从"逼近 NAT 超时边界"，继续翻倍只会让保活越来越稀疏，
+        // 反而拖慢断线感知。封顶为当前角色的探测上限：
+        //   · hot 需要最快感知断线 → 保持 floor*2（不增长）
+        //   · warm_safe/warm_loose 允许适度增长，但不超过各自钳制上限
+        if (failCount == 0) {
+            val cap = if (role == "hot") floor * 2 else safeCap
+            currentInterval = clamp(minOf(currentInterval * 2, cap))
+            return
+        }
         var c = (currentInterval * 2 * (ROLE_FACTOR[role] ?: 1.0)).toInt()
         if (lowerBound != null) {
             c = minOf(c, (upperBound!! + lowerBound!!) / 2)

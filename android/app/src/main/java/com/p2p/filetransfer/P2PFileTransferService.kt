@@ -82,6 +82,8 @@ class P2PFileTransferService : Service() {
     // 网络切换后房间重建：保存最近一次成功加入的参数（server 原始输入 + 房间名）
     @Volatile private var lastRoomServer: String = ""
     @Volatile private var lastRoomName: String = ""
+    /** 房间密码缓存：网络切换重建时重发（空 = 开放房间）。 */
+    @Volatile private var lastRoomPassword: String = ""
     // 上一次回调看到的网络句柄（用于判断网络是否真的切换）
     @Volatile private var lastNetHandle: Long = 0L
     // 上次重建时间（冷却，避免网络抖动导致频繁重建）
@@ -402,7 +404,8 @@ class P2PFileTransferService : Service() {
     }
 
     /** 加入房间：连接信令服务器并开始全连接打洞。 */
-    fun joinRoom(server: String, room: String, reuseId: String? = null) {
+    fun joinRoom(server: String, room: String, reuseId: String? = null,
+                 password: String? = null) {
         if (roomSig != null) {
             emitLog("[房间] 已在房间中，请先退出")
             return
@@ -411,6 +414,9 @@ class P2PFileTransferService : Service() {
             emitLog("[房间] 服务器地址与房间号不能为空")
             return
         }
+        // 缓存密码：网络切换重建时一并重发（不带密码会连不上受保护房间）
+        if (password != null) lastRoomPassword = password
+        val pwd = lastRoomPassword
         serviceScope.launch {
             try {
                 // 支持三种格式：host / host:port / [ipv6]:port / 纯 IPv6
@@ -478,13 +484,19 @@ class P2PFileTransferService : Service() {
                     punchLocalPort = tcpPort,
                     scope = serviceScope, log = ::emitLog,
                     reuseId = reuseId,
+                    password = pwd,
                     onJoined = { list -> mgr.onJoined(list); _roomMembers.value = mgr.getMembers() },
                     onMemberJoin = { m -> mgr.onMemberJoin(m); _roomMembers.value = mgr.getMembers() },
                     onMemberLeave = { id -> mgr.onMemberLeave(id); _roomMembers.value = mgr.getMembers() },
                     onPunchGo = { pg -> mgr.onPunchGo(pg.peer, pg.atMs) },
                     onError = { code ->
                         emitLog("[房间] 服务器错误: " + code)
-                        if (code == "ROOM_FULL") emitLog("[房间] 房间已满")
+                        when (code) {
+                            "ROOM_FULL" -> emitLog("[房间] 房间已满")
+                            "NEED_PASSWORD" -> emitLog("[房间] 该房间需要密码，请填写正确的房间密码")
+                            "BAD_PASSWORD" -> emitLog("[房间] 房间密码错误，无法加入")
+                            "ROOM_OPEN" -> emitLog("[房间] 该房间是开放房间（无密码），请清空密码栏")
+                        }
                     }
                 )
                 mgr.signaling = sig
@@ -546,6 +558,7 @@ class P2PFileTransferService : Service() {
             // （网络切换触发的重建保留参数，重建完成后继续可用）
             lastRoomServer = ""
             lastRoomName = ""
+            lastRoomPassword = ""   // 主动退出：清空密码缓存
         }
         _roomJoined.value = false
         _roomName.value = ""

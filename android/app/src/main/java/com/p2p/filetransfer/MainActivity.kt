@@ -66,6 +66,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -373,8 +374,8 @@ class MainViewModel(app: android.app.Application) : AndroidViewModel(app) {
     }
 
     // ===== 房间模式方法 =====
-    fun joinRoom(server: String, room: String) {
-        P2PFileTransferService.instance?.joinRoom(server, room)
+    fun joinRoom(server: String, room: String, password: String = "") {
+        P2PFileTransferService.instance?.joinRoom(server, room, password = password)
     }
 
     fun leaveRoom() {
@@ -709,6 +710,7 @@ fun RoomCard(vm: MainViewModel) {
         }
     }
     var roomText by remember { mutableStateOf("") }
+    var pwdText by remember { mutableStateOf("") }
     var expanded by remember { mutableStateOf(false) }
     var historyExpanded by remember { mutableStateOf(false) }
 
@@ -812,9 +814,20 @@ fun RoomCard(vm: MainViewModel) {
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Spacer(Modifier.height(6.dp))
+                    // 房间密码（可选）：留空 = 开放房间（任何人凭房间号可进）；
+                    // 填写 = 受保护房间（必须密码匹配才能进）。由创建者决定性质。
+                    OutlinedTextField(
+                        value = pwdText,
+                        onValueChange = { pwdText = it },
+                        label = { Text("密码（可选，留空=开放房间）") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     Spacer(Modifier.height(8.dp))
                     Button(
-                        onClick = { vm.joinRoom(serverText.trim(), roomText.trim()) },
+                        onClick = { vm.joinRoom(serverText.trim(), roomText.trim(), pwdText.trim()) },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("加入房间") }
                 }
@@ -1001,7 +1014,7 @@ fun MainScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text("文件互传 V16", style = MaterialTheme.typography.titleMedium)
+                        Text("文件互传 V16.1", style = MaterialTheme.typography.titleMedium)
                         Text(
                             text = "设备名: " + deviceName + "   ·   保存到: " + saveDirDesc,
                             style = MaterialTheme.typography.labelSmall,

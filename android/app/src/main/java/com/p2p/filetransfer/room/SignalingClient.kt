@@ -42,9 +42,19 @@ class SignalingClient(
     private val onError: (String) -> Unit,
     private val serverTcpPort: Int = RoomConfig.DEFAULT_SERVER_TCP_PORT,
     /** 身份复用：网络切换重建时传入上次 myId，服务器复用（不换 id）。 */
-    private val reuseId: String? = null
+    private val reuseId: String? = null,
+    /** 房间密码（可选）：空 = 开放房间。仅存内存，随 join 发送，重建时重发。 */
+    private val password: String = ""
 ) {
     @Volatile var myId: String? = null
+        private set
+
+    /**
+     * 房间级拒绝码（服务器明确回了 error）：NEED_PASSWORD / BAD_PASSWORD /
+     * ROOM_OPEN / ROOM_FULL 等。非空表示"服务器可达但拒绝加入"，
+     * 区别于"超时无响应"（服务器不可达）。供 start() 区分错误提示。
+     */
+    @Volatile var lastJoinError: String? = null
         private set
 
     private var udp: DatagramSocket? = null
@@ -109,18 +119,34 @@ class SignalingClient(
         }
         udp?.soTimeout = RoomConfig.RECV_SO_TIMEOUT_MS
 
+        lastJoinError = null
         sendJoin()
         if (!waitJoined()) {
             // 未能加入房间：明确报错并停止，绝不打印"已加入"误导用户
             running = false
-            log("[信令] 无法连接信令服务器 " + serverHost + ":" + serverPort +
-                    "（10 秒内无响应）。请检查：服务器是否已启动、地址是否正确、" +
-                    "防火墙是否放行 UDP " + serverPort + "。" +
-                    "提示：若服务器与本机在同一台机器/同一局域网，请填局域网 IP" +
-                    "（如服务器的局域网地址），不要填公网 IP" +
-                    "（多数路由器不支持从内网访问自己的公网 IP）。")
+            val rej = lastJoinError
+            if (rej != null) {
+                // 服务器可达但明确拒绝（密码错/房间满等）。错误详情已由
+                // onError 上报，这里【不再】误报"无法连接"，也【不再】发
+                // CONNECT_FAILED（那会让 UI 提示去查网络，误导用户）。
+                val hint = when (rej) {
+                    "NEED_PASSWORD" -> "该房间需要密码，请填写房间密码后重试"
+                    "BAD_PASSWORD" -> "房间密码错误，请检查后重试"
+                    "ROOM_OPEN" -> "该房间是开放房间（无密码），请清空密码栏后重试"
+                    "ROOM_FULL" -> "房间人数已满"
+                    else -> "服务器拒绝了加入请求"
+                }
+                log("[信令] 加入房间被拒绝（" + rej + "）：" + hint)
+            } else {
+                log("[信令] 无法连接信令服务器 " + serverHost + ":" + serverPort +
+                        "（10 秒内无响应）。请检查：服务器是否已启动、地址是否正确、" +
+                        "防火墙是否放行 UDP " + serverPort + "。" +
+                        "提示：若服务器与本机在同一台机器/同一局域网，请填局域网 IP" +
+                        "（如服务器的局域网地址），不要填公网 IP" +
+                        "（多数路由器不支持从内网访问自己的公网 IP）。")
+                onError("CONNECT_FAILED")
+            }
             try { udp?.close() } catch (_: Exception) {}
-            onError("CONNECT_FAILED")
             return false
         }
 
@@ -460,6 +486,11 @@ class SignalingClient(
         if (!reuseId.isNullOrEmpty()) {
             msg.put("reuse_id", reuseId)
         }
+        // 房间密码：仅在【有密码时】才带该字段；无密码时不发 pwd，
+        // 报文与旧版完全一致 → 开放房间零兼容风险。
+        if (password.isNotEmpty()) {
+            msg.put("pwd", password)
+        }
         send(msg)
     }
 
@@ -475,7 +506,9 @@ class SignalingClient(
                     return true
                 }
                 RoomConfig.T_ERROR -> {
-                    onError(msg.optString("code", "UNKNOWN"))
+                    val code = msg.optString("code", "UNKNOWN")
+                    lastJoinError = code
+                    onError(code)
                     running = false
                     return false
                 }

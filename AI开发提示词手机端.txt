@@ -41,9 +41,19 @@
 ## 三、网络协议规范（必须严格实现）
 
 ### 端口定义
+【局域网模式】
 - UDP 9998: 设备发现（心跳/广播/回复）
 - TCP 9999: 文件传输通道
 - UDP 9997: 扫描探测（与设备发现隔离）
+
+【公网房间模式 · 服务器】
+- UDP 3336: 信令交互（加入房间/心跳/打洞协调）
+- TCP 3337: TCP 映射观测（客户端连接以暴露 TCP 公网映射）
+- UDP 3338: NAT 类型探测
+
+【公网房间模式 · 客户端】
+- TCP 9998: 房间模式 TCP 打洞 / 映射观测（【不监听】）
+- UDP 9996: 房间模式 UDP 打洞 / UDP-RTP
 
 ### 关键常量
 - NODE_TIMEOUT = 600秒（节点10分钟未响应则移除）
@@ -57,6 +67,24 @@
 - WRITE_BATCH_SIZE = 1MB（磁盘写入批量）
 - RECV_ACTIVITY_TIMEOUT = 60秒（接收静默超时）
 - ACTIVITY_TIMEOUT = 30秒（发送静默超时）
+
+### 房间模式常量
+- MAX_ROOM_SIZE = 16（单房间最大人数）
+- HEARTBEAT_INTERVAL = 20秒（客户端心跳间隔，需 < 服务器 30s 超时）
+- PUNCH_CONCURRENCY = 6（同时打洞任务数）
+- PUNCH_CONNECT_TIMEOUT = 6秒（单次 TCP connect 超时，可自适应）
+- PUNCH_RETRY = 3（打洞重试次数）
+- PUNCH_RETRY_BACKOFF = 1秒（重试退避基数）
+- NAT_KEEPALIVE_INTERVAL = 15秒（维持 NAT 映射）
+
+### P2 打洞优化常量
+- PROTO_VER = 2（UDP-RTP 协议版本，>=2 启用 v2 COMMIT + 版本协商）
+- SYNC_SAMPLE_COUNT = 4（SYNC 校时采样次数）
+- SYNC_TIMEOUT = 1秒（单次 SYNC 采样超时）
+- SYNC_COMMIT_DELAY_MS = 500（COMMIT 后多少毫秒执行打洞）
+- SYNC_COMMIT_RESEND = 3（COMMIT 重传次数）
+- SYNC_COMMIT_RESEND_INTERVAL_MS = 100（重传间隔）
+- 自适应 connect 超时 = clamp(SYNC_RTT × 4, 3s, 8s)
 
 ### 标志位
 - FLAG_FILE = 0x00（单文件）
@@ -685,6 +713,305 @@ fun scanSubnet(cidr: String, callback: (ip: String, hostname: String) -> Unit) {
 6. 电脑端会显示接收请求/确认
 7. 验证文件完整性
 
+
 ---
+
+## 十一、公网房间模式 · Android 端实战踩坑记录（血泪版）
+
+本节记录 Android 端实现"房间模式（信令 + TCP/UDP 打洞 + 可靠 UDP）"时
+真实踩过的坑。请在实现时直接规避。
+
+### 11.1 网络栈坑
+
+#### 坑 1：Android Socket 默认是 IPv6 双栈
+- 现象：`Socket().bind(InetSocketAddress("0.0.0.0", 9998))` 后
+        `localSocket` 仍是 `::`（IPv6），connect IPv4 服务器报
+        **EADDRNOTAVAIL**。
+- 根因：Android 的 `java.net.Socket()` 默认创建 AF_INET6 双栈 socket，
+        bind IPv4 地址会被当作 IPv4-mapped IPv6 处理。
+- 修复：用反射调用
+        `SocketChannel.open(StandardProtocolFamily.INET).socket()`
+        创建纯 IPv4 socket（minSdk >= 24）。
+
+  Kotlin 编译器会把 `SocketChannel.open(family)` 误匹配到
+  `open(SocketAddress)` 重载，**必须用反射**：
+  ```kotlin
+  fun createIpv4Socket(): Socket {
+      val m = SocketChannel::class.java.getMethod(
+          "open", java.net.ProtocolFamily::class.java)
+      val ch = m.invoke(null, StandardProtocolFamily.INET) as SocketChannel
+      return ch.socket()
+  }
+  ```
+
+#### 坑 2：SO_REUSEPORT 是 Linux 值 15，Android 没有 Java 常量
+- 现象：`StandardSocketOptions.SO_REUSEPORT` 是 API 29+ 字段，
+        低版本引用抛 **NoSuchFieldError**（Error 非 Exception，直接崩溃）。
+- 修复：用 `android.system.Os.setsockoptInt(fd, SOL_SOCKET, 15, 1)`，
+        fd 用 `ParcelFileDescriptor.fromSocket(socket)` 获取 + WeakHashMap
+        保活（防 GC 关闭 fd），详见 PC 端文档坑 5。
+
+#### 坑 3：buildProcessToNetwork(WiFi) 会影响房间模式
+- 现象：进程被绑定到校园网 WiFi（无公网路由）后，TCP connect 公网服务器
+        报 **EADDRNOTAVAIL**。
+- 修复：对每个公网 socket 单独绑 `activeNetwork`（能上网的那张网卡）。
+  - **socket 级绑定的顺序必须是**：
+    `setReuseAddress`（触发 fd 创建）→ `network.bindSocket(socket)` →
+    `bind(0.0.0.0:port)`。
+  - UDP 不需要显式 bind 源 IP，**UDP 打洞 socket 不要绑 activeNetwork**，
+    否则网络切换后旧网络失效会报 **ENETUNREACH**。
+
+#### 坑 4：bind 具体源 IP 会导致 EADDRNOTAVAIL
+- 现象：从 WiFi 网卡读到内网 IP 后 bind 它，再 connect 公网服务器，
+        报 **EADDRNOTAVAIL**。
+- 根因：校园网/企业网的内网 IP 无法直接路由到公网。
+- 修复：bind `0.0.0.0`，让内核按路由自动选源 IP。
+
+#### 坑 5：getLinkProperties 返回缓存的旧 DHCP 地址
+- 现象：WiFi 重连后 `ConnectivityManager.getLinkProperties().linkAddresses`
+        返回旧 IP，与 `NetworkInterface.getNetworkInterfaces()` 不一致。
+- 修复：获取 WiFi IP 时优先用 `NetworkInterface` 遍历 wlan* 网卡读
+        【当前】IPv4。
+
+### 11.2 打洞与文件传输坑
+
+#### 坑 6：房间模式 TCP 端口不监听
+- Android 的 SO_REUSEADDR 严格，监听 + 出站 + 映射观测不能共用 9998。
+- 必须用独立端口 9998（与局域网 9999 分离），且 **9998 只出不进**
+  （simultaneous open 不需要 listener）。
+
+#### 坑 7：映射观测连接必须从 9998 发起
+- 让服务器从 TCP accept 源地址得到 (公网IP, 9998) 作为对端打洞靶子。
+- 映射观测和打洞都 bind 9998，靠 SO_REUSEPORT 共存。
+
+#### 坑 8：UDP 打洞判定必须校验【来源地址】
+- 错误实现：收到任意包就当成功 → 误把本机自己的出口地址当成对端。
+- 正确做法：
+  - 单一【全局接收循环】(`udpGlobalRecvLoop`) 收所有 UDP 包
+  - 用 `holeTargets["ip:port"] = peerId` 登记正在打洞的目标
+  - 收到 `P2P_UDP_HOLE` 时，**仅当源地址匹配 holeTargets** 才判定成功
+  - RTP 数据按源地址查 `udpRtpHandlers["ip:port"]` 分发
+
+#### 坑 9：UDP-RTP 收发共用同一 ioLock
+- `UdpReliableSocket` 内部要有 `ioLock = Mutex()`，
+  接收循环 `handleReceiveOnSocket(rtp, rtp.ioLock, key)` 与发送方共用，
+  避免两个消费者争抢同一队列。
+
+#### 坑 10：发送前重置 soTimeout
+- 接收循环会周期性把 soTimeout 设为 500ms（检测无数据）；
+  发送方读 ACK 时若继承该超时，立即抛 SocketTimeoutException。
+- 修复：`sendSingleFileWithSocket` / `sendFolder` 开头
+  `socket.soTimeout = 0`。
+
+#### 坑 11：StreamSocket 抽象
+- 为让文件传输层同时支持 TCP Socket 和 UDP-RTP，
+  定义 `StreamSocket` 接口：
+  ```kotlin
+  interface StreamSocket {
+      val inputStream: InputStream
+      val outputStream: OutputStream
+      var soTimeout: Int
+      fun close()
+  }
+  ```
+- `TcpStreamSocket(socket: Socket)` 包装 TCP；
+  `UdpReliableSocket` 直接实现该接口。
+
+### 11.3 网络切换与生命周期坑
+
+#### 坑 12：网络变化回调会重置绑定
+- `registerDefaultNetworkCallback` 里的 `onAvailable` 会触发
+  `bindProcessToNetwork(WiFi)`，进而影响所有新创建的公网 socket。
+- 修复：每个公网 socket 创建时显式 `network.bindSocket(socket)`，
+  不依赖进程级绑定。
+
+#### 坑 13：前台服务是必须的
+- Android 8+ 后台网络会被杀；所有网络操作必须在 Foreground Service 中。
+- 通知渠道：TRANSFER_PROGRESS / RECEIVER_REQUEST / APP_STATUS。
+
+#### 坑 14：WiFi 唤醒锁 + 电池优化豁免
+- 传输期间持有 `WifiManager.WifiLock` 和 `PowerManager.PARTIAL_WAKE_LOCK`。
+- 请求用户忽略电池优化，避免 Doze 模式暂停网络。
+
+### 11.3.1 P2 优化实测暴露的新坑
+
+#### 坑 15：createIpv4Socket 实际创建了 IPv6 套接字（根因 bug）
+- 现象：日志 localSocket=::/:::9998（是 :: 不是 0.0.0.0）；
+        [映射] connect 服务器 3337 → Address not available（EADDRNOTAVAIL）；
+        [打洞] connect 对端 → 无路由（NoRouteToHost）。
+- 根因：代码依赖 java.net.preferIPv4Stack=true，但该属性在
+        Application.onCreate 设置时【晚于 InetAddress 初始化】（只读一次），
+        导致 Socket() 仍是 AF_INET6 双栈。
+        【一个 bug 同时导致映射观测失败（pub_tcp 恒空）+ 出站打洞"无路由"】。
+- 修复：createIpv4Socket() 改为【反射创建真 AF_INET】：
+    SocketChannel::class.java.getMethod("open", ProtocolFamily::class.java)
+    .invoke(null, StandardProtocolFamily.INET) as SocketChannel → .socket()
+  与 createIpv6Socket（用 INET6）严格对称。切勿依赖 preferIPv4Stack。
+
+#### 坑 16：协议版本协商只做一半 → 新端被判成 v1
+- 现象：两端都是新版，日志却是 peerVer=1，走 COMMIT(v1)。
+- 根因：只有 SYNC_REQ 带 ver，SYNC_ACK 不带 → initiator 永远学不到版本。
+- 修复：SYNC_ACK payload 尾部也带 1 字节 PROTO_VER；initiator 收 ACK 时读取。
+
+#### 坑 17：并发打洞任务把已成功的连接覆盖为 FAILED
+- 现象：一个任务报"已连接"，另一任务报"连接失败"覆盖成功状态，还误发 PUNCH_FAIL。
+- 根因：多个触发源（punchGo / TCP_READY / SYNC 回落）并发起打洞任务，
+        任务结尾【无条件】把 state 置 FAILED。
+- 修复：结尾加守卫——仅当当前【非 CONNECTED】才标失败、才发 PUNCH_FAIL。
+
+### 11.4 端到端验证（已成功）
+
+实测场景：
+- 手机：蜂窝网络（CGNAT，出口 14.24.194.211）
+- PC：校园网私有网（出口 183.6.127.232）
+- 结果：
+  - TCP 打洞成功（手机 connect 183.6.127.232:9998，PC connect
+    14.24.194.211:62351）
+  - UDP-RTP 通道同时建立
+  - 文件传输成功（244KB 图片，300+ KB/s，SHA-256 校验通过）
+
+P2 优化后验证（PROTO_VER=2）：
+- 日志出现 peer_ver=2 + 已发 COMMIT(v2) ... x3 + 对端 收到 COMMIT(v2)
+- 主导轮次 N / 跟随主导轮次 N 两端时刻一致
+- 追加 UDP 预测候选 ip:port±2 → pub_tcp 为空时靠预测端口打通
+- 连接成功后【不再】被其他任务覆盖为"连接失败"
+
+### 11.5 Android 端 UDP-RTP 关键方法清单
+
+`UdpReliableSocket` 必须实现（与 PC 端 udp_reliable.py 协议一致）：
+- `sendall(data: ByteArray)`        分片 + 序列号 + 累积 ACK
+- `recv(n: Int): ByteArray`           阻塞读（支持 soTimeout）
+- `recvExact(n: Int): ByteArray`      精确读 n 字节
+- `onPacket(data: ByteArray)`         由全局接收循环调用
+- `close()`                           发 FIN + 唤醒等待者
+- `override val inputStream`          供 ProtoReader 使用
+- `override val outputStream`         供 ProtoWriter 使用
+- `override var soTimeout`            超时（0 = 阻塞）
+- `val ioLock = Mutex()`              收发串行化
+- `val isUdpRtp = true`               供上层识别传输类型
+
+P2 优化新增方法（PROTO_VER=2）：
+- `startSync()`                         SYNC 采样 → 发 COMMIT 约定打洞时刻
+- `sendPunchRound(roundNo, tGoR)`       主导方下发下一轮打洞时刻（PUNCH_ROUND）
+- `sendTcpReady()` / `sendPunchFail()`   TCP 就绪信号 / 失败通知
+- `getSyncOffset() / getSyncRtt() / getPeerVer()`  查询
+- 回调字段（由 RoomManager 挂载）：
+  `onPunchRound(roundNo, tGoR)`、`onTcpReady()`、`onPunchFail()`
+
+### 11.6 P2 打洞优化机制（Android 端，须与 PC 端对称）
+
+**UDP-RTP 消息类型扩展（原 0~3 不变，新增 4~9）：**
+  4=SYNC_REQ  5=SYNC_ACK  6=SYNC_COMMIT  7=PUNCH_ROUND
+  8=TCP_READY  9=PUNCH_FAIL
+
+**#1 COMMIT 可靠化 + 版本协商**
+- SYNC_REQ payload = t1(8B) + PROTO_VER(1B)
+- SYNC_ACK payload = t1,t2,t3(各8B) + PROTO_VER(1B)，两端互学 peer_ver
+- COMMIT v2 = t_go_R(对端钟绝对毫秒) + commit_id，重传 3 次（幂等），
+  响应方按 commit_id 去重；peer_ver<2 时回退 v1（delta 单发）
+
+**#2 打洞轮次确定性对齐**
+- PUNCH_ROUND payload = round_no + t_go_R
+- myId < peerId 一方【主导】：下发下一轮绝对时刻（用 SYNC offset 换算对端钟）
+- myId > peerId 一方【跟随】：等待并 sleep 到该时刻；收不到则本地退避
+
+**#3 候选并行连接**
+- 所有候选（内网 + pubTcp + UDP 预测）同时 connect，谁先成功用谁
+- HolePuncher.connectCandidatesParallel：Barrier/原子标志选赢家
+
+**#4 UDP 端口预测 TCP 候选**
+- UDP 打洞成功记录对端 UDP 公网地址（setUdpHint）
+- pubTcp 为空时追加预测候选 port, port±1, port±2（仅 IPv4）
+
+**#6 TCP 映射就绪信号**
+- 映射观测建立成功 → markMappingReady → 广播 TCP_READY
+- 对端收到立即发起打洞（无需等 punch_go）
+- 新建 UDP 通道且映射已就绪时补发
+
+**#8 打洞失败即时通知**
+- 多轮彻底失败发 PUNCH_FAIL；对端收到标记 FAILED 回退 UDP
+- 【守卫】任务结束仅当 peer 当前【非 CONNECTED】才标失败并发 PUNCH_FAIL；
+  已被其他任务连接则静默退出（否则覆盖成功连接 + 误发）
+
+**#9 自适应连接超时**
+- SYNC 完成后 connect 超时 = clamp(SYNC_RTT × 4, 3s, 8s)
+
+**关键守卫（实测修复）：**
+- 保活循环取快照后连接可能被替换 → 仅当快照对象仍是【当前】连接才处理
+  （Kotlin: `connections[pid] === c`）
+- onInbound 覆盖旧连接前先 closeConn(c)，避免 fd 泄漏
+
+---
+
+### 11.7 梯度冗余多路径调度（Android 端，须与 PC 端对称）
+
+打洞成功后维护多条路径，按角色分级、按需保活、可换路续传。
+
+**路径角色**
+- 热备 hot：传数据；保活最积极
+- 保守暖备 warm_safe：不传；保活间隔硬性钳制 <= 协议安全上限，确保可立即接管
+- 宽松暖备 warm_loose：不传；保活贪心探测到极致，省电优先
+
+**保活：软性探测 + 硬性下限**
+    PROTO_FLOOR    = {tcp: 30, udp: 15}      秒（任何路径不得低于）
+    PROTO_SAFE_CAP = {tcp: 3600, udp: 60}    秒（保守暖备不得高于）
+    ROLE_FACTOR    = {hot: 1.0, warm_safe: 1.5, warm_loose: 4.0}
+- 成功则间隔指数增长；失败则二分收敛
+- 硬性下限兜底；保守暖备硬性钳制 <= PROTO_SAFE_CAP
+- 收敛判据：成功率 > 95% 才继续增长
+
+**热备断裂 -> 立即重建**
+1. 保守暖备上位为热备
+2. 宽松暖备验证后升级为保守暖备
+3. 后台立即重建补足宽松暖备
+4. 跨路径重传未确认部分
+
+**连接池跨传输复用 + 空闲降频**
+- 传输结束不关连接，下次直接复用
+- 空闲越久保活越稀疏：小于60s 乘1 / 小于10min 乘4 / 小于1h 乘16 / 更久 乘64
+- markActive() 在传输开始/结束时重置空闲计时
+
+**按角色选路发送**
+    fun getSendChannel(peerId: String, exclude: Set<Int> = emptySet()): SendChannel?
+    // 优先 hot -> warm_safe -> warm_loose -> 回退任意可用
+    // exclude：已失败对象（System.identityHashCode 比较）
+SendChannel 含：stream（StreamSocket）、ioLock（Mutex）、isUdp、role
+
+**跨路径换路续传**
+    suspend fun sendItemsOnSocket(
+        socket: StreamSocket, items: ..., targetKey: String, ioLock: Mutex,
+        onItemDone: ..., roomMgr: RoomManager? = null, peerId: String? = null
+    )
+    // 通道失败 -> 换另一条路径重发（MAX_SWITCH=3）
+    //   单文件：QUERY_OFFSET 协商从断点继续
+    //   文件夹：重新握手，接收端 skip/resume/full
+
+**打洞并发限制**
+- 同一 peer 最多 2 个 punchTask 并发（punchActive: HashMap<String,Int> 计数）
+- per-round 守卫：已连接则本任务退出
+- 结尾守卫：仅未连接时才标失败/发 PUNCH_FAIL
+
+**日志降噪**
+- HolePuncher.verbose 默认 false：逐候选失败/超时/尝试日志不输出
+- 成功与最终汇总日志始终输出
+
+### 11.8 实测暴露的额外坑（V16）
+
+#### 坑 18：文件夹换路时 .tmp 残留
+- 接收文件夹失败分支需同时清理 dest_path.with_suffix('.tmp')
+
+#### 坑 19：换路后旧通道被再次选中
+- getSendChannel 需加 exclude（已失败对象）+ 通道存活检查
+
+### 11.9 房间密码（V16.1 新增，信令协议 ver=2）
+
+- 不填密码 = 完全开放房间（与旧版一致）；填了 = 受保护房间（须密码匹配）。
+- 首位加入者决定房间性质；服务器存 sha256(room:pwd)，不回传明文。
+- join 新增可选 pwd 字段；joined 新增 room_open；
+  错误码 ROOM_OPEN / NEED_PASSWORD / BAD_PASSWORD。
+- 安卓端：SignalingClient(password=)、joinRoom(password=)、Compose 密码框、
+  lastRoomPassword 缓存（网络重建时重发）；退出清空。
+- 校验锁内原子完成（防并发创建 TOCTOU）；房间空了密码一并删除。
+- 收到拒绝错误时不再误报"无法连接信令服务器"，给准确提示。
 
 ## 复制终点
