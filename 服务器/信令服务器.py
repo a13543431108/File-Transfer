@@ -35,6 +35,7 @@ except Exception:
 #   2. 同目录下的 config.json（或 --config 指定的文件）
 #   3. 命令行参数（--port 等）
 DEFAULTS = {
+    "APP_VERSION": "17",       # 应用版本（与协议版本 VER 不同）
     "VER": 2,                  # 协议版本（2 = 支持房间密码）
     "LISTEN_IP": "0.0.0.0",    # 监听地址
     "LISTEN_PORT": 3336,       # UDP 信令端口
@@ -52,6 +53,7 @@ DEFAULTS = {
 }
 
 # 全局配置（由 load_config() 填充，单一来源）
+APP_VERSION = DEFAULTS["APP_VERSION"]
 VER = DEFAULTS["VER"]
 LISTEN_IP = DEFAULTS["LISTEN_IP"]
 LISTEN_PORT = DEFAULTS["LISTEN_PORT"]
@@ -867,7 +869,7 @@ def _print_startup_banner():
     否则启动瞬间客户端连不上服务器。
     """
     print("=" * 64)
-    print("信令服务器已启动")
+    print("信令服务器 V%s 已启动" % APP_VERSION)
     print("  监听: UDP %s:%d（信令）| UDP %s:%d（NAT探测）| TCP %s:%d（映射观测）"
           % (LISTEN_IP, LISTEN_PORT, LISTEN_IP, NAT_PROBE_PORT, LISTEN_IP, TCP_LISTEN_PORT))
     print("  （0.0.0.0 表示监听本机所有网卡，下面才是实际可用地址）")

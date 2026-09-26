@@ -35,6 +35,9 @@ android {
     }
     buildFeatures {
         compose = true
+        // 生成 BuildConfig，供代码用 BuildConfig.VERSION_NAME 读取版本
+        // （versionName 是单一来源，改 build.gradle.kts 即可全局生效）
+        buildConfig = true
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"

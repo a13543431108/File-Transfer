@@ -1125,7 +1125,7 @@ fun MainScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text("文件互传 V17", style = MaterialTheme.typography.titleMedium)
+                        Text("文件互传 V" + BuildConfig.VERSION_NAME, style = MaterialTheme.typography.titleMedium)
                         Text(
                             text = "设备名: " + deviceName + "   ·   保存到: " + saveDirDesc,
                             style = MaterialTheme.typography.labelSmall,

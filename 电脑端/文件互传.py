@@ -58,6 +58,9 @@ def _materialize_embedded_icon():
 # 仅当用户输入"房间号"并点击加入时才启用；不输入则维持原有局域网模式。
 # ================================================================================
 
+# ---------- 应用版本（单一来源，改这里全局生效） ----------
+APP_VERSION = "17"
+
 # ---------- 房间模块配置（单一来源，改这里全局生效） ----------
 RM_VER = 2                       # 协议版本（2 = 支持房间密码）
 # 消息类型：客户端 -> 服务器
@@ -2645,10 +2648,11 @@ BROADCAST_BURST_DURATION = 5    # 爆发广播持续秒数
 NODE_TIMEOUT = 600
 
 # 动态本地打洞端口（映射观测 + TCP打洞共用）。
-# 默认 9998。若 9998 被占用（Windows 上次会话 TIME_WAIT 未释放，报 10048），
-# 映射连接退化为随机端口；打洞 socket 必须用【同一端口】，才能与映射共享
-# 同一 NAT 映射（否则服务器记录的 pub_tcp 与实际打洞源端口不一致 → 打洞必败）。
-_DYNAMIC_PUNCH_PORT = [9998]
+# 默认 = RM_TCP_PORT（9995）。若被占用（Windows 上次会话 TIME_WAIT 未释放，
+# 报 10048），映射连接退化为随机端口并登记到全局；打洞 socket 必须用
+# 【同一端口】，才能与映射共享同一 NAT 映射（否则服务器记录的 pub_tcp
+# 与实际打洞源端口不一致 → 打洞必败）。
+_DYNAMIC_PUNCH_PORT = [RM_TCP_PORT]
 _DYN_PORT_LOCK = threading.Lock()
 
 def _get_dyn_punch_port():
@@ -5433,7 +5437,7 @@ class P2PApp:
                 self.root = tk.Tk()
         else:
             self.root = tk.Tk()
-        self.root.title("文件互传 V17-全网通")
+        self.root.title("文件互传 V%s-全网通" % APP_VERSION)
         self.root.geometry("1200x700")
         self.root.resizable(True, True)
 
