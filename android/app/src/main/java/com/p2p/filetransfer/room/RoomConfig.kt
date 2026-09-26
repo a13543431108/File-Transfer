@@ -26,6 +26,7 @@ object RoomConfig {
     const val T_NAT_PROBE_REPLY = "nat_probe_reply"  // 服务器 -> 客户端：观察到的公网地址
     const val T_MEMBER_JOIN = "member_join"
     const val T_MEMBER_LEAVE = "member_leave"
+    const val T_MEMBER_UPDATE = "member_update"   // 成员信息更新（如映射登记完成）
     const val T_PUNCH_GO = "punch_go"
     const val T_ERROR = "error"
 
@@ -53,6 +54,15 @@ object RoomConfig {
     const val PUNCH_STORM_DURATION_MS = 6000L
     // TCP 打洞握手确认超时（毫秒）
     const val PUNCH_HANDSHAKE_TIMEOUT_MS = 2000
+    // TCP_READY 收到后，等待 SYNC 协调的窗口（毫秒）。
+    // 有 UDP-RTP 时优先走 SYNC 精确对齐（同 tGo 同时打洞）；
+    // 超过此窗口 SYNC 仍未完成 → 回退到"直接打洞"。
+    // SYNC 理论耗时：4 次采样(~100ms) + COMMIT 延迟 500ms ≈ 700ms，取 1.5s 留余量。
+    const val TCP_READY_SYNC_WAIT_MS = 1500L
+    // SYNC 超时回退打洞时，收到 TCP_READY 后再等多久才发 SYN（毫秒）。
+    // 给对端足够时间也收到本端 TCP_READY 并进入等待，使两端发出时刻
+    // 误差 ≈ RTT/2，优于"立即打"的随机错开。
+    const val TCP_READY_FALLBACK_DELAY_MS = 300L
     // 握手魔数（两端一致）：区分"真通"与"半开连接"
     val PUNCH_HANDSHAKE_MAGIC = byteArrayOf(0x50, 0x32, 0x50, 0x48)  // "P2PH"
                                               // 每轮打洞 6 秒，间隔 1/2/3 秒

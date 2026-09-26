@@ -4,6 +4,7 @@ android/app/build/
 android/build/
 android/local.properties
 android/.idea/
+android/build_out.txt
 *.apk
 *.aab
 电脑端/__pycache__/
@@ -25,3 +26,14 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ===== 文档 / 分析产物（仅保留 README.md）=====
+*.docx
+*.md
+!README.md
+
+# ===== 根目录分析脚本 / 临时文件（非项目源码）=====
+/_tmp_dump.py
+/双端无公网打洞方案.py
+/梯度冗余多路径调度.py
+/打包命令.txt

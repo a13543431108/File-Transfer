@@ -1,5 +1,6 @@
 package com.p2p.filetransfer
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
@@ -8,8 +9,11 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import com.p2p.filetransfer.model.DeviceNode
 import com.p2p.filetransfer.model.IncomingRequest
@@ -67,6 +71,9 @@ class P2PFileTransferService : Service() {
 
     private lateinit var wifiLock: WifiManager.WifiLock
     private var wakeLock: PowerManager.WakeLock? = null
+    // WakeLock 定时续期：部分 ROM（华为/小米）会在后台静默撤销长时间持有的
+    // WakeLock。每 4 分钟检查一次，若已被撤销则重新 acquire（对抗冻结）。
+    private val wakeLockRenewHandler = Handler(Looper.getMainLooper())
     private val pendingConfirms = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
 
     private val prefs: SharedPreferences by lazy {
@@ -163,6 +170,63 @@ class P2PFileTransferService : Service() {
     }
 
     /**
+     * 每周清理：每个星期一之后第一次启动时，全量清理所有自生成文件。
+     *
+     * 判定：计算"当前所在周的周一日期"（yyyy-MM-dd）。若与 prefs 里记录的
+     * 上次清理周不同 → 执行全量清理 → 更新记录。这样"跨周后首次启动"必然
+     * 触发，同一周内不重复。
+     *
+     * 清理范围（一切自生成文件）：
+     *   · .p2p_resume/ —— 全部续传记录（单文件 + 文件夹，即"之前的续传任务"）
+     *   · Received/    —— 私有暂存目录全部（续传记录已清，保留无意义）
+     *   · logs/        —— 全部日志
+     * 不清理：已发布到公共目录/用户 SAF 目录的文件（非"自生成缓存"）。
+     */
+    private fun weeklyCleanupIfNeeded() {
+        try {
+            val now = System.currentTimeMillis()
+            val cal = java.util.Calendar.getInstance()
+            cal.timeInMillis = now
+            // 回退到本周一（Calendar.MONDAY=2，SUNDAY=1）
+            while (cal.get(java.util.Calendar.DAY_OF_WEEK) != java.util.Calendar.MONDAY) {
+                cal.add(java.util.Calendar.DAY_OF_MONTH, -1)
+            }
+            val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+            val thisMonday = fmt.format(cal.time)
+            val lastMonday = prefs.getString(KEY_LAST_WEEKLY_CLEANUP, null)
+            if (thisMonday == lastMonday) return   // 本周已清理过
+            // 执行全量清理
+            var total = 0
+            total += resumeRepo.clearAll()
+            // 暂存目录：全删（含中断续传文件——续传记录已清，保留无意义）
+            try {
+                val dir = File(getExternalFilesDir(null) ?: filesDir, "Received")
+                if (dir.exists()) {
+                    dir.listFiles()?.forEach { f ->
+                        try {
+                            val ok = if (f.isDirectory) f.deleteRecursively() else f.delete()
+                            if (ok) total++
+                        } catch (_: Exception) {}
+                    }
+                }
+            } catch (_: Exception) {}
+            // 日志：全删
+            try {
+                val logDir = File(filesDir, "logs")
+                if (logDir.exists()) {
+                    logDir.listFiles()?.forEach { f ->
+                        try { if (f.isFile && f.delete()) total++ } catch (_: Exception) {}
+                    }
+                }
+            } catch (_: Exception) {}
+            prefs.edit().putString(KEY_LAST_WEEKLY_CLEANUP, thisMonday).apply()
+            emitLog("[清理] 每周清理完成（" + thisMonday + "），删除 " + total + " 项自生成文件")
+        } catch (e: Exception) {
+            emitLog("[清理] 每周清理异常: " + e.message)
+        }
+    }
+
+    /**
      * 清空私有暂存目录（getExternalFilesDir/Received/）。
      *
      * 该目录只是"发布到公共目录前的中转站"（接收时先落这里，校验后再
@@ -230,8 +294,12 @@ class P2PFileTransferService : Service() {
         deviceRepo = DeviceRepository()
         resumeRepo = ResumeRepository(this)
 
-        // 启动时清理自身生成的过期文件（续传 JSON 30 天 / 日志 7 天）
+        // 启动时清理自身生成的过期文件
         serviceScope.launch(Dispatchers.IO) {
+            // 1) 每周清理：跨周后首次启动 → 全量清理（含续传任务）。
+            //    若本周已清理，weeklyCleanupIfNeeded 内部直接返回，不影响后续。
+            weeklyCleanupIfNeeded()
+            // 2) 常规过期清理（续传 JSON 30 天 / 日志 7 天）
             try {
                 val n = resumeRepo.cleanupExpired(30)
                 if (n > 0) emitLog("[清理] 删除 " + n + " 个过期续传记录（>30天）")
@@ -239,7 +307,7 @@ class P2PFileTransferService : Service() {
             try {
                 cleanupLogs(7)
             } catch (_: Exception) {}
-            // 智能清理私有暂存目录（发布前中转站）：
+            // 3) 智能清理私有暂存目录（发布前中转站）：
             // 删除已完成的残留副本，保留中断中的续传文件，防止爆满又不误删。
             cleanupStagingDir()
         }
@@ -325,6 +393,27 @@ class P2PFileTransferService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return START_STICKY
+    }
+
+    /**
+     * 用户从最近任务划掉 App 时触发（配合 android:stopWithTask="false"）。
+     * 部分 ROM 划卡会强杀前台服务，这里用 AlarmManager 1 秒后重启自己，
+     * 尽量维持后台存活（华为需用户手动在"启动管理"允许后台活动才生效）。
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        try {
+            val restart = Intent(applicationContext, P2PFileTransferService::class.java)
+            val pi = PendingIntent.getService(
+                this, 1, restart,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_ONE_SHOT
+            )
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            am.set(
+                AlarmManager.ELAPSED_REALTIME,
+                SystemClock.elapsedRealtime() + 1000, pi
+            )
+        } catch (_: Exception) {}
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
@@ -450,6 +539,9 @@ class P2PFileTransferService : Service() {
                 val tcpPort = Constants.ROOM_TCP_PORT
 
                 val mgr = RoomManager(tcpPort, serviceScope, ::emitLog)
+                // C/S 打洞降级：房间端口未成功监听时，本端不再按 ID 分角色，
+                // 一律主动 connect（回退"同时打开"），避免干等不存在的 LISTEN。
+                mgr.roomPortBoundChecker = { tcp.isRoomPortBound() }
                 mgr.onSocketReady = { peerId, sock, member ->
                     emitLog("[房间] 长连接就绪 " + member.name + "，启动接收循环")
                     val conn = mgr.getConn(peerId)
@@ -918,9 +1010,27 @@ class P2PFileTransferService : Service() {
             wakeLock?.setReferenceCounted(false)
             wakeLock?.acquire()
         } catch (_: Exception) {}
+        // 启动 WakeLock 定时续期
+        wakeLockRenewHandler.removeCallbacksAndMessages(null)
+        wakeLockRenewHandler.postDelayed(wakeLockRenewRunnable, WAKE_LOCK_RENEW_MS)
+    }
+
+    private val wakeLockRenewRunnable = object : Runnable {
+        override fun run() {
+            try {
+                val wl = wakeLock
+                if (wl != null && !wl.isHeld) {
+                    wl.acquire()
+                }
+                // Wi-Fi Lock 同样可能被撤销，一并续期
+                try { if (!wifiLock.isHeld) wifiLock.acquire() } catch (_: Exception) {}
+            } catch (_: Exception) {}
+            wakeLockRenewHandler.postDelayed(this, WAKE_LOCK_RENEW_MS)
+        }
     }
 
     private fun releaseLocks() {
+        wakeLockRenewHandler.removeCallbacksAndMessages(null)
         try { wifiLock.release() } catch (_: Exception) {}
         try { wakeLock?.release() } catch (_: Exception) {}
     }
@@ -943,6 +1053,8 @@ class P2PFileTransferService : Service() {
 
     companion object {
         private const val NOTIFICATION_ID = 1001
+        // WakeLock 续期间隔（毫秒）：4 分钟
+        private const val WAKE_LOCK_RENEW_MS = 4 * 60 * 1000L
 
         @Volatile
         var instance: P2PFileTransferService? = null
@@ -1009,6 +1121,7 @@ class P2PFileTransferService : Service() {
         private const val KEY_DEVICE_NAME = "device_name"
         private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_SERVER_HISTORY = "server_history"
+        private const val KEY_LAST_WEEKLY_CLEANUP = "last_weekly_cleanup_monday"
     /** 首次使用（无历史）时预填的参考服务器地址。 */
     const val DEFAULT_ROOM_SERVER = "42.194.133.132"
 

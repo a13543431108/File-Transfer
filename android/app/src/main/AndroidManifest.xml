@@ -114,7 +114,8 @@
             android:name=".P2PFileTransferService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false" />
 
         <!-- 日志导出分享需要 FileProvider（把私有目录文件暴露给分享目标） -->
         <provider

@@ -28,6 +28,11 @@ _TYPE_PUNCH_ROUND = 7 # P2: 打洞轮次对齐（主导方约定下一轮时刻�
 _TYPE_TCP_READY = 8   # P2: TCP 映射已就绪信号（#6）
 _TYPE_PUNCH_FAIL = 9  # P2: 打洞彻底失败通知（#8）
 
+# 单包最大载荷（字节）。1200 为保守安全值：
+# 1200+12头+8UDP+20IP=1240，远低于任何常见 MTU（含蜂窝 1400/1428），
+# 绝不触发 IP 分片。曾试 1400（=1440 字节 IP 包），在蜂窝链路（MTU
+# 常 ≤1400）触发分片 → 单包丢一片即整包丢失 → 吞吐暴跌（实测
+# 2.5MB/s → 0.9MB/s），故回退 1200。
 MAX_PAYLOAD = 1200
 WINDOW = 64                    # 兼容名（初始值）
 # 自适应窗口（AIMD）：发送端根据 ACK / 丢包动态调在途包数。
@@ -37,7 +42,11 @@ WINDOW = 64                    # 兼容名（初始值）
 WINDOW_MIN = 1
 WINDOW_MAX = 256
 WINDOW_INIT = 64
-RTO_MS = 300
+# RTO 下限/上限（毫秒）：RTO 随实测 RTT 自适应（RTO = 4×RTT，夹在此范围）。
+# 原固定 300ms 在低 RTT 链路（如公网 22ms）下重传太慢，收紧可加快丢包恢复。
+# RTO 下限：即使 RTT 很小也不低于此值，避免延迟抖动误判丢包。
+RTO_MIN_MS = 250
+RTO_MAX_MS = 1000
 RTX_INTERVAL = 0.05
 KEEPALIVE_INTERVAL = 15.0      # 空闲超过该秒数 → 发一个 KEEPALIVE
 PEER_DEAD_TIMEOUT = 90.0       # 超过该秒数没收到对端任何包 → 判定失联
@@ -81,6 +90,9 @@ class UdpReliableSocket:
         self._on_punch_fail = on_punch_fail
         self._sync_offset = None          # P2: 最近一次 SYNC offset（responder钟-本机钟）
         self._sync_rtt = None             # P2 #9: 最近一次 SYNC 最小 RTT（毫秒）
+        # RTO（重传超时，毫秒）：随实测 RTT 自适应（RTO = 4×RTT，
+        # 夹在 [RTO_MIN_MS, RTO_MAX_MS]）。初始 300ms。SYNC 测得 RTT 后收紧。
+        self._rto_ms = 300
         self._peer_ver = 1                # P2: 对端协议版本（默认 1）
         self._commit_seq = 0              # P2: COMMIT 自增轮次号
         self._last_commit_id = -1         # P2: 已处理的 commit_id（去重）
@@ -104,6 +116,12 @@ class UdpReliableSocket:
         self._last_send_time = time.time()
         self._last_recv_time = time.time()
         self._peer_dead_fired = False
+        # 心跳 RTT 探测（本地计时，零协议变更）：
+        # 发 KEEPALIVE 时记下时刻，收到对应 ACK 时算 RTT。
+        # 仅空闲时发 KEEPALIVE（传输中 _last_send_time 不断更新，不触发），
+        # 故收到 ACK 时若无心跳在途则忽略，不会污染数据 ACK 统计。
+        self._ka_sent_at = 0.0
+        self._last_rtt_ms = -1   # -1 表示暂无数据
         # P1：SYNC 状态
         self._sync_lock = threading.Lock()
         self._sync_in_progress = False   # 防止重复发起
@@ -220,6 +238,31 @@ class UdpReliableSocket:
             self.log("[打洞] 发送 PUNCH_FAIL 失败: %s" % e)
             return False
 
+    def warm_up_nat(self, count=5, interval_ms=20):
+        """打洞前 NAT 预热：连发几个 KEEPALIVE，让本端 NAT conntrack 处于热态。
+
+        原理：很多家用 NAT / CGNAT 对"刚建立或即将超时的 TCP 映射"会丢 SYN，
+        导致同时打开的 SYN 被丢弃。发送期间保持 UDP 通道活跃，可让本端 NAT
+        相关映射槽保持活跃，紧接的 SYN 更易被转发。
+
+        复用现有 _TYPE_KEEPALIVE（对端回 ACK），零协议变更。
+        阻塞执行（count×interval_ms，默认约 100ms），由调用方在后台线程执行。
+        """
+        for i in range(count):
+            if self._closed:
+                return
+            try:
+                self._send_fn(self.peer,
+                              _PKT.pack(_TYPE_KEEPALIVE, 0, self._recv_next, 0, 0))
+                self._last_send_time = time.time()
+            except Exception:
+                pass
+            if i < count - 1:
+                try:
+                    time.sleep(interval_ms / 1000.0)
+                except Exception:
+                    return
+
     def get_sync_offset(self):
         """P2: 返回最近一次 SYNC offset（responder钟-本机钟），无则 None。"""
         return self._sync_offset
@@ -227,6 +270,10 @@ class UdpReliableSocket:
     def get_sync_rtt(self):
         """P2 #9: 返回最近一次 SYNC 最小 RTT（毫秒），无则 None。"""
         return self._sync_rtt
+
+    def get_last_rtt_ms(self):
+        """心跳 RTT 探测：返回最近一次心跳往返时延（毫秒），-1 表示暂无数据。"""
+        return self._last_rtt_ms
 
     def get_peer_ver(self):
         """P2: 返回对端协议版本（默认 1）。"""
@@ -283,6 +330,9 @@ class UdpReliableSocket:
             best_rtt, best_offset = min(self._sync_samples, key=lambda s: s[0])
             self._sync_offset = best_offset
             self._sync_rtt = best_rtt
+            # RTO 固定 300ms（回退自适应：曾改为 4×RTT 下限250ms，但在
+            # 移动网络抖动下过于激进，误判丢包导致重传风暴、窗口反复减半）。
+            self._rto_ms = 300
             self.log("[SYNC] 最佳：RTT=%dms offset=%dms（共 %d 次采样，peer_ver=%d）"
                      % (best_rtt, best_offset, len(self._sync_samples), self._peer_ver))
 
@@ -388,6 +438,18 @@ class UdpReliableSocket:
                 self._last_send_time = time.time()
             except Exception:
                 pass
+            return
+
+        if ptype == _TYPE_ACK:
+            # 心跳 RTT 探测：若正在等待 keepalive 回复，计算往返时延。
+            # 仅在 _ka_sent_at > 0（刚发过心跳）时计算，避免把数据 ACK
+            # 误当心跳回复（传输中不发心跳，故不会误判）。
+            sent_at = self._ka_sent_at
+            if sent_at > 0:
+                self._ka_sent_at = 0.0
+                self._last_rtt_ms = int((time.time() - sent_at) * 1000)
+                self.log("[UDP-RTP] 心跳 RTT = %d ms（peer=%s）"
+                         % (self._last_rtt_ms, self.peer))
             return
 
         # ===== P1: SYNC 消息处理 =====
@@ -522,7 +584,7 @@ class UdpReliableSocket:
             now = time.time()
             with self._send_lock:
                 to_resend = [(s, q[0]) for s, q in self._send_queue.items()
-                             if now - q[1] > RTO_MS / 1000.0]
+                             if now - q[1] > self._rto_ms / 1000.0]
             if to_resend:
                 # AIMD 乘性减：出现超时重传（疑似丢包/拥塞）→ 窗口减半
                 with self._send_lock:
@@ -555,11 +617,12 @@ class UdpReliableSocket:
                 if self._closed:
                     break
                 try:
+                    self._ka_sent_at = time.time()   # RTT 计时起点
                     pkt = _PKT.pack(_TYPE_KEEPALIVE, 0, self._recv_next, 0, 0)
                     self._send_fn(self.peer, pkt)
                     self._last_send_time = now
                 except Exception:
-                    pass
+                    self._ka_sent_at = 0.0
             # 2) 对端失联检测（只触发一次）
             if (not self._peer_dead_fired
                     and now - self._last_recv_time > PEER_DEAD_TIMEOUT):

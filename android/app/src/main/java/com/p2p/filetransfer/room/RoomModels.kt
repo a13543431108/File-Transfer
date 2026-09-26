@@ -12,7 +12,10 @@ data class RoomMember(
     val tcp: Int,          // 对方 TCP 监听端口
     // 服务器观测的 TCP/UDP 端口分配偏移（TCP端口 - UDP端口，同一目标 IP）。
     // 供 pub_tcp 为空时修正 UDP 端口预测基准；缺省 null 时退化为 ±2 盲猜。
-    val tcpUdpOffset: Int? = null
+    val tcpUdpOffset: Int? = null,
+    // 对端能否"监听+映射同端口"（Windows=true，Android=false）。
+    // 用于决定 C/S 打洞角色：能 listen 的一方 listen，另一方 connect。
+    val canListen: Boolean = true
 )
 
 /** 打洞协调事件：与某成员同时打洞。 */

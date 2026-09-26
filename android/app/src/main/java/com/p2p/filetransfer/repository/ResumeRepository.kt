@@ -148,6 +148,17 @@ class ResumeRepository(context: Context) {
         return out
     }
 
+    /** 全量清空所有续传记录（每周清理用）。返回删除文件数。 */
+    fun clearAll(): Int {
+        var n = 0
+        resumeDir.listFiles()?.forEach { f ->
+            try {
+                if (f.isFile && f.delete()) n++
+            } catch (_: Exception) {}
+        }
+        return n
+    }
+
     /** 清理超过指定天数的续传记录（自清生成文件）。 */
     fun cleanupExpired(retentionDays: Int): Int {
         val cutoff = System.currentTimeMillis() - retentionDays.toLong() * 86400_000L

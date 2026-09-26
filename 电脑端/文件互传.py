@@ -74,6 +74,7 @@ RM_T_JOINED = "joined"
 RM_T_NAT_PROBE_REPLY = "nat_probe_reply"  # 服务器 -> 客户端：观察到的公网地址
 RM_T_MEMBER_JOIN = "member_join"
 RM_T_MEMBER_LEAVE = "member_leave"
+RM_T_MEMBER_UPDATE = "member_update"   # 成员信息更新（如映射登记完成）
 RM_T_PUNCH_GO = "punch_go"
 RM_T_ERROR = "error"
 # 信令连接
@@ -101,6 +102,15 @@ RM_PUNCH_STORM_DURATION = 6.0       # 每轮"重连风暴"持续时长（秒）
                                     # 在此窗口内不停地做并行 connect 轮次，
                                     # 直到成功（含握手确认）或超时。
 RM_PUNCH_HANDSHAKE_TIMEOUT = 2.0    # TCP 打洞握手确认超时（秒）
+# TCP_READY 收到后，等待 SYNC 协调的窗口（秒）。
+# 有 UDP-RTP 时优先走 SYNC 精确对齐（同 tGo 同时打洞）；
+# 超过此窗口 SYNC 仍未完成 → 回退到"直接打洞"。
+# SYNC 理论耗时：4 次采样(~0.1s) + COMMIT 延迟 0.5s ≈ 0.7s，取 1.5s 留余量。
+RM_TCP_READY_SYNC_WAIT = 1.5
+# SYNC 超时回退打洞时，收到 TCP_READY 后再等多久才发 SYN（秒）。
+# 给对端足够时间也收到本端 TCP_READY 并进入等待，使两端发出时刻
+# 误差 ≈ RTT/2，优于"立即打"的随机错开。
+RM_TCP_READY_FALLBACK_DELAY = 0.3
 RM_PUNCH_HANDSHAKE_MAGIC = b"P2PH"  # 握手魔数（两端一致，4 字节）
                                     # 作用：区分"真通"与"半开连接"。
                                     # connect 成功仅代表本端三次握手完成，
@@ -112,11 +122,23 @@ RM_NAT_KEEPALIVE_INTERVAL = 15      # 维持 NAT 映射的间隔（秒）
 # B：保活健壮性 —— 新建连接宽限期内不判死；连续失败 N 次才判死（抗抖动）
 RM_TCP_KEEPALIVE_GRACE = 10.0        # 新建 TCP 连接宽限期（秒）
 RM_TCP_KEEPALIVE_FAIL_THRESHOLD = 2  # 连续探测失败次数阈值
+# TCP 心跳 RTT 探测：仅在空闲时才发（避免干扰传输），间隔与 UDP-RTP 一致。
+RM_TCP_PING_IDLE = 5.0                # 空闲超过 5 秒才算"可探测"
+RM_TCP_PING_INTERVAL = 15.0           # PING 间隔（与 UDP-RTP 心跳一致）
+# 「等待精准打洞」门闩超时（秒）：UDP-RTP 就绪后若此时间内未等到
+# SYNC 结果（COMMIT / 精准打洞完成），自动放行兜底风暴，避免永久阻塞。
+# 门闩有效期：必须覆盖"UDP-RTP就绪 → SYNC采样 → COMMIT → 到点打洞"全程。
+# 实测 SYNC 全程约 1~2 秒；取 6 秒留足余量。过短会导致门闩在 SYNC 完成前
+# 失效，responder 的 _punch_task 抢先打洞，两端用不同打洞任务 →
+# 一端成功一端失败（方向固定的"不一致"半开）。
+RM_SYNC_AWAIT_TIMEOUT = 6.0
 # 房间模式专用 TCP 端口
 # 必须与局域网 TCP_PORT(9999) 分离：Android 的 SO_REUSEADDR 比 Windows 严格，
 # 若映射观测连接与文件接收监听绑同一端口会 EADDRINUSE，导致无法登记公网映射、
 # pub_tcp 为空、打洞必然失败。
-RM_TCP_PORT = 9998
+# 房间模式 TCP 端口：映射观测 + 打洞共用（须与映射端口一致）。
+# 从 9998 改到 9995：实测 9998 在部分环境被占用/冲突，换到空闲的 9995。
+RM_TCP_PORT = 9995
 # 房间模式专用 UDP 打洞端口（与局域网发现端口 UDP 9998 冲突，独立为 9996）
 RM_UDP_PORT = 9996
 RM_UDP_PROBE_INTERVAL = 0.1         # 探测发送间隔（秒）
@@ -366,22 +388,81 @@ class RmHolePuncher:
             round_no += 1
             result = self._connect_candidates_parallel(candidates, peer_id)
             if result:
-                # 软握手确认：握手成功→标记已验证；失败→仍返回（降级信任）。
-                # 关键：不再因握手失败而废弃连接。SO_REUSEPORT 干扰下握手往返
-                # 常误失败，若据此关闭会把【本可用的连接】误杀，反而降低成功率。
-                # 是否正确由"实际发数据"来验证（发送失败会自动换路/重建）。
+                # 强制应用层握手确认：双方各发魔数、各读魔数。
+                # 【只有握手成功才认这条连接】——握手失败=半开/单向（connect
+                # 成功仅证明本端三次握手完成，不代表双向可达），必须丢弃重试，
+                # 否则会把半开连接当可用通道，发数据石沉大海。
+                # （曾"降级信任"半开连接，导致电脑自认成功、手机认为失败、
+                #   互传失败——已废止。）
                 if rm_punch_handshake(result.sock, RM_PUNCH_HANDSHAKE_TIMEOUT):
                     self.log("[打洞] 成功（握手确认）-> %s:%d (peer=%s, 第%d轮)"
                              % (result.ip, result.port, peer_id, round_no))
+                    return result
                 else:
-                    self.log("[打洞] 连接成功（握手无回应，降级信任）-> %s:%d (peer=%s, 第%d轮)"
+                    self.log("[打洞] 握手无回应（半开），丢弃重试 -> %s:%d (peer=%s, 第%d轮)"
                              % (result.ip, result.port, peer_id, round_no))
-                return result
+                    try: result.sock.close()
+                    except Exception: pass
+                    # 继续循环（下一轮重试）
             # 轮间短暂停顿，避免 CPU 空转与端口耗尽
             time.sleep(0.1)
         if self.verbose:
             self.log("[打洞] 风暴结束未成功 peer=%s（%d 轮）" % (peer_id, round_no))
         return None
+
+    def punch_once(self, peer, at_ms):
+        """精准打洞（TCP 同时打开的"精确"版）：
+
+        在 at_ms 时刻，只向候选地址发【一轮】并行 SYN，然后等结果。
+        不跑 6 秒风暴——风暴把多个 SYN 分散到不同时刻/端口，SO_REUSEPORT
+        还会把入站 SYN 分错 socket，反而降低"两端 SYN 精确交叉"的概率。
+
+        一轮失败 → 返回 None，调用方回退到 punch()（6 秒风暴）兜底。
+        """
+        peer_id = peer.get("id")
+        tcp_port = peer.get("tcp") or 0
+        if not tcp_port:
+            self.log("[打洞] punch_once 放弃：对方 tcp 端口为 0 (peer=%s)" % peer_id)
+            return None
+        candidates = self._build_candidates(peer)
+        if not candidates:
+            self.log("[打洞] punch_once 放弃：候选地址为空 (peer=%s)" % peer_id)
+            return None
+        if self.verbose:
+            self.log("[打洞] punch_once peer=%s 候选=%s"
+                     % (peer_id,
+                        ", ".join("%s:%d" % (ip, p) for ip, p in candidates)))
+        if at_ms:
+            self._wait_until(at_ms)
+
+        # 单轮打洞：T_go 时做一次（多候选并行）connect。
+        #
+        # 为什么单轮：TCP 同时打开只要两端 SYN 交叉即成；若某次没交叉，
+        # 【内核会自动重传 SYN】（约 1s/3s/7s…），覆盖数秒窗口，无需手动多轮。
+        # 手动多轮反而有害：
+        #   · 并发多轮 → 多 socket 同 bind(9998) 连同一目标，四元组冲突，
+        #     SYN,ACK 分错 socket（曾致"TCP 成功但应用层误判失败"）；
+        #   · 串行多轮 → 每轮 connect 阻塞数秒，轮间隔被撑大，错过窗口。
+        # 故回到单轮，让内核重传兜底。
+        self.log("[打洞] punch_once（T_go 单轮，候选=%d）" % len(candidates))
+        try:
+            result = self._connect_candidates_parallel(candidates, peer_id)
+        except Exception as e:
+            self.log("[打洞] punch_once 异常: %s" % e)
+            result = None
+        if not result:
+            return None
+        # 强制握手确认：失败=半开，丢弃返回 None（由上层回退风暴重试）。
+        if rm_punch_handshake(result.sock, RM_PUNCH_HANDSHAKE_TIMEOUT):
+            self.log("[打洞] 精准成功（握手确认）-> %s:%d (peer=%s)"
+                     % (result.ip, result.port, peer_id))
+            return result
+        else:
+            self.log("[打洞] 精准握手无回应（半开），丢弃 -> %s:%d (peer=%s)"
+                     % (result.ip, result.port, peer_id))
+            try: result.sock.close()
+            except Exception: pass
+            return None
 
     def _connect_candidates_parallel(self, candidates, peer_id):
         """P2 #3: 并行尝试所有候选地址，返回首个成功的 RmPunchResult。"""
@@ -504,14 +585,18 @@ class RmHolePuncher:
             sock = socket.socket(family, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
+                # 用【动态端口】（= 映射观测连接的实际本地端口），而非缓存的
+                # self.local_tcp_port。二者必须一致才能与映射共享同一 NAT 映射。
+                # 映射端口被占用时会退化为随机端口并登记到全局，此处读回。
+                _bindp = _get_dyn_punch_port() or self.local_tcp_port
                 if family == socket.AF_INET6:
-                    sock.bind(("::", self.local_tcp_port))
+                    sock.bind(("::", _bindp))
                 else:
-                    sock.bind(("", self.local_tcp_port))
+                    sock.bind(("", _bindp))
                 bind_ok = True
             except Exception as be:
                 self.log("[打洞] bind %d 失败: %s（继续，走内核随机端口）"
-                         % (self.local_tcp_port, be))
+                         % (_get_dyn_punch_port(), be))
             # 非阻塞 connect
             sock.setblocking(False)
             t0 = time.time()
@@ -662,7 +747,10 @@ class RmSignalingClient:
         if self.my_id:
             # 先做时间同步（NTP 式），再建映射、开 UDP 打洞 socket、开始打洞
             self._sync_time()
-            self._open_mapping()
+            # 映射建立放到后台线程【持续重试】：映射是打洞靶子，失败/慢会让
+            # 对端一直收不到 pub_tcp。不能阻塞 start()，否则 recv_thread 不启动、
+            # 收不到后续 punch_go / member_update。
+            threading.Thread(target=self._open_mapping, daemon=True).start()
             self._open_udp_hole_socket()
             time.sleep(0.2)
         if self.on_joined:
@@ -698,6 +786,24 @@ class RmSignalingClient:
                 self.log("[NAT探测] 提示：本机为锥形 NAT，打洞可行性较高。")
         except Exception as e:
             self.log("[NAT探测] 异常: %s" % e)
+
+    def release_map_socket(self):
+        """时序独占打洞：释放映射观测 socket。
+
+        打洞要求本地端口上【只有一个 socket】，否则入站 SYN 可能被映射
+        socket（ESTABLISHED）抢走而丢弃（Windows 实测）。映射 socket 已完成
+        登记 pub_tcp 的使命，可安全关闭：锥形 NAT 下同一本地端口的 TCP 映射
+        保留数分钟，服务器也配置了延迟清理（180s），pub_tcp 仍有效。
+        """
+        s = self.map_sock
+        if s is None:
+            return
+        try:
+            s.close()
+        except Exception:
+            pass
+        self.map_sock = None
+        self.log("[信令] 映射 socket 已关闭（释放本地端口给打洞独占）")
 
     def stop(self, quiet=False):
         """停止信令客户端。
@@ -891,6 +997,7 @@ class RmSignalingClient:
             "type": RM_T_JOIN, "ver": RM_VER, "room": self.room,
             "name": self.name, "tcp": self.tcp_port, "lan": self.lan_ips,
             "did": self.device_id,
+            "can_listen": True,   # Windows 能 listen+映射同端口
         }
         # 网络重建时携带旧 id，服务器复用之（协议向后兼容：旧服务器忽略该字段）
         if self.reuse_id:
@@ -974,19 +1081,51 @@ class RmSignalingClient:
 
     def _open_mapping(self):
         fam = socket.AF_INET6 if ":" in self.server_ip else socket.AF_INET
-        for attempt in range(1, 4):
+        # 先释放上一次会话残留的映射 socket：Windows 上 SO_REUSEADDR 语义较严，
+        # 若旧 socket 未关就重绑 9998，易报 WinError 10048（端口占用）。
+        if self.map_sock is not None:
+            try:
+                self.map_sock.close()
+            except Exception:
+                pass
+            self.map_sock = None
+        # 优先用固定端口（默认 9995）；若被占用（Windows TIME_WAIT 未释放，
+        # 报 10048），退化为随机端口——但【必须】把随机端口登记到全局，
+        # 让 TCP 打洞 socket 用同一端口 bind，才能共享同一 NAT 映射。
+        want_port = self.punch_local_port or 0
+        bind_port = want_port
+        attempt = 0
+        # 持续重试：映射是打洞靶子，失败/慢会让对端一直收不到 pub_tcp。
+        # 只要信令还在运行就不断重试（间隔递增，上限 3s），直到成功。
+        while self._running:
+            attempt += 1
             s = None
             try:
                 s = socket.socket(fam, socket.SOCK_STREAM)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if self.punch_local_port:
-                    bind_addr = ("::", self.punch_local_port) if fam == socket.AF_INET6 else ("", self.punch_local_port)
-                    s.bind(bind_addr)
+                # SO_LINGER(onoff=1, linger=0)：close() 时发 RST 而非正常四次挥手，
+                # 【跳过 TIME_WAIT】——根治"反复进出房间导致端口被自己上次连接
+                # 的 TIME_WAIT 占用（WinError 10048）"。映射连接只发过一次注册 id，
+                # 无待传业务数据，RST 不丢东西，对服务器也无害。
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                 struct.pack("ii", 1, 0))
+                except Exception:
+                    pass
+                bind_addr = ("::", bind_port) if fam == socket.AF_INET6 else ("", bind_port)
+                s.bind(bind_addr)
+                actual_port = s.getsockname()[1]
                 s.connect((self.server_ip, self.server_tcp_port))
                 mid = self.my_id.encode("utf-8")
                 s.sendall(struct.pack("!H", len(mid)) + mid)
                 self.map_sock = s
-                self.log("[信令] TCP 映射观测连接已建立（本地端口=%s）" % s.getsockname()[1])
+                # 登记实际端口（打洞 socket 须用同一端口）
+                _set_dyn_punch_port(actual_port)
+                if actual_port != want_port:
+                    self.log("[信令] TCP 映射观测连接已建立（本地端口=%s，原 %s 被占用，改用随机端口）"
+                             % (actual_port, want_port))
+                else:
+                    self.log("[信令] TCP 映射观测连接已建立（本地端口=%s）" % actual_port)
                 # P2 #6: 通知上层 TCP 映射已就绪，可广播 TCP_READY
                 if self.on_mapping_ready:
                     try:
@@ -998,10 +1137,18 @@ class RmSignalingClient:
                 if s:
                     try: s.close()
                     except Exception: pass
-                if attempt < 3:
-                    time.sleep(0.5)
+                # 固定端口被占用 → 退化为随机端口（一次性），继续重试
+                if want_port and _is_addr_in_use(e):
+                    self.log("[信令] 本地端口 %s 被占用（%s），退化为随机端口"
+                             % (want_port, e))
+                    bind_port = 0
+                    want_port = 0
                     continue
-                self.log("[信令] TCP 映射观测连接失败: %s" % e)
+                # 其它错误：退避后持续重试（间隔递增，上限 3s）
+                backoff = min(0.5 * attempt, 3.0)
+                self.log("[信令] TCP 映射观测连接失败（第 %d 次，%.1fs 后重试）: %s"
+                         % (attempt, backoff, e))
+                time.sleep(backoff)
 
     def _wait_joined(self):
         deadline = time.time() + 10
@@ -1050,6 +1197,11 @@ class RmSignalingClient:
             if t == RM_T_MEMBER_JOIN:
                 if self.on_member_join:
                     self.on_member_join(msg.get("member", {}))
+            elif t == RM_T_MEMBER_UPDATE:
+                # 成员信息更新（如对端 TCP 映射登记完成）：走 on_member_join
+                # 路径（_add_member 更新信息 + 触发打洞），拿到刚登记的 pub_tcp。
+                if self.on_member_join:
+                    self.on_member_join(msg.get("member", {}))
             elif t == RM_T_MEMBER_LEAVE:
                 if self.on_member_leave:
                     self.on_member_leave(msg.get("id"))
@@ -1080,7 +1232,8 @@ class RmSignalingClient:
 class RmConn:
     """单条到某成员的长连接。io_lock 串行化收发。"""
 
-    __slots__ = ("state", "sock", "addr", "member", "io_lock", "created_at")
+    __slots__ = ("state", "sock", "addr", "member", "io_lock", "created_at",
+                 "preferred")
 
     def __init__(self, member):
         self.state = RM_STATE_CONNECTING
@@ -1090,6 +1243,10 @@ class RmConn:
         self.io_lock = threading.Lock()
         # B：建连时间戳 —— 保活宽限期内不判死，避免刚连上被误杀
         self.created_at = time.time()
+        # 是否为"约定主连接"（去重用）：同时打开可能形成两条独立 TCP
+        # 连接（各方向一条），两端各用一条 → 半开。用 ID 规则约定只保留
+        # 一条：ID 大者的出站连接 = 主；ID 小者的入站连接 = 主。
+        self.preferred = True
 
 
 # ==================== 梯度冗余多路径调度（叠加层） ====================
@@ -1167,6 +1324,10 @@ class RmKeepaliveScheduler:
 # 协议优先级：数字越小越优先当 hot。
 # TCP > UDP-RTP（TCP 有内核拥塞控制、NAT 映射超时更长、丢包处理更成熟）。
 RM_PROTO_PRIORITY = {"tcp": 0, "udp": 1}
+# 测试开关：True = 只允许 TCP 通道（UDP-RTP 不参与发送）。
+# 用于验证"TCP 打洞是否真的可用"——若 TCP 不可用则发送【明确失败】，
+# 不会被 UDP-RTP 静默回退掩盖。生产环境应为 False（允许 UDP 兜底）。
+RM_TCP_ONLY = False
 
 
 class RmPath:
@@ -1315,10 +1476,25 @@ class RmRoomManager:
         self._punch_round_evt = {}   # {peer_id: (round_no, t_go_r)}
         # P2 #6: 本机 TCP 映射是否就绪
         self._mapping_ready = False
+        # C/S 降级：房间端口监听状态查询（由 P2PApp 注入）。
+        # 未监听时 is_punch_initiator 一律返回 True（主动 connect）。
+        self.room_port_bound_checker = None
         # 梯度冗余多路径调度：{peer_id: RmPeerPathScheduler}
         self._path_schedulers = {}
         # 打洞并发计数：{peer_id: int} —— 同一 peer 最多 2 个 _punch_task
         self._punch_active = {}
+        # SYNC 精准打洞计划：{peer_id: t_go(本机毫秒)}。
+        # 一旦收到 SYNC_COMMIT（进入精准打洞模式），记录 t_go；
+        # _punch_task 检测到该 peer 有精准计划时【主动让路】，避免与
+        # PUNCH_ROUND 驱动的重试风暴抢执行权、错过对齐时刻（导致半开）。
+        self._sync_plan = {}
+        # 「等待精准打洞」门闩：{peer_id: 加入时刻(秒)}。
+        # UDP-RTP 就绪后加入；精准打洞结束（成功/失败）后移除。
+        # 在此期间【任何】风暴触发（含 punch_go）都让路——
+        # 保证"先精准打洞，失败才风暴"的严格顺序。
+        # 超时（RM_SYNC_AWAIT_TIMEOUT）后自动失效，防止对端不支持
+        # SYNC（旧版本/包丢失）时永久阻塞，兜底风暴仍能启动。
+        self._awaiting_sync = {}
         # 连接池：{peer_id: 最后活跃时间戳} —— 用于空闲降频保活 / LRU 清理
         self._peer_last_active = {}
         # 接收代际：{peer_key: int} —— 新通道接管时递增，旧接收循环据此退出，
@@ -1326,6 +1502,10 @@ class RmRoomManager:
         self._recv_epoch = {}
         # B：TCP 保活连续失败计数 {peer_id: int}
         self._tcp_alive_fail = {}
+        # TCP 心跳 RTT 探测：{peer_id: 上次发 PING 时刻}。
+        # 仅在空闲（_peer_last_active 距今 >= RM_TCP_PING_IDLE）时才发，
+        # 避免干扰文件数据传输（传输中 io_lock 被占，acquire(False) 失败即跳过）。
+        self._tcp_last_ping_at = {}
 
     def _get_path_sched(self, peer_id):
         """取（或创建）某 peer 的路径调度器。"""
@@ -1415,6 +1595,9 @@ class RmRoomManager:
             return
         with self.lock:
             self.udp_conns[peer_id] = rtp
+            # 门闩：UDP-RTP 就绪 → 进入"等待精准打洞"窗口。
+            # 窗口内所有风暴触发源（含 punch_go）都让路，优先走 SYNC 精准打洞。
+            self._awaiting_sync[peer_id] = time.time()
             member = dict(self.members.get(peer_id, {}))
         self.log("[UDP-RTP] 已为 %s 建立可靠通道 %s"
                  % (member.get("name", peer_id), peer_addr))
@@ -1446,9 +1629,9 @@ class RmRoomManager:
             self.log("[SYNC] 启动判断异常: %s" % e)
 
     def _maybe_start_sync(self, peer_id, rtp):
-        """P1: 延迟 300ms 后（避免与 punch_go 触发的 TCP 打洞并发）发起 SYNC。"""
+        """延迟 100ms 后发起 SYNC（门闩已挡 punch_go 触发的打洞，无需长等）。"""
         try:
-            time.sleep(0.3)
+            time.sleep(0.1)
             with self.lock:
                 conn = self.connections.get(peer_id)
                 if conn and conn.state == RM_STATE_CONNECTED:
@@ -1458,36 +1641,130 @@ class RmRoomManager:
         except Exception as e:
             self.log("[SYNC] 异常: %s" % e)
 
+    def _is_punch_initiator(self, peer_id):
+        """返回 True 表示本端主动 connect（打洞）。
+
+        NAT 穿透铁律：纯 listen 不成立——监听方不发 SYN 则本机 NAT 无映射，
+        对方 SYN 被丢弃（pcap 实证）。故双端都必须 connect（各发出站 SYN
+        打洞本机 NAT），listen 仅作兜底。
+
+        保留 listen（房间端口监听）+ 入站接管（on_inbound）作为额外兜底。
+        """
+        return True
+
+    def _outbound_is_preferred(self, peer_id):
+        """本端【出站 connect】连接是否为主连接（ID 大者的出站 = 主）。"""
+        my_id = getattr(self.signaling, "my_id", None) or ""
+        if not my_id or not peer_id:
+            return True
+        return my_id > peer_id
+
+    def _inbound_is_preferred(self, peer_id):
+        """本端【入站 accept】连接是否为主连接（ID 小者的入站 = 主）。"""
+        my_id = getattr(self.signaling, "my_id", None) or ""
+        if not my_id or not peer_id:
+            return True
+        return my_id < peer_id
+
+    def _has_reachable_target(self, peer):
+        """是否有可达靶子（打洞候选）。
+
+        没靶子不打：
+          · pub_tcp 非空 → 有公网 TCP 靶子
+          · lan 非空 → 有内网候选（跨网时快速失败，但不至于完全无候选）
+        都没有 = 打也白打（无候选可连），放弃本轮、等对端登记映射后重新触发。
+        """
+        if not peer:
+            return False
+        if peer.get("pub_tcp"):
+            return True
+        if peer.get("lan"):
+            return True
+        return False
+
     def _on_sync_ready(self, peer_id, t_go):
         """P1: SYNC 完成，到 t_go 时刻精准执行 TCP 同时打开。"""
         with self.lock:
             conn = self.connections.get(peer_id)
             if conn and conn.state == RM_STATE_CONNECTED:
+                # 已连接（其他路径已成功）→ 清门闩，避免残留
+                self._awaiting_sync.pop(peer_id, None)
                 return
             peer = self.members.get(peer_id)
         if not peer:
             return
+        # 没靶子不打：无候选可连，精准打洞也无意义（等对端登记映射后重触发）。
+        if not self._has_reachable_target(peer):
+            self.log("[打洞] peer=%s 无靶子，跳过精准打洞（不打）" % peer_id)
+            with self.lock:
+                self._sync_plan.pop(peer_id, None)
+                self._awaiting_sync.pop(peer_id, None)
+            return
+        # 登记精准打洞计划：_punch_task 见此即让路（避免抢执行权错过 t_go）
+        with self.lock:
+            self._sync_plan[peer_id] = t_go
         threading.Thread(target=self._sync_punch_task,
                          args=(peer_id, peer, t_go), daemon=True).start()
 
     def _sync_punch_task(self, peer_id, peer, t_go):
         """单次精准 TCP 打洞（不重试，因为 SYNC 已对齐时刻）。"""
+        # 标准 C/S：ID 小者 listen 等待，不主动 connect。
+        if not self._is_punch_initiator(peer_id):
+            self.log("[打洞] peer=%s：本端 ID 较小，listen 等待（精准打洞跳过）" % peer_id)
+            with self.lock:
+                self._sync_plan.pop(peer_id, None)
+                self._awaiting_sync.pop(peer_id, None)
+            return
         try:
             # at_ms = t_go 是【本机时刻】（由 SYNC 计算），_wait_until 的换算
             # 在 punch 内部用 _RM_CLOCK_OFFSET_MS——但 t_go 已是本机时刻，
             # 故需绕过换算直接等待。
             now_ms = int(time.time() * 1000)
             wait_sec = (t_go - now_ms) / 1000.0
-            if wait_sec > 0:
+            # NAT 预热必须在 T_go【之前】完成，否则预热耗时(约100ms)会把
+            # 实际发 SYN 的时刻推迟到 T_go 之后，错过对端的同时打开窗口。
+            # 提前 warmup_lead 秒唤醒，预热完刚好到 T_go。
+            warmup_lead = 0.12
+            if wait_sec > warmup_lead:
+                time.sleep(wait_sec - warmup_lead)
+                try:
+                    _rtp = self.get_udp_socket(peer_id)
+                    if _rtp is not None:
+                        _rtp.warm_up_nat(5, 20)
+                except Exception:
+                    pass
+            elif wait_sec > 0:
                 time.sleep(min(wait_sec, 3.0))
-            result = self._puncher.punch(peer, 0)   # at_ms=0，已 sleep 到点
+            # 用 punch_once：到点只发一轮 SYN（真正的同时打开），不跑风暴。
+            # 一轮失败 → 回退 _punch_task（6秒风暴）兜底。
+            result = self._puncher.punch_once(peer, 0)   # at_ms=0，已 sleep 到点
             if result:
                 self._install_socket(peer_id, result)
                 self.log("[SYNC] 精准 TCP 打洞成功 peer=%s" % peer_id)
             else:
+                # 注意：punch 返回 None 也可能是"打洞期间已被其他路径连接"，
+                # 此时不是失败，不打误导性日志。
+                with self.lock:
+                    _c = self.connections.get(peer_id)
+                    already_connected = bool(_c and _c.state == RM_STATE_CONNECTED)
+                if already_connected:
+                    self.log("[SYNC] 精准打洞期间已由其他路径连接，跳过 peer=%s" % peer_id)
+                    with self.lock:
+                        self._sync_plan.pop(peer_id, None)
+                        self._awaiting_sync.pop(peer_id, None)
+                    return
                 self.log("[SYNC] 精准 TCP 打洞失败 peer=%s，转入多轮重试" % peer_id)
+                # 精准打洞失败：清除计划与门闩，让 _punch_task 恢复（否则被永久抑制）
+                with self.lock:
+                    self._sync_plan.pop(peer_id, None)
+                    self._awaiting_sync.pop(peer_id, None)
                 # P2: 单次精准打洞失败后，回落到轮次对齐的多轮重试
                 self._punch_task(peer, 0)
+                return
+            # 精准打洞成功 → 清除计划与门闩
+            with self.lock:
+                self._sync_plan.pop(peer_id, None)
+                self._awaiting_sync.pop(peer_id, None)
         except Exception as e:
             self.log("[SYNC] TCP 打洞异常: %s" % e)
 
@@ -1509,7 +1786,19 @@ class RmRoomManager:
                 pass
 
     def _on_peer_tcp_ready(self, peer_id):
-        """P2 #6: 对端 TCP 映射已就绪 → 立即触发一次打洞（无需等服务器 punch_go）。"""
+        """P2 #6: 对端 TCP 就绪。
+
+        关键：TCP_READY 的语义是"我 TCP 映射就绪，可以打洞"（可以），
+        不是"现在就打"（现在）。若收到即打（at_ms=0，无时刻对齐），会与
+        initiator 发起的 SYNC 精确对齐路径【抢同一个本地端口】，把
+        6 秒打洞窗口先耗光，等 SYNC 算好 t_go 时窗口已过 → 必然失败。
+
+        新策略：TCP_READY 只当"就绪门"，打洞交给 SYNC 精确对齐：
+          - 有 UDP-RTP → 等待 SYNC 协调（两端同 t_go 同时发 SYN）
+          - 超过 RM_TCP_READY_SYNC_WAIT 仍未连上 → 回退"直接打洞"
+            （回退时也等 RM_TCP_READY_FALLBACK_DELAY，让两端发出时刻
+             误差 ≈ RTT/2，优于立即打的随机错开）
+        """
         with self.lock:
             peer = self.members.get(peer_id)
             conn = self.connections.get(peer_id)
@@ -1518,8 +1807,29 @@ class RmRoomManager:
             if not peer:
                 return
             self.connections[peer_id] = RmConn(peer)
-        self.log("[打洞] 对端 TCP 就绪，立即发起打洞 peer=%s" % peer_id)
-        threading.Thread(target=self._punch_task, args=(peer, 0), daemon=True).start()
+        self.log("[打洞] 对端 TCP 就绪 peer=%s，等待 SYNC 协调" % peer_id)
+        threading.Thread(target=self._on_peer_tcp_ready_wait,
+                         args=(peer,), daemon=True).start()
+
+    def _on_peer_tcp_ready_wait(self, peer):
+        """等待 SYNC 协调；超时则回退"直接打洞"（带近似对齐延迟）。"""
+        peer_id = peer.get("id")
+        try:
+            rtp = self.get_udp_socket(peer_id)
+            if rtp is not None:
+                time.sleep(RM_TCP_READY_SYNC_WAIT)
+                with self.lock:
+                    conn = self.connections.get(peer_id)
+                    still_not_connected = (conn is None or
+                                           conn.state != RM_STATE_CONNECTED)
+                if not still_not_connected:
+                    return
+                self.log("[打洞] SYNC 未完成，回退直接打洞 peer=%s（再等 %.0fms）"
+                         % (peer_id, RM_TCP_READY_FALLBACK_DELAY * 1000))
+                time.sleep(RM_TCP_READY_FALLBACK_DELAY)
+            self._punch_task(peer, 0)
+        except Exception as e:
+            self.log("[打洞] TCP_READY 回退打洞异常: %s" % e)
 
     def _on_peer_punch_fail(self, peer_id):
         """P2 #8: 对端放弃 TCP → 本端停止空等，标记失败并回退 UDP。
@@ -1672,6 +1982,9 @@ class RmRoomManager:
             # 连接池：清理空闲记录
             self._peer_last_active.pop(peer_id, None)
             self._tcp_alive_fail.pop(peer_id, None)
+            self._tcp_last_ping_at.pop(peer_id, None)
+            self._sync_plan.pop(peer_id, None)
+            self._awaiting_sync.pop(peer_id, None)
             # UDP 连接也要清理（否则成员离开后仍占资源）
             rtp = self.udp_conns.pop(peer_id, None)
         if rtp:
@@ -1709,31 +2022,52 @@ class RmRoomManager:
         ready_pid = None
         ready_member = None
         with self.lock:
+            # 优先精确匹配 ip:port（pub_tcp 与入站源端口一致时）
             for pid, m in self.members.items():
-                pub_tcp = m.get("pub_tcp", "")
-                if pub_tcp and pub_tcp == key:
+                if m.get("pub_tcp", "") == key:
                     ready_pid = pid
                     ready_member = dict(m)
                     break
+            # 回退：按【公网 IP】匹配。原因：NAT 可能给"映射 socket（朝服务器）"
+            # 和"打洞 socket（朝对端）"分配不同的公网端口，导致精确 ip:port
+            # 匹配失败（实测：TCP 握手成功但 on_inbound 不认、连接被关）。
+            # 用 IP 匹配即可唯一识别对端（1v1 场景）。
+            if ready_pid is None and ip:
+                for pid, m in self.members.items():
+                    pt = m.get("pub_tcp", "")
+                    if pt and pt.rsplit(":", 1)[0] == ip:
+                        ready_pid = pid
+                        ready_member = dict(m)
+                        break
         if ready_pid is None:
             return False
-        # 软握手确认（在释放锁之后做，避免阻塞锁）：成功→验证；失败→仍接管。
-        # 与出站一致：不因握手失败而拒绝连接，避免误杀本可用的连接。
+        # 强制握手确认：失败=半开/单向 → 关闭不接管（避免把死连接当通道）。
         if rm_punch_handshake(sock, RM_PUNCH_HANDSHAKE_TIMEOUT):
             self.log("[打洞] 入站连接 %s 握手确认" % key)
         else:
-            self.log("[打洞] 入站连接 %s（握手无回应，降级信任）" % key)
+            self.log("[打洞] 入站连接 %s 握手无回应（半开），关闭不接管" % key)
+            try: sock.close()
+            except Exception: pass
+            return False
+        my_pref = self._inbound_is_preferred(ready_pid)
         with self.lock:
             conn = self.connections.get(ready_pid)
             if conn and conn.state == RM_STATE_CONNECTED and conn.sock:
-                return True
-            # 覆盖前先关掉旧 socket，避免并发入站/出站竞争导致 fd 泄漏
-            if conn:
+                # 已有连接：仅当"新来是主、已有非主"才替换；否则保留已有，
+                # 关闭新入站 socket（避免 fd 泄漏）。
+                if not (my_pref and not conn.preferred):
+                    try: sock.close()
+                    except Exception: pass
+                    return True
+                self._close_sock(conn)
+            elif conn:
+                # 覆盖前先关掉旧 socket，避免并发入站/出站竞争导致 fd 泄漏
                 self._close_sock(conn)
             new_conn = RmConn(ready_member)
             new_conn.state = RM_STATE_CONNECTED
             new_conn.sock = sock
             new_conn.addr = (ip, port)
+            new_conn.preferred = my_pref
             self.connections[ready_pid] = new_conn
         self._apply_keepalive(sock)
         self.log("[房间] 入站连接 %s <- %s" % (ready_member.get("name", ready_pid), key))
@@ -1818,7 +2152,7 @@ class RmRoomManager:
                                 and id(conn.sock) not in exclude
                                 and self._channel_usable(conn.sock)):
                             return (conn.sock, conn.io_lock, False, role)
-                else:
+                elif not RM_TCP_ONLY:
                     with self.lock:
                         rtp = self.udp_conns.get(peer_id)
                         if (rtp is not None and id(rtp) not in exclude
@@ -1831,10 +2165,11 @@ class RmRoomManager:
                     and id(conn.sock) not in exclude
                     and self._channel_usable(conn.sock)):
                 return (conn.sock, conn.io_lock, False, "?")
-            rtp = self.udp_conns.get(peer_id)
-            if (rtp is not None and id(rtp) not in exclude
-                    and self._channel_usable(rtp)):
-                return (rtp, rtp.io_lock, True, "?")
+            if not RM_TCP_ONLY:
+                rtp = self.udp_conns.get(peer_id)
+                if (rtp is not None and id(rtp) not in exclude
+                        and self._channel_usable(rtp)):
+                    return (rtp, rtp.io_lock, True, "?")
         return None
 
     def get_path_roles(self, peer_id):
@@ -1908,6 +2243,11 @@ class RmRoomManager:
         punch_go 携带有效 pub_tcp。若本任务不重读，就会一直用旧的空 pub_tcp。
         """
         peer_id = peer.get("id")
+        # 标准 C/S：ID 小者 listen 等待（不主动 connect，靠 LISTEN socket
+        # 接住对方 SYN）；ID 大者才主动 connect。
+        if not self._is_punch_initiator(peer_id):
+            self.log("[打洞] peer=%s：本端 ID 较小，listen 等待对方连接" % peer_id)
+            return
         # 打洞并发限制：同一 peer 最多允许 2 个 _punch_task 并发。
         # 保留适度冗余（多触发源中若一个卡住，另一个可补位），又不至于泛滥。
         with self.lock:
@@ -1927,23 +2267,39 @@ class RmRoomManager:
                     if _c and _c.state == RM_STATE_CONNECTED:
                         self.log("[打洞] peer=%s 已由其他任务连接，本任务退出" % peer_id)
                         return
+                    # SYNC 精准打洞优先（全局门闩）：若该 peer 正在"等待/执行精准打洞"
+                    # 且未超时，本重试任务（无论来自 punch_go / TCP_READY / 轮次重试）
+                    # 一律让路退出，保证"先精准打洞，失败才风暴"的严格顺序。
+                    # 超时保护：对端不支持 SYNC / COMMIT 丢失时，超时后放行兜底风暴。
+                    _t0 = self._awaiting_sync.get(peer_id)
+                    _waiting = (_t0 is not None
+                                and (time.time() - _t0) < RM_SYNC_AWAIT_TIMEOUT)
+                    _planned = self._sync_plan.get(peer_id)
+                if _waiting or _planned is not None:
+                    self.log("[打洞] peer=%s 等待精准打洞中%s，重试任务让路退出"
+                             % (peer_id,
+                                ("（t_go=%d）" % _planned) if _planned is not None else ""))
+                    return
                 # 重读最新 peer（含可能刚更新过的 pub_tcp）
                 with self.lock:
                     latest = self.members.get(peer_id) or peer
-                # D 修复：pub_tcp 为空说明对端 TCP 公网映射尚未登记，
-                # 此时重试再多次也无候选可用（日志"pub_tcp="空硬打 3 轮"）。
-                # 主动再发一次 punch_req，让服务器重新下发带 pub_tcp 的 punch_go。
-                if not latest.get("pub_tcp"):
+                # 没靶子不打：pub_tcp 与内网候选都为空 → 无候选可连，打也白打。
+                # 主动再发一次 punch_req 请求映射，短暂等待后重读；仍无则放弃
+                # 本轮（等对端登记映射后由 member_update / punch_go 重新触发）。
+                if not self._has_reachable_target(latest):
                     try:
                         if self.signaling:
-                            self.log("[打洞] peer=%s pub_tcp 为空，重新请求映射"
+                            self.log("[打洞] peer=%s 无靶子（pub_tcp 与内网均空），请求映射后等待"
                                      % peer_id)
                             self.signaling.request_punch(peer_id)
-                            time.sleep(0.3)
-                            with self.lock:
-                                latest = self.members.get(peer_id) or latest
                     except Exception:
                         pass
+                    time.sleep(0.5)
+                    with self.lock:
+                        latest = self.members.get(peer_id) or latest
+                    if not self._has_reachable_target(latest):
+                        self.log("[打洞] peer=%s 仍无靶子，放弃本轮（不打）" % peer_id)
+                        return
                 if attempt == 1:
                     self.log("[打洞] 任务启动 peer=%s 本地端口=%d"
                              % (peer_id, self._puncher.local_tcp_port))
@@ -1955,6 +2311,14 @@ class RmRoomManager:
                     with self.lock:
                         _cc = self.connections.get(_pid)
                         return bool(_cc and _cc.state == RM_STATE_CONNECTED)
+                # NAT 预热：打洞前用 UDP keepalive 保持本端 NAT conntrack 热态，
+                # 让紧接的 SYN 更易被 NAT 转发（很多 NAT 对刚建/将超时的 TCP 映射丢 SYN）。
+                try:
+                    _rtp = self.get_udp_socket(peer_id)
+                    if _rtp is not None:
+                        _rtp.warm_up_nat(5, 20)
+                except Exception:
+                    pass
                 result = self._puncher.punch(latest, at_ms, should_stop=_already_connected)
                 if result:
                     self._install_socket(peer_id, result)
@@ -2016,20 +2380,26 @@ class RmRoomManager:
             self._punch_sem.release()
 
     def _install_socket(self, peer_id, result):
+        my_pref = self._outbound_is_preferred(peer_id)
         with self.lock:
             old = self.connections.get(peer_id)
             if old and old.state == RM_STATE_CONNECTED and old.sock:
-                try:
-                    result.sock.close()
-                except Exception:
-                    pass
-                return
-            if old:
+                # 已有连接：若已有的是主连接、新来非主 → 丢弃新的；
+                # 反之（已有非主、新来主）→ 替换；同优先级 → 保留先到的。
+                if not (my_pref and not old.preferred):
+                    try:
+                        result.sock.close()
+                    except Exception:
+                        pass
+                    return
+                self._close_sock(old)
+            elif old:
                 self._close_sock(old)
             conn = RmConn(self.members.get(peer_id, {}))
             conn.state = RM_STATE_CONNECTED
             conn.sock = result.sock
             conn.addr = (result.ip, result.port)
+            conn.preferred = my_pref
             self.connections[peer_id] = conn
             member = dict(self.members.get(peer_id, {}))
         self._apply_keepalive(result.sock)
@@ -2142,6 +2512,26 @@ class RmRoomManager:
                 if self._alive(conn.sock):
                     # 探测成功 → 清空失败计数
                     self._tcp_alive_fail.pop(pid, None)
+                    # TCP 心跳 RTT 探测：空闲时发 PING（与 UDP-RTP 心跳对称）。
+                    # 用 io_lock.acquire(False) 非阻塞获取写权——若正有文件
+                    # 传输持锁，直接跳过本次（不干扰数据流，避免字节流错位）。
+                    with self.lock:
+                        last_active = self._peer_last_active.get(pid, 0)
+                        last_ping = self._tcp_last_ping_at.get(pid, 0)
+                    idle_enough = (now - last_active >= RM_TCP_PING_IDLE
+                                   and now - last_ping >= RM_TCP_PING_INTERVAL)
+                    if idle_enough:
+                        got = conn.io_lock.acquire(blocking=False)
+                        if got:
+                            try:
+                                conn.sock.sendall(struct.pack('!B', FLAG_PING))
+                                with self.lock:
+                                    self._tcp_last_ping_at[pid] = now
+                                tcp_rtt_mark_ping_sent(pid)
+                            except Exception:
+                                pass
+                            finally:
+                                conn.io_lock.release()
                     continue
                 # ② 失败累计：未达阈值先记账，不判死
                 fail_n = self._tcp_alive_fail.get(pid, 0) + 1
@@ -2253,6 +2643,57 @@ BROADCAST_INTERVAL = 1      # 正常广播间隔（1秒）
 BROADCAST_BURST_INTERVAL = 0.2  # 启动时爆发广播间隔（0.2秒）
 BROADCAST_BURST_DURATION = 5    # 爆发广播持续秒数
 NODE_TIMEOUT = 600
+
+# 动态本地打洞端口（映射观测 + TCP打洞共用）。
+# 默认 9998。若 9998 被占用（Windows 上次会话 TIME_WAIT 未释放，报 10048），
+# 映射连接退化为随机端口；打洞 socket 必须用【同一端口】，才能与映射共享
+# 同一 NAT 映射（否则服务器记录的 pub_tcp 与实际打洞源端口不一致 → 打洞必败）。
+_DYNAMIC_PUNCH_PORT = [9998]
+_DYN_PORT_LOCK = threading.Lock()
+
+def _get_dyn_punch_port():
+    with _DYN_PORT_LOCK:
+        return _DYNAMIC_PUNCH_PORT[0]
+
+def _set_dyn_punch_port(p):
+    with _DYN_PORT_LOCK:
+        _DYNAMIC_PUNCH_PORT[0] = p
+
+def _is_addr_in_use(exc):
+    """判断异常是否为"地址/端口已被占用"（跨平台：WinError 10048 / errno 98/48）。"""
+    try:
+        en = getattr(exc, "errno", None) or getattr(exc, "winerror", None)
+        if en in (10048, 98, 48, 10049):   # WSAEADDRINUSE / EADDRINUSE
+            return True
+        s = str(exc).lower()
+        return "10048" in s or "address already in use" in s or "只允许使用一次" in s
+    except Exception:
+        return False
+
+# TCP 心跳 RTT 追踪（本地计时，零协议变更）。
+# 结构：{peer_key: {pingSentAt, rttMs}}，仅在房间模式长连接使用。
+_TCP_RTT_LOCK = threading.Lock()
+_TCP_PING_SENT_AT = {}    # peer_key -> 纳秒时刻
+_TCP_RTT_MS = {}          # peer_key -> 最近 RTT（毫秒）
+
+def tcp_rtt_mark_ping_sent(peer_key):
+    with _TCP_RTT_LOCK:
+        _TCP_PING_SENT_AT[peer_key] = time.perf_counter_ns()
+
+def tcp_rtt_mark_pong(peer_key):
+    """收到 PONG：若有匹配的在途 PING，返回本次 RTT（毫秒），否则 None。"""
+    with _TCP_RTT_LOCK:
+        t = _TCP_PING_SENT_AT.pop(peer_key, None)
+        if t is None:
+            return None
+        rtt = (time.perf_counter_ns() - t) // 1_000_000
+        _TCP_RTT_MS[peer_key] = rtt
+        return rtt
+
+def tcp_rtt_get(peer_key):
+    with _TCP_RTT_LOCK:
+        return _TCP_RTT_MS.get(peer_key, -1)
+
 BUFFER_SIZE = 1 * 1024 * 1024   # 1 MB 初始值，会动态调整
 MAX_BUFFER_SIZE = 8 * 1024 * 1024  # 最大缓冲区 8MB（防止内存占用过高）
 SOCKET_BUFFER_SIZE = 16 * 1024 * 1024  # socket 缓冲区大小 16MB（高延迟网络适配）
@@ -2260,6 +2701,11 @@ FLAG_FILE   = 0                 # 标志位：文件
 FLAG_FOLDER = 1                 #  
 FLAG_COMPRESS = 0x01
 FLAG_RESUME   = 0x02            # 断点续传标志
+# TCP 心跳探测（仅房间模式长连接使用，空闲时发）：
+#   PING: 发送方 -> 接收方，单字节；PONG: 接收方 -> 发送方，单字节。
+# 与 UDP-RTP 的 KEEPALIVE 语义对齐，用于对比两协议的应用层 RTT。
+FLAG_PING   = 0x10
+FLAG_PONG   = 0x11
 AUTO_SCAN_INTERVAL = 20         # 心跳扫描间隔
 SCAN_TIMEOUT = 0.5              # 扫描超时500ms，适配异地组网高延迟
 SCAN_THREADS = 1000             # 1000线程并发扫描
@@ -2771,6 +3217,13 @@ class Node(threading.Thread):
         self.broadcast_sockets = []
         # 所有需要主动关闭的监听 socket（用于干净退出）
         self.listen_sockets = []
+        # 房间模式专用监听（方案 B）：电脑 listen 9998，接住手机主动发来的
+        # 打洞连接。原因：实测"手机→电脑"方向的 SYN 能到达，"电脑→手机"
+        # 方向常被 NAT 丢弃（异构设备 TCP 同时打开失败）。故电脑侧开监听，
+        # 让手机单向 connect 即可建立（C/S 模式，绕开失败方向）。
+        self.room_listener_sock = None
+        self.room_listener_running = False
+        self.room_listener_thread = None
         self.auto_scan_enabled = False
         self.scanning = False
         self.pausing_network = False  # 传输时暂停广播/扫描/心跳
@@ -3458,14 +3911,33 @@ class Node(threading.Thread):
         """薄封装：调用全项目统一的 socket 优化入口。"""
         optimize_tcp_socket(sock)
 
-    def room_tcp_listener(self):
-        """房间模式专用 TCP 监听（端口 9998）。
+    def start_room_listener(self):
+        """启动房间模式监听（方案 B：电脑 listen 9998 接住手机的主动连接）。"""
+        if self.room_listener_running:
+            return
+        self.room_listener_running = True
+        self.room_listener_thread = threading.Thread(
+            target=self.room_tcp_listener, daemon=True)
+        self.room_listener_thread.start()
 
-        与局域网文件接收端口（9999）分离的原因：
-          Android 端 SO_REUSEADDR 语义严格，若房间模式的 TCP 映射观测连接
-          与文件接收监听绑同一端口会 EADDRINUSE，导致服务器无法登记公网映射，
-          对端拿不到 pub_tcp 从而打洞必然失败。
-        本监听仅接管房间模式打洞入站连接，收到非房间连接一律关闭。
+    def stop_room_listener(self):
+        """停止房间模式监听。"""
+        self.room_listener_running = False
+        s = self.room_listener_sock
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+            self.room_listener_sock = None
+
+    def room_tcp_listener(self):
+        """房间模式专用 TCP 监听（端口 9998）—— 方案 B。
+
+        背景：实测"电脑→手机"方向的打洞 SYN 常被 NAT 丢弃（异构设备
+        TCP 同时打开失败），而"手机→电脑"方向可达。故电脑侧 listen 9998，
+        让手机单向 connect 即可建立（标准 C/S，绕开失败方向）。
+        仅接管房间模式打洞入站连接（匹配成员 pub_tcp），其余一律关闭。
         """
         sock = None
         for family, addr in ((socket.AF_INET, ('0.0.0.0', RM_TCP_PORT)),
@@ -3494,10 +3966,12 @@ class Node(threading.Thread):
                 continue
         if sock is None:
             self.gui.log(f"[房间] 端口 {RM_TCP_PORT} 监听失败（房间模式不可用）")
+            self.room_listener_running = False
             return
-        self.listen_sockets.append(sock)
+        self.room_listener_sock = sock
+        self.gui.log(f"[房间] 已监听 {RM_TCP_PORT}（方案B：接住手机主动连接）")
         sock.settimeout(1.0)
-        while self.running:
+        while self.room_listener_running:
             try:
                 conn, addr = sock.accept()
                 self._optimize_socket(conn)
@@ -3516,10 +3990,12 @@ class Node(threading.Thread):
             except OSError:
                 break
             except Exception as e:
-                if self.running:
+                if self.room_listener_running:
                     self.gui.log(f"[房间] accept 异常: {e}")
         try: sock.close()
         except Exception: pass
+        self.room_listener_sock = None
+        self.room_listener_running = False
 
     def tcp_file_receiver(self):
         # IPv4优先，兼容性更好
@@ -3694,6 +4170,18 @@ class Node(threading.Thread):
                                 pass
                     elif flag == 0x02:
                         self._handle_query_offset(sock, addr)
+                    elif flag == FLAG_PING:
+                        # TCP 心跳探测：收到 PING 立即回 PONG（空闲长连接，不干扰数据）
+                        try:
+                            sock.sendall(struct.pack('!B', FLAG_PONG))
+                        except Exception:
+                            pass
+                    elif flag == FLAG_PONG:
+                        # 收到 PONG → 记录 RTT
+                        rtt = tcp_rtt_mark_pong(peer_key)
+                        if rtt is not None:
+                            self.gui.log("[TCP] 心跳 RTT = %d ms（peer=%s）"
+                                         % (rtt, peer_key))
                     else:
                         break
                 finally:
@@ -4945,7 +5433,7 @@ class P2PApp:
                 self.root = tk.Tk()
         else:
             self.root = tk.Tk()
-        self.root.title("文件互传 V16.1-全网通")
+        self.root.title("文件互传 V17-全网通")
         self.root.geometry("1200x700")
         self.root.resizable(True, True)
 
@@ -5215,6 +5703,9 @@ class P2PApp:
             punch_port = RM_TCP_PORT
 
             self.room_mgr = RoomManager(None, punch_port, log=self.log)
+            # C/S 降级：房间端口未成功监听时一律主动 connect。
+            self.room_mgr.room_port_bound_checker = (
+                lambda: self.node.room_listener_sock is not None)
             self.room_mgr.on_socket_ready = self._on_room_socket_ready
             self.room_mgr.on_udp_ready = self._on_room_udp_ready
             # 成员状态变化（保活检测到死亡/重建成功等）→ 派发到主线程刷新 UI
@@ -5240,6 +5731,19 @@ class P2PApp:
             )
             self.room_mgr.signaling = self.room_sig
             ok = self.room_sig.start()
+
+            # 标准 C/S（替代脆弱的"同时打开"）：
+            #   电脑 listen 房间端口（与映射 socket 同端口共存——已在本地
+            #   验证：Windows 上 listen socket 能接住入站连接，且不影响
+            #   ESTABLISHED 的映射 socket）。
+            #   规则：ID 小者 listen 等对方 connect，ID 大者主动 connect。
+            #   这样入站 SYN 由 LISTEN socket 按规则接住（不再靠 SYN_SENT
+            #   的 socket 碰运气），NAT 全支持，异构设备（电脑↔手机）也稳。
+            if ok:
+                try:
+                    self.node.start_room_listener()
+                except Exception as e:
+                    self.log(f"[房间] 启动房间监听失败: {e}")
 
             if not ok:
                 # 连接失败：清理，不显示"已加入"
@@ -5275,6 +5779,11 @@ class P2PApp:
         若先关 udp_hole_sock，UdpReliableSocket 的 keepalive 线程仍在跑，
         会用它发送 → WinError 10038。
         """
+        # 方案 B：先停房间监听（避免它持有 9998 影响映射 socket 释放）
+        try:
+            self.node.stop_room_listener()
+        except Exception:
+            pass
         try:
             if self.room_mgr:
                 self.room_mgr.stop()

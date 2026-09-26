@@ -59,10 +59,12 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -110,7 +112,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         requestPermissionsIfNeeded()
-        requestIgnoreBatteryOptimizations()
+        // 注：不再启动即自动跳系统"电池优化"页（体验突兀），改为进主界面后
+        // 由 LaunchedEffect 检测并弹"后台保活引导"弹窗，用户点击再跳转。
         startTransferService()
 
         // 处理"分享到" / "用其他应用打开" 传入的文件
@@ -124,7 +127,9 @@ class MainActivity : ComponentActivity() {
                         onAddFiles = { pickFiles.launch(arrayOf("*/*")) },
                         onAddFolder = { pickFolder.launch(null) },
                         onPickSaveDir = { pickSaveDir.launch(null) },
-                        onResetSaveDir = { vm.resetSaveDir() }
+                        onResetSaveDir = { vm.resetSaveDir() },
+                        onOpenKeepAlive = { openKeepAliveSettings() },
+                        onRequestBatteryOptimize = { requestIgnoreBatteryOptimizations() }
                     )
                 }
             }
@@ -235,6 +240,51 @@ class MainActivity : ComponentActivity() {
             }
         } catch (_: Exception) {
         }
+    }
+
+    /**
+     * 打开系统"后台保活"设置页（各厂商路径不同）。
+     * 国产 ROM（华为/小米/OPPO/vivo）有独立的"应用启动管理/自启动管理"，
+     * 会冻结后台应用（无视标准 WakeLock/前台服务）。必须引导用户手动允许
+     * 后台活动，否则息屏/切后台后连接会被切断。
+     */
+    fun openKeepAliveSettings() {
+        val mfr = Build.MANUFACTURER.lowercase()
+        val candidates = mutableListOf<Intent>()
+        when {
+            mfr.contains("huawei") || mfr.contains("honor") -> {
+                candidates.add(Intent().setComponent(android.content.ComponentName(
+                    "com.huawei.systemmanager",
+                    "com.huawei.systemmanager.appcontrol.activity.StartupAppControlActivity")))
+                candidates.add(Intent().setComponent(android.content.ComponentName(
+                    "com.huawei.systemmanager",
+                    "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")))
+            }
+            mfr.contains("xiaomi") -> candidates.add(Intent().setComponent(
+                android.content.ComponentName(
+                    "com.miui.securitycenter",
+                    "com.miui.permcenter.autostart.AutoStartManagementActivity")))
+            mfr.contains("oppo") || mfr.contains("realme") -> candidates.add(
+                Intent().setComponent(android.content.ComponentName(
+                    "com.coloros.safecenter",
+                    "com.coloros.safecenter.permission.startup.StartupAppListActivity")))
+            mfr.contains("vivo") -> candidates.add(Intent().setComponent(
+                android.content.ComponentName(
+                    "com.vivo.permissionmanager",
+                    "com.vivo.permissionmanager.activity.BgStartUpManagerActivity")))
+        }
+        // 通用回退：应用详情页（用户可手动进"电池/权限"）
+        candidates.add(Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.parse("package:" + packageName)))
+        for (intent in candidates) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                return
+            } catch (_: Exception) {}
+        }
+        Toast.makeText(this, "请手动在系统设置中开启后台运行权限", Toast.LENGTH_LONG).show()
     }
 }
 
@@ -850,7 +900,9 @@ fun MainScreen(
     onAddFiles: () -> Unit,
     onAddFolder: () -> Unit,
     onPickSaveDir: () -> Unit,
-    onResetSaveDir: () -> Unit
+    onResetSaveDir: () -> Unit,
+    onOpenKeepAlive: () -> Unit = {},
+    onRequestBatteryOptimize: () -> Unit = {}
 ) {
     val running by P2PFileTransferService.isRunning.collectAsState()
     val service = if (running) P2PFileTransferService.instance else null
@@ -874,6 +926,65 @@ fun MainScreen(
     var saveDirDialog by remember { mutableStateOf(false) }
     var deviceNameDialog by remember { mutableStateOf(false) }
     var deviceNameText by remember { mutableStateOf("") }
+    var keepAliveDialog by remember { mutableStateOf(false) }
+    // 是否已在本 Activity 生命周期内自动检查过（rememberSaveable 跨重组/旋转保留）
+    var keepAliveAutoChecked by rememberSaveable { mutableStateOf(false) }
+
+    // 启动时自动检查：若未忽略电池优化（即后台可能被系统限制），
+    // 直接弹【系统原生"忽略电池优化"权限弹窗】。仅首次自动弹（prefs 记录），
+    // 避免用户拒绝后每次启动反复骚扰；后续可点右上角按钮重新触发。
+    LaunchedEffect(Unit) {
+        if (!keepAliveAutoChecked) {
+            keepAliveAutoChecked = true
+            val needGuide = try {
+                val pm = context.getSystemService(PowerManager::class.java)
+                pm == null || !pm.isIgnoringBatteryOptimizations(context.packageName)
+            } catch (_: Exception) { false }
+            if (needGuide) {
+                val prefs = context.getSharedPreferences("p2p_config",
+                    android.content.Context.MODE_PRIVATE)
+                if (!prefs.getBoolean("battery_opt_asked", false)) {
+                    prefs.edit().putBoolean("battery_opt_asked", true).apply()
+                    onRequestBatteryOptimize()
+                }
+            }
+        }
+    }
+
+    // 后台保活引导弹窗：息屏/切后台断连的根因是系统冻结后台应用，
+    // 需用户手动在"应用启动管理"里允许后台活动。
+    if (keepAliveDialog) {
+        AlertDialog(
+            onDismissRequest = { keepAliveDialog = false },
+            title = { Text("后台保活设置") },
+            text = {
+                Text(
+                    "为在息屏/切后台后保持连接，请允许本应用后台运行：\n\n" +
+                    "1. 点击下方「打开设置」，进入系统的应用启动管理\n" +
+                    "2. 将本应用设为「手动管理」，并勾选：\n" +
+                    "   · 允许自启动\n" +
+                    "   · 允许关联启动\n" +
+                    "   · 允许后台活动\n\n" +
+                    "（华为/小米/OPPO/vivo 等系统还需在「电池」里设为「不限制」）\n\n" +
+                    "若不设置，息屏后连接可能被系统切断。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    // 先弹系统原生"忽略电池优化"权限弹窗
+                    onRequestBatteryOptimize()
+                    keepAliveDialog = false
+                }) { Text("允许") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    // 系统弹窗不弹/已忽略时，仍可手动进厂商启动管理
+                    onOpenKeepAlive()
+                    keepAliveDialog = false
+                }) { Text("打开启动管理") }
+            }
+        )
+    }
 
     // 设备名编辑弹窗
     if (deviceNameDialog) {
@@ -1014,7 +1125,7 @@ fun MainScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text("文件互传 V16.1", style = MaterialTheme.typography.titleMedium)
+                        Text("文件互传 V17", style = MaterialTheme.typography.titleMedium)
                         Text(
                             text = "设备名: " + deviceName + "   ·   保存到: " + saveDirDesc,
                             style = MaterialTheme.typography.labelSmall,
@@ -1032,6 +1143,17 @@ fun MainScreen(
                     }
                     IconButton(onClick = { saveDirDialog = true }) {
                         Icon(Icons.Filled.Settings, contentDescription = "设置保存目录")
+                    }
+                    IconButton(onClick = {
+                        // 先弹系统"忽略电池优化"权限弹窗；华为等还需手动进启动管理，
+                        // 自定义弹窗提供该入口（见 keepAliveDialog）。
+                        val pm = context.getSystemService(PowerManager::class.java)
+                        if (pm != null && !pm.isIgnoringBatteryOptimizations(context.packageName)) {
+                            onRequestBatteryOptimize()
+                        }
+                        keepAliveDialog = true
+                    }) {
+                        Icon(Icons.Filled.Info, contentDescription = "后台保活设置")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(

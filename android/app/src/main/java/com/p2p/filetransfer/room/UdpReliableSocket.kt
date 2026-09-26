@@ -50,6 +50,11 @@ class UdpReliableSocket(
         private const val TYPE_PUNCH_ROUND = 7 // P2: 打洞轮次对齐
         private const val TYPE_TCP_READY = 8   // P2 #6: TCP 映射就绪信号
         private const val TYPE_PUNCH_FAIL = 9  // P2 #8: 打洞彻底失败通知
+        // 单包最大载荷（字节）。1200 为保守安全值：
+        // 1200+12头+8UDP+20IP=1240，远低于任何常见 MTU（含蜂窝 1400/1428），
+        // 绝不触发 IP 分片。曾试 1400（=1440 字节 IP 包），在蜂窝链路（MTU
+        // 常 ≤1400）触发分片 → 单包丢一片即整包丢失 → 吞吐暴跌（实测
+        // 2.5MB/s → 0.9MB/s），故回退 1200。
         private const val MAX_PAYLOAD = 1200
         // 自适应窗口（AIMD）：发送端根据 ACK / 丢包动态调在途包数。
         //   收到有效 ACK → 窗口 +1（加性增，封顶 WINDOW_MAX）
@@ -58,7 +63,10 @@ class UdpReliableSocket(
         private const val WINDOW_MIN = 1
         private const val WINDOW_MAX = 256
         private const val WINDOW_INIT = 64
-        private const val RTO_MS = 300L
+        // RTO 下限（毫秒）：即使 RTT 很小也不低于此值，避免延迟抖动被误判为
+        // 丢包（引发无谓重传 + AIMD 窗口减半）。250ms 对移动网络抖动更稳健。
+        private const val RTO_MIN_MS = 250L
+        private const val RTO_MAX_MS = 1000L
         private const val RTX_INTERVAL_MS = 50L
         private const val HEADER_LEN = 12
         private const val KEEPALIVE_INTERVAL_MS = 15_000L
@@ -82,12 +90,18 @@ class UdpReliableSocket(
 
     @Volatile private var sendSeq = 0
     private val sendQueue = HashMap<Int, Pair<ByteArray, Long>>()
+    // 注：必须用 java.lang.Object（而非 kotlin.Any）——synchronized 块内需
+    // 调用 wait，Any 上的 wait 在 Kotlin 中是 error 级废弃。@Suppress 抑制警告。
+    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
     private val sendLock: java.lang.Object = java.lang.Object()
     /** 自适应发送窗口（AIMD，受 sendLock 保护）。 */
     private var window = WINDOW_INIT
 
     @Volatile private var recvNext = 0
     private val outOfOrder = HashMap<Int, ByteArray>()
+    // 注：必须用 java.lang.Object（而非 kotlin.Any）——synchronized 块内需
+    // 调用 notifyAll，Any 上的 notifyAll 在 Kotlin 中是 error 级废弃。
+    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
     private val recvLock: java.lang.Object = java.lang.Object()
 
     /** 已按序重组的数据块队列。 */
@@ -105,6 +119,13 @@ class UdpReliableSocket(
     @Volatile private var lastRecvTime = System.currentTimeMillis()
     @Volatile private var peerDeadFired = false
 
+    // 心跳 RTT 探测（本地计时，零协议变更）：
+    // 发 KEEPALIVE 时记下纳秒时刻，收到对应 ACK 时算 RTT。
+    // 仅空闲时发 KEEPALIVE（传输中 lastSendTime 不断更新，不触发），
+    // 故收到 ACK 时若无心跳在途则忽略，不会污染数据 ACK 统计。
+    @Volatile private var kaSentAtNanos: Long = 0L
+    @Volatile private var lastRttMs: Long = -1L   // -1 表示暂无数据
+
     // P1：SYNC 状态
     private val syncLock = Object()
     @Volatile private var syncInProgress = false
@@ -114,6 +135,9 @@ class UdpReliableSocket(
     // P2: 轮次对齐 + 版本
     @Volatile private var syncOffset: Long? = null      // responder钟 - 本机钟
     @Volatile private var syncRtt: Long? = null         // P2 #9: SYNC 最小 RTT（毫秒）
+    // RTO（重传超时，毫秒）：随实测 RTT 自适应（RTO = 4×RTT，夹在 [150,1000]）。
+    // 初始 300ms（无 RTT 数据时的保守值）。SYNC 测得 RTT 后收紧，加快丢包恢复。
+    @Volatile private var rtoMs: Long = 300L
     @Volatile private var peerVer = 1                   // 对端协议版本（默认 1）
     @Volatile private var commitSeq = 0L                // COMMIT 自增轮次号
     @Volatile private var lastCommitId = -1L            // 已处理的 commit_id（去重）
@@ -258,6 +282,9 @@ class UdpReliableSocket(
             val best = samples.minByOrNull { it[0] }!!
             syncOffset = best[1]
             syncRtt = best[0]
+            // RTO 固定 300ms（回退自适应：曾改为 4×RTT 下限250ms，但在
+            // 移动网络抖动下过于激进，误判丢包导致重传风暴、窗口反复减半）。
+            rtoMs = 300
             log("[SYNC] 最佳 RTT=" + best[0] + "ms offset=" + best[1] + "ms peerVer=" + peerVer)
             // 发 SYNC_COMMIT
             val deltaMs = SYNC_COMMIT_DELAY_MS
@@ -426,7 +453,9 @@ class UdpReliableSocket(
                 return
             }
             TYPE_DATA -> {
-                var ackSend = recvNext
+                // ackSend 在下方 when 的每个分支（含 else）均被赋值，
+                // 故声明为无初值，由编译器确认明确赋值（去掉冗余初始化警告）。
+                val ackSend: Int
                 synchronized(recvLock) {
                     when {
                         seq == recvNext -> {
@@ -453,6 +482,17 @@ class UdpReliableSocket(
                 synchronized(recvLock) {
                     peerClosed = true
                     recvLock.notifyAll()
+                }
+            }
+            TYPE_ACK -> {
+                // 心跳 RTT 探测：若正在等待 keepalive 回复，计算往返时延。
+                // 仅在 kaSentAtNanos > 0（刚发过心跳）时计算，避免把
+                // 数据 ACK 误当心跳回复（传输中不发心跳，故不会误判）。
+                val sentAt = kaSentAtNanos
+                if (sentAt > 0) {
+                    kaSentAtNanos = 0L
+                    lastRttMs = (System.nanoTime() - sentAt) / 1_000_000
+                    log("[UDP-RTP] 心跳 RTT = " + lastRttMs + " ms（peer=" + peerAddr + "）")
                 }
             }
         }
@@ -496,11 +536,37 @@ class UdpReliableSocket(
         }
     }
 
+    /**
+     * 打洞前 NAT 预热：连发几个 KEEPALIVE，让本端 NAT conntrack 处于热态。
+     *
+     * 原理：很多家用 NAT / CGNAT 对"刚建立或即将超时的 TCP 映射"会丢 SYN，
+     * 导致同时打开的 SYN 被丢弃。发送期间保持 UDP 通道活跃，可让本端 NAT
+     * 相关映射槽保持活跃，紧接的 SYN 更易被转发。
+     *
+     * 复用现有 TYPE_KEEPALIVE（对端回 ACK），零协议变更。
+     * 阻塞执行（count×intervalMs，默认约 100ms），由调用方在后台线程执行。
+     */
+    fun warmUpNat(count: Int = 5, intervalMs: Long = 20) {
+        for (i in 0 until count) {
+            if (closed) return
+            try {
+                sendFn(peerAddr, buildPacket(TYPE_KEEPALIVE, 0, recvNext, ByteArray(0)))
+                lastSendTime = System.currentTimeMillis()
+            } catch (_: Exception) {}
+            if (i < count - 1) {
+                try { Thread.sleep(intervalMs) } catch (_: InterruptedException) { return }
+            }
+        }
+    }
+
     /** P2: 返回最近一次 SYNC offset（responder钟-本机钟），无则 null。 */
     fun getSyncOffset(): Long? = syncOffset
 
     /** P2 #9: 返回最近一次 SYNC 最小 RTT（毫秒），无则 null。 */
     fun getSyncRtt(): Long? = syncRtt
+
+    /** 心跳 RTT 探测：返回最近一次心跳往返时延（毫秒），-1 表示暂无数据。 */
+    fun getLastRttMs(): Long = lastRttMs
 
     /** P2: 返回对端协议版本（默认 1）。 */
     fun getPeerVer(): Int = peerVer
@@ -544,7 +610,7 @@ class UdpReliableSocket(
             val toResend: List<Pair<Int, ByteArray>>
             synchronized(sendLock) {
                 toResend = sendQueue.entries
-                    .filter { now - it.value.second > RTO_MS }
+                    .filter { now - it.value.second > rtoMs }
                     .map { Pair(it.key, it.value.first) }
             }
             if (toResend.isNotEmpty()) {
@@ -573,9 +639,10 @@ class UdpReliableSocket(
             if (now - lastSendTime >= KEEPALIVE_INTERVAL_MS) {
                 if (closed) break   // 双检：sleep 期间可能已被 close
                 try {
+                    kaSentAtNanos = System.nanoTime()   // RTT 计时起点
                     sendFn(peerAddr, buildPacket(TYPE_KEEPALIVE, 0, recvNext, ByteArray(0)))
                     lastSendTime = now
-                } catch (_: Exception) {}
+                } catch (_: Exception) { kaSentAtNanos = 0L }
             }
             // 2) 失联检测（只触发一次）
             if (!peerDeadFired && now - lastRecvTime > PEER_DEAD_TIMEOUT_MS) {

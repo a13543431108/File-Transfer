@@ -35,6 +35,9 @@ object ReusePort {
     /**
      * 为 socket 开启 SO_REUSEPORT（必须在 bind 前调用）。返回是否成功。
      */
+    // 成功日志只打一次（避免打洞风暴时刷屏）。失败始终打。
+    @Volatile private var loggedSuccessOnce = false
+
     @Synchronized
     fun enable(socket: Socket, log: (String) -> Unit): Boolean {
         // ① 触发 fd 创建 —— 关键！
@@ -58,7 +61,11 @@ object ReusePort {
         // ③ 设置 SO_REUSEPORT
         return try {
             Os.setsockoptInt(pfd.fileDescriptor, OsConstants.SOL_SOCKET, SO_REUSEPORT_LINUX, 1)
-            log("[端口复用] SO_REUSEPORT 设置成功")
+            // 成功日志只打首次（风暴时每次 connect 都调此函数，全打会刷屏）
+            if (!loggedSuccessOnce) {
+                loggedSuccessOnce = true
+                log("[端口复用] SO_REUSEPORT 设置成功（后续相同日志静默）")
+            }
             true
         } catch (t: Throwable) {
             log("[端口复用] SO_REUSEPORT 设置失败: " +

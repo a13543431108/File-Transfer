@@ -87,6 +87,13 @@ class KeepaliveScheduler(val role: String, val proto: String) {
 /** 协议优先级：数字越小越优先当 hot。TCP > UDP-RTP。 */
 private val PROTO_PRIORITY = mapOf("tcp" to 0, "udp" to 1)
 
+/**
+ * 测试开关：true = 只允许 TCP 通道（UDP-RTP 不参与发送）。
+ * 用于验证"TCP 打洞是否真的可用"——若 TCP 不可用则发送【明确失败】，
+ * 不会被 UDP-RTP 静默回退掩盖。生产环境应为 false。
+ */
+const val TCP_ONLY = false
+
 /** 单条路径的运行时状态。 */
 class PathRecord(
     val pathId: String,

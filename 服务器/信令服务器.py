@@ -225,6 +225,13 @@ room_pwd = {}       # {room_name: sha256hex 或 None}  None=开放房间，无�
 id_index = {}       # {member_id: (room_name, addr_tuple)}
 tcp_mappings = {}   # {member_id: (ip, port)}  服务器观测到的客户端 TCP 公网映射
 tcp_socks = {}      # {member_id: socket}  保持 TCP 映射存活的连接
+# {member_id: 最后活跃时间ms}  映射连接断开后延迟清理 pub_tcp 的计时
+tcp_mapping_ts = {}
+# 映射连接断开后，pub_tcp 保留时长（毫秒）。原因：客户端"登记映射后即关
+# 映射 socket 以释放本地端口给打洞 socket 独占"（消除 Windows 上映射 socket
+# 抢入站 SYN 的问题）。但 TCP NAT 映射不会因 socket 关闭立即消失（独立超时
+# 通常数分钟），故服务器可安全保留 pub_tcp 一段时间。
+TCP_MAPPING_GRACE_MS = 180000
 udp_mappings = {}   # {member_id: (ip, port)}  客户端 UDP 打洞 socket 的公网映射
 state_lock = threading.Lock()
 
@@ -236,6 +243,7 @@ T_BYE = "bye"
 T_JOINED = "joined"
 T_MEMBER_JOIN = "member_join"
 T_MEMBER_LEAVE = "member_leave"
+T_MEMBER_UPDATE = "member_update"   # 成员信息更新（如 TCP 映射登记完成）
 T_PUNCH_GO = "punch_go"
 T_ERROR = "error"
 T_NAT_PROBE = "nat_probe"                 # 客户端 -> 服务器：请求回复观察到的公网地址
@@ -315,9 +323,9 @@ def gen_id():
     return uuid.uuid4().hex[:8]
 
 
-def make_member(name, pub_addr, lan, tcp, last_hb, did=""):
+def make_member(name, pub_addr, lan, tcp, last_hb, did="", can_listen=True):
     return {"name": name, "pub": pub_addr, "lan": lan, "tcp": tcp,
-            "last_hb": last_hb, "did": did}
+            "last_hb": last_hb, "did": did, "can_listen": can_listen}
 
 
 def _calc_tcp_udp_offset(member_id):
@@ -354,6 +362,7 @@ def member_for_peer(member_id, member):
         "tcp_udp_offset": _calc_tcp_udp_offset(member_id),
         "lan": member["lan"],
         "tcp": member["tcp"],
+        "can_listen": member.get("can_listen", True),
     }
 
 
@@ -447,8 +456,18 @@ def handle_join(sock, msg, addr):
             if old is None or (my_did and old.get("did") == my_did):
                 my_id = reuse_id
 
-        # 同 did 去重：移除该设备的【其他】旧 id（reuse_id 自身除外）。
-        # 兜底防御：万一客户端没带 reuse_id 而生成新 id，也不会残留"两个自己"。
+        # did 兜底复用：客户端崩溃重启后 myId 丢失（没传 reuse_id），但 did
+        # 稳定。此时若同 did 已有成员，直接【复用其 id】——对端看到的是
+        # "同一成员回归"，不产生"旧成员离开 + 新成员加入"的抖动，按 peer_id
+        # 缓存的状态也不会孤儿化。
+        if my_id is None and my_did:
+            for m, info in members.items():
+                if info.get("did") == my_did:
+                    my_id = m
+                    break
+
+        # 同 did 去重：移除该设备的【其他】旧 id（复用/兜底命中的自身除外）。
+        # 兜底防御：万一客户端没带 reuse_id 且无 did 匹配，也不会残留"两个自己"。
         if my_did:
             for dup_id in [m for m, info in members.items()
                            if info.get("did") == my_did and m != my_id]:
@@ -488,6 +507,9 @@ def handle_join(sock, msg, addr):
             tcp=msg.get("tcp", 0),
             last_hb=now_ms(),
             did=my_did,
+            # 客户端能否"listen+映射同端口"（Windows=true，Android=false）。
+            # 旧客户端不带此字段 → 默认 True（按能 listen 处理，退回 ID 规则）。
+            can_listen=bool(msg.get("can_listen", True)),
         )
         members[my_id] = member
         id_index[my_id] = (room, addr)
@@ -593,6 +615,7 @@ def remove_member(sock, mid):
         remaining = len(others)
         s = tcp_socks.pop(mid, None)
         tcp_mappings.pop(mid, None)
+        tcp_mapping_ts.pop(mid, None)
         udp_mappings.pop(mid, None)
     if s:
         try:
@@ -755,18 +778,40 @@ def _handle_tcp_reg(conn, addr):
 
     with state_lock:
         tcp_mappings[mid] = addr
+        tcp_mapping_ts[mid] = now_ms()
         old = tcp_socks.get(mid)
         tcp_socks[mid] = conn
         member = None
+        others = []
         info = id_index.get(mid)
         if info:
-            member = rooms.get(info[0], {}).get(mid)
-        if member:
-            member["last_hb"] = now_ms()
+            room = info[0]
+            member = rooms.get(room, {}).get(mid)
+            if member:
+                member["last_hb"] = now_ms()
+                # 收集同房间其他成员（用于广播 member_update）
+                others = [(oid, m) for oid, m in rooms.get(room, {}).items()
+                          if oid != mid]
+        # 构造广播快照（锁内取，避免并发改动）
+        my_peer_snapshot = member_for_peer(mid, member) if member else None
     if old:
         try: old.close()
         except Exception: pass
     print("[TCP] 登记映射 %s -> %s" % (mid, fmt_addr(addr)))
+
+    # 主动广播 member_update：其他成员拿到本端刚登记的 pub_tcp，立刻可打洞，
+    # 无需等本端再发 punch_req（消除"等映射下发"的时序竞态）。
+    if my_peer_snapshot is not None:
+        for _, om in others:
+            try:
+                send_to(om["pub"], {
+                    "type": T_MEMBER_UPDATE, "ver": VER,
+                    "member": my_peer_snapshot,
+                })
+            except Exception:
+                pass
+        print("[TCP] 广播 member_update %s（pub_tcp=%s）给 %d 个成员"
+              % (mid, my_peer_snapshot.get("pub_tcp"), len(others)))
 
     # 挂起保持连接（读阻塞直到对端关闭）
     try:
@@ -781,7 +826,10 @@ def _handle_tcp_reg(conn, addr):
         with state_lock:
             if tcp_socks.get(mid) is conn:
                 tcp_socks.pop(mid, None)
-                tcp_mappings.pop(mid, None)
+                # 注意：不立即清 tcp_mappings！延迟清理——客户端会主动关闭
+                # 映射连接以释放本地端口给打洞 socket。NAT 映射仍存活，
+                # pub_tcp 仍有效，保留 TCP_MAPPING_GRACE_MS 供打洞使用。
+                tcp_mapping_ts[mid] = now_ms()
         try: conn.close()
         except Exception: pass
 
@@ -797,6 +845,14 @@ def cleanup_loop(sock):
                      if rooms.get(room, {}).get(mid, {}).get("last_hb", 0) < deadline]
         for mid in stale:
             remove_member(sock, mid)
+        # 清理"映射连接已断开且超过宽限期"的 pub_tcp（见 _handle_tcp_reg）
+        now = now_ms()
+        with state_lock:
+            expired = [mid for mid, ts in tcp_mapping_ts.items()
+                       if mid not in tcp_socks and (now - ts) > TCP_MAPPING_GRACE_MS]
+            for mid in expired:
+                tcp_mappings.pop(mid, None)
+                tcp_mapping_ts.pop(mid, None)
         # 周期性保存状态（崩溃后最多丢 STATE_SAVE_INTERVAL 秒的变化）
         if time.time() - last_save >= STATE_SAVE_INTERVAL:
             save_state()

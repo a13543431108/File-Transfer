@@ -11,7 +11,16 @@ object Constants {
     // 必须与 LAN 用的 9999 分离：房间模式需要三个 socket 同时占用同一端口
     // （映射观测 + 入站监听 + 打洞出站），Android 的 SO_REUSEADDR 严格，
     // 若与文件接收监听共用 9999 会 EADDRINUSE，导致 pub_tcp 无法登记、打洞必败。
-    const val ROOM_TCP_PORT = 9998
+    // 房间模式 TCP 端口：映射观测 + 打洞共用（须与映射端口一致）。
+    // 从 9998 改到 9995：实测 9998 在部分环境被占用/冲突（Windows 上
+    // 映射 socket 与打洞 socket 争 9998 导致打洞失败），换到空闲的 9995。
+    const val ROOM_TCP_PORT = 9995
+    /**
+     * 本端能否"监听 + 映射同端口"（决定打洞角色）：
+     *   Windows = true（SO_REUSEADDR 可共存），Android = false（不能，只出站）。
+     * 上报给服务器转发，供对端决定谁 listen、谁 connect。
+     */
+    const val CAN_LISTEN = false
 
     // 时间/大小
     const val NODE_TIMEOUT_MS = 600_000L          // 节点 10 分钟无响应则移除
@@ -54,6 +63,13 @@ object Constants {
     const val FLAG_FILE = 0x00
     const val FLAG_FOLDER = 0x01
     const val FLAG_QUERY_OFFSET = 0x02
+    // TCP 心跳探测（仅房间模式长连接使用，空载/空闲时发）：
+    //   PING: 发送方 -> 接收方，单字节
+    //   PONG: 接收方 -> 发送方，单字节
+    // 与 UDP-RTP 的 TYPE_KEEPALIVE 对齐语义，用于对比两协议的应用层 RTT。
+    // 注意：局域网模式下不会发送（只有长连接保活循环发）。
+    const val FLAG_PING = 0x10
+    const val FLAG_PONG = 0x11
 
     // flags 位
     const val FLAG_COMPRESS = 0x01   // bit0

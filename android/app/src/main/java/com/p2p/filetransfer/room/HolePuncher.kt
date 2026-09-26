@@ -105,15 +105,15 @@ class HolePuncher(private val localTcpPort: Int, private val log: (String) -> Un
             round++
             val r = connectCandidatesParallel(candidates, peer.id)
             if (r != null) {
-                // 软握手确认：成功→已验证；失败→仍返回（降级信任）。
-                // 不因握手失败而废弃连接：SO_REUSEPORT 干扰下握手往返常误失败，
-                // 据此关闭会把【本可用的连接】误杀，反而降低成功率。
-                // 是否正确由"实际发数据"验证（发送失败会自动换路/重建）。
+                // 握手确认：成功→标记已验证；失败→仍返回（不关闭）。
+                // 原因：TCP 同时打开时握手魔数收发时序敏感，易误判失败；
+                // 若据此关闭会把【本可用的连接】误杀（实测致打洞失败）。
+                // 半开保护由对端（电脑端强制握手）负责。
                 if (punchHandshake(r.socket, RoomConfig.PUNCH_HANDSHAKE_TIMEOUT_MS)) {
                     log("[打洞] 成功（握手确认）-> " + r.ip + ":" + r.port +
                             " (peer=" + peer.id + ", 第" + round + "轮)")
                 } else {
-                    log("[打洞] 连接成功（握手无回应，降级信任）-> " + r.ip + ":" + r.port +
+                    log("[打洞] 连接成功（握手无回应，保留）-> " + r.ip + ":" + r.port +
                             " (peer=" + peer.id + ", 第" + round + "轮)")
                 }
                 return r
@@ -122,6 +122,56 @@ class HolePuncher(private val localTcpPort: Int, private val log: (String) -> Un
         }
         if (verbose) log("[打洞] 风暴结束未成功 peer=" + peer.id + "（" + round + " 轮）")
         return null
+    }
+
+    /**
+     * 精准打洞（TCP 同时打开的"精确"版）：
+     *   在 atMs 时刻，只向候选地址发【一轮】并行 SYN，然后等结果。
+     *   不跑 6 秒风暴——风暴把多个 SYN 分散到不同时刻/端口，SO_REUSEPORT
+     *   还会把入站 SYN 分错 socket，反而降低"两端 SYN 精确交叉"的概率。
+     *
+     * 一轮失败 → 返回 null，调用方回退到 [punch]（6 秒风暴）兜底。
+     */
+    fun punchOnce(peer: RoomMember, atMs: Long): PunchResult? {
+        val tcpPort = peer.tcp
+        if (tcpPort <= 0) {
+            log("[打洞] punchOnce 放弃：对方 tcp 端口为 0")
+            return null
+        }
+        val candidates = buildCandidates(peer)
+        if (candidates.isEmpty()) {
+            log("[打洞] punchOnce 放弃：候选地址为空")
+            return null
+        }
+        if (verbose) {
+            log("[打洞] punchOnce peer=" + peer.id + " 候选=" +
+                    candidates.joinToString { it.first + ":" + it.second })
+        }
+        if (atMs > 0) waitUntil(atMs)
+
+        // 单轮打洞：T_go 时做一次（多候选并行）connect。
+        //
+        // 为什么单轮：TCP 同时打开只要两端 SYN 交叉即成；若某次没交叉，
+        // 【内核会自动重传 SYN】（约 1s/3s/7s…），覆盖数秒窗口，无需手动多轮。
+        // 手动多轮反而有害：
+        //   · 并发多轮 → 多 socket 同 bind(9998) 连同一目标，四元组冲突，
+        //     SYN,ACK 分错 socket（曾致"TCP 成功但应用层误判失败"）；
+        //   · 串行多轮 → 每轮 connect 阻塞数秒，轮间隔被撑大，错过窗口。
+        // 故回到单轮，让内核重传兜底。
+        log("[打洞] punchOnce（T_go 单轮，候选=" + candidates.size + "）")
+        val r = try { connectCandidatesParallel(candidates, peer.id) } catch (e: Exception) {
+            log("[打洞] punchOnce 异常: " + e.message); null
+        } ?: return null
+        // 握手确认：失败不关闭（避免误杀同时打开的有效连接）。
+        // 半开保护由对端负责。
+        if (punchHandshake(r.socket, RoomConfig.PUNCH_HANDSHAKE_TIMEOUT_MS)) {
+            log("[打洞] 精准成功（握手确认）-> " + r.ip + ":" + r.port +
+                    " (peer=" + peer.id + ")")
+        } else {
+            log("[打洞] 精准连接成功（握手无回应，保留）-> " + r.ip + ":" + r.port +
+                    " (peer=" + peer.id + ")")
+        }
+        return r
     }
 
     /** P2 #3: 并行尝试所有候选，返回首个成功结果。 */

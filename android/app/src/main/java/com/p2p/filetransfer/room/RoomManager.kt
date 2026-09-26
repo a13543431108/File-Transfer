@@ -1,5 +1,6 @@
 package com.p2p.filetransfer.room
 
+import com.p2p.filetransfer.protocol.Constants
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -16,7 +17,11 @@ class RoomConn(
     val member: RoomMember,
     @Volatile var state: RoomConnState = RoomConnState.CONNECTING,
     @Volatile var socket: Socket? = null,
-    @Volatile var addr: String? = null
+    @Volatile var addr: String? = null,
+    // 是否为"约定主连接"（去重用）：同时打开可能形成两条独立 TCP 连接
+    // （各方向一条），两端各用一条 → 半开。用 ID 规则约定只保留一条：
+    // ID 大者的出站连接 = 主；ID 小者的入站连接 = 主。
+    @Volatile var preferred: Boolean = true
 ) {
     /** 读写锁（协程 Mutex）：发送时持锁，接收循环空闲时持锁读，串行化收发。 */
     val ioLock = kotlinx.coroutines.sync.Mutex()
@@ -56,6 +61,10 @@ class RoomManager(
     private val REBUILD_COOLDOWN_MS = 30_000L
 
     // P2: 打洞轮次对齐（对端下发 PUNCH_ROUND → 存入，供 punchTask 等待）
+    // 注：必须用 java.lang.Object（而非 kotlin.Any）——因为要在 synchronized
+    // 块内调用 wait/notifyAll，而 Any 上的这些方法在 Kotlin 中是 error 级废弃。
+    // 抑制 PLATFORM_CLASS_MAPPED_TO_KOTLIN 警告（此处为有意使用）。
+    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
     private val punchRoundLock: java.lang.Object = java.lang.Object()
     private val punchRoundEvt = HashMap<String, Pair<Long, Long>>()  // peerId -> (roundNo, tGoR)
 
@@ -69,6 +78,26 @@ class RoomManager(
     // （保留适度冗余，又不至于泛滥）
     private val punchActive = HashMap<String, Int>()
 
+    // SYNC 精准打洞计划：{peerId: tGo(本机毫秒)}。
+    // 一旦收到 SYNC_COMMIT（进入精准打洞模式），记录 tGo；
+    // punchTask 检测到该 peer 有精准计划时【主动让路】，避免与
+    // PUNCH_ROUND 驱动的重试风暴抢执行权、错过对齐时刻（导致半开）。
+    // 精准打洞成功/失败后清除。
+    private val syncPlan = HashMap<String, Long>()
+
+    // 「等待精准打洞」门闩：{peerId: 加入时刻(ms)}。
+    // UDP-RTP 就绪后加入；精准打洞结束（成功/失败）后移除。
+    // 在此期间的【任何】风暴触发（含服务器 punch_go）都让路——
+    // 保证"先精准打洞，失败才风暴"的严格顺序。
+    // 超时（SYNC_AWAIT_TIMEOUT_MS）后自动失效，防止对端不支持
+    // SYNC（旧版本/包丢失）时永久阻塞，兜底风暴仍能启动。
+    private val awaitingSync = HashMap<String, Long>()
+    // 门闩有效期：必须覆盖"UDP-RTP就绪 → SYNC采样 → COMMIT → 到点打洞"全程。
+    // 实测 SYNC 全程约 1~2 秒（若启动不被 IO 池延迟）；取 6 秒留足余量。
+    // 过短会导致门闩在 SYNC 完成前失效，responder 的 punchTask 抢先打洞，
+    // 两端用不同打洞任务 → 一端成功一端失败（方向固定的"不一致"半开）。
+    private val SYNC_AWAIT_TIMEOUT_MS = 6000L
+
     // 连接池：{peerId: 最后活跃时间戳} —— 空闲降频保活用
     private val peerLastActive = HashMap<String, Long>()
 
@@ -79,6 +108,13 @@ class RoomManager(
     private val tcpAliveFail = HashMap<String, Int>()
     private val TCP_KEEPALIVE_GRACE_MS = 10_000L
     private val TCP_KEEPALIVE_FAIL_THRESHOLD = 2
+
+    // TCP 心跳 RTT 探测：{peerId: 上次发 PING 的时刻}。
+    // 仅在【空闲】（peerLastActive 距今 >= TCP_PING_IDLE_MS）时才发，
+    // 避免干扰文件数据传输（传输中 ioLock 被占，tryLock 会失败即跳过）。
+    private val tcpLastPingAt = HashMap<String, Long>()
+    private val TCP_PING_IDLE_MS = 5_000L      // 空闲超过 5 秒才算"可探测"
+    private val TCP_PING_INTERVAL_MS = 15_000L // PING 间隔（与 UDP-RTP 心跳一致）
 
     /** 取（或创建）某 peer 的路径调度器。 */
     private fun getPathSched(peerId: String): PeerPathScheduler = synchronized(this) {
@@ -146,6 +182,9 @@ class RoomManager(
         synchronized(this) {
             if (udpConns.containsKey(peerId)) return
             udpConns[peerId] = rtp
+            // 门闩：UDP-RTP 就绪 → 进入"等待精准打洞"窗口。
+            // 窗口内所有风暴触发源（含 punch_go）都让路，优先走 SYNC 精准打洞。
+            awaitingSync[peerId] = System.currentTimeMillis()
         }
         log("[UDP-RTP] 可靠通道就绪 peer=" + peerId + " addr=" + rtp.peer)
         // P2: 挂载轮次对齐回调
@@ -171,6 +210,51 @@ class RoomManager(
         maybeStartSync(peerId, rtp)
     }
 
+    /**
+     * 标准 C/S 打洞规则：ID 大者为 initiator（主动 connect），
+     * ID 小者 listen 等待对方 connect。
+     *
+     * 原因（核心）：TCP"同时打开"要求两端 SYN 精确交叉，异构设备/NAT 下
+     * 极易失败（实测电脑↔手机必败）。改为标准 C/S——一方 listen、一方
+     * connect，是所有 NAT 唯一保证支持的路径。ID 小者 listen（其 LISTEN
+     * socket 接住入站 SYN），ID 大者 connect。
+     */
+    /** 房间端口是否已监听（由 Service 注入实时查询）。null = 未知，按已监听处理。 */
+    @Volatile var roomPortBoundChecker: (() -> Boolean)? = null
+
+    private fun isPunchInitiator(peerId: String): Boolean {
+        // NAT 穿透铁律：纯 listen 不成立——监听方不发 SYN 则本机 NAT
+        // 无映射，对方 SYN 被丢弃（pcap 实证）。故双端都必须 connect
+        // （各发出站 SYN 打洞本机 NAT），listen 仅作兜底。
+        return true
+    }
+
+    /** 本端【出站 connect】连接是否为主连接（ID 大者的出站 = 主）。 */
+    private fun outboundIsPreferred(peerId: String): Boolean {
+        val myId = signaling?.myId
+        if (myId.isNullOrEmpty() || peerId.isEmpty()) return true
+        return myId > peerId
+    }
+
+    /** 本端【入站 accept】连接是否为主连接（ID 小者的入站 = 主）。 */
+    private fun inboundIsPreferred(peerId: String): Boolean {
+        val myId = signaling?.myId
+        if (myId.isNullOrEmpty() || peerId.isEmpty()) return true
+        return myId < peerId
+    }
+
+    /**
+     * 是否有可达靶子（打洞候选）。
+     *   · pub_tcp 非空 → 有公网 TCP 靶子
+     *   · lan 非空 → 有内网候选（跨网时快速失败，但不至于完全无候选）
+     * 都没有 = 打也白打（无候选可连），直接放弃、等对端登记映射后再触发。
+     */
+    private fun hasReachableTarget(p: RoomMember): Boolean {
+        if (p.pubTcp.isNotEmpty()) return true
+        if (p.lan.any { it.isNotEmpty() }) return true
+        return false
+    }
+
     /** P1：initiator 判断（myId < peerId 时才发起 SYNC）。 */
     private fun maybeStartSync(peerId: String, rtp: UdpReliableSocket) {
         val myId = signaling?.myId ?: return
@@ -183,8 +267,11 @@ class RoomManager(
             val c = connections[peerId]
             if (c != null && c.state == RoomConnState.CONNECTED) return
         }
-        scope.launch(Dispatchers.IO) {
-            delay(300)  // 避免与 punch_go 触发的 TCP 打洞并发
+        // 用 Dispatchers.Default（CPU 池）而非 IO：打洞风暴会占满 IO 线程池，
+        // 用 IO 会让 SYNC 启动被排队数秒，门闩期（6秒）内来不及完成 →
+        // 两端打洞任务不一致。Default 池更独立。
+        scope.launch(Dispatchers.Default) {
+            delay(100)  // 短暂让位（门闩已挡 punch_go 触发的打洞，无需长等）
             synchronized(this@RoomManager) {
                 val c = connections[peerId]
                 if (c != null && c.state == RoomConnState.CONNECTED) return@launch
@@ -200,7 +287,11 @@ class RoomManager(
     fun onUdpSyncReady(peerId: String, tGo: Long) {
         synchronized(this) {
             val c = connections[peerId]
-            if (c != null && c.state == RoomConnState.CONNECTED) return
+            if (c != null && c.state == RoomConnState.CONNECTED) {
+                // 已连接（其他路径已成功）→ 清门闩，避免残留
+                awaitingSync.remove(peerId)
+                return
+            }
         }
         // P2 #9: 用 SYNC RTT 自适应 connect 超时
         try {
@@ -208,27 +299,69 @@ class RoomManager(
             if (rtt != null) puncher.setAdaptiveTimeout(rtt)
         } catch (_: Exception) {}
         val peer = synchronized(this) { members[peerId] } ?: return
-        scope.launch(Dispatchers.IO) {
-            // 等到 tGo 时刻
+        // 标准 C/S：ID 小者 listen 等待（不主动 connect），只登记 plan 让 punchTask 也让路。
+        if (!isPunchInitiator(peerId)) {
+            log("[打洞] peer=" + peerId + "：本端 ID 较小，listen 等待对方连接（精准打洞跳过）")
+            synchronized(this) { syncPlan.remove(peerId); awaitingSync.remove(peerId) }
+            return
+        }
+        // 没靶子不打：无候选可连，精准打洞也无意义（等对端登记映射后重触发）。
+        if (!hasReachableTarget(peer)) {
+            log("[打洞] peer=" + peerId + " 无靶子，跳过精准打洞（不打）")
+            synchronized(this) { syncPlan.remove(peerId); awaitingSync.remove(peerId) }
+            return
+        }
+        // 登记精准打洞计划：punchTask 见此即让路（避免抢执行权错过 tGo）
+        synchronized(this) { syncPlan[peerId] = tGo }
+        // 用 Dispatchers.Default（CPU 池）而非 IO：打洞风暴期间 IO 池线程紧张，
+        // 用 IO 会被排队延迟，错过 tGo。Default 池更独立、调度更快。
+        scope.launch(Dispatchers.Default) {
             val now = System.currentTimeMillis()
             val waitMs = tGo - now
-            if (waitMs > 0) delay(minOf(waitMs, 3000L))
-            log("[SYNC] 到点执行 TCP 打洞 peer=" + peerId)
-            val result = try { puncher.punch(peer, 0) {
-                synchronized(this@RoomManager) {
-                    val c = connections[peerId]
-                    c != null && c.state == RoomConnState.CONNECTED
-                }
-            } } catch (e: Exception) {
-                log("[SYNC] punch 异常: " + e.message); null
+            // NAT 预热必须在 T_go【之前】完成，否则预热耗时(约100ms)会把
+            // 实际发 SYN 的时刻推迟到 T_go 之后，错过对端的同时打开窗口。
+            // 提前 warmupLeadMs 唤醒，预热完刚好到 T_go。
+            val warmupLeadMs = 120L
+            if (waitMs > warmupLeadMs) {
+                delay(waitMs - warmupLeadMs)
+                try { getUdpConn(peerId)?.warmUpNat(5, 20) } catch (_: Exception) {}
+            } else if (waitMs > 0) {
+                delay(minOf(waitMs, 3000L))
+            }
+            log("[SYNC] 到点执行精准打洞 peer=" + peerId)
+            // 用 punchOnce：到点只发一轮 SYN（真正的同时打开），不跑风暴。
+            // 一轮失败 → 回退 punchTask（6秒风暴）兜底。
+            val result = try { puncher.punchOnce(peer, 0) } catch (e: Exception) {
+                log("[SYNC] punchOnce 异常: " + e.message); null
             }
             if (result != null) {
                 installSocket(peerId, result)
                 log("[SYNC] 精准 TCP 打洞成功 peer=" + peerId)
             } else {
+                // 注意：punch 返回 null 也可能是"打洞期间已被其他路径连接"，
+                // 此时不是失败，不打误导性日志。
+                val alreadyConnected = synchronized(this@RoomManager) {
+                    val c = connections[peerId]
+                    c != null && c.state == RoomConnState.CONNECTED
+                }
+                if (alreadyConnected) {
+                    log("[SYNC] 精准打洞期间已由其他路径连接，跳过 peer=" + peerId)
+                    synchronized(this@RoomManager) {
+                        syncPlan.remove(peerId); awaitingSync.remove(peerId)
+                    }
+                    return@launch
+                }
                 log("[SYNC] 精准 TCP 打洞失败 peer=" + peerId + "，转入多轮重试")
-                // P2: 单次精准打洞失败后，回落到轮次对齐的多轮重试
+                // 精准打洞失败：清除计划与门闩，让 punchTask 恢复（否则被永久抑制）
+                synchronized(this@RoomManager) {
+                    syncPlan.remove(peerId); awaitingSync.remove(peerId)
+                }
                 punchTask(peer, 0)
+                return@launch
+            }
+            // 精准打洞成功 → 清除计划与门闩
+            synchronized(this@RoomManager) {
+                syncPlan.remove(peerId); awaitingSync.remove(peerId)
             }
         }
     }
@@ -243,7 +376,19 @@ class RoomManager(
         try { r?.close() } catch (_: Exception) {}
     }
 
-    /** P2 #6: 对端 TCP 就绪 → 立即发起打洞。 */
+    /** P2 #6: 对端 TCP 就绪。
+     *
+     *  关键：TCP_READY 的语义是"我 TCP 映射就绪，可以打洞"（可以），
+     *  不是"现在就打"（现在）。若收到即打（atMs=0，无时刻对齐），会与
+     *  initiator 发起的 SYNC 精确对齐路径【抢同一个本地端口】，把
+     *  6 秒打洞窗口先耗光，等 SYNC 算好 tGo 时窗口已过 → 必然失败。
+     *
+     *  新策略：TCP_READY 只当"就绪门"，打洞交给 SYNC 精确对齐：
+     *    - 有 UDP-RTP → 等待 SYNC 协调（两端同 tGo 同时发 SYN）
+     *    - 超过 TCP_READY_SYNC_WAIT_MS 仍未连上 → 回退"直接打洞"
+     *      （回退时也等 TCP_READY_FALLBACK_DELAY_MS，让两端发出时刻
+     *       误差 ≈ RTT/2，优于立即打的随机错开）
+     */
     private fun onPeerTcpReady(peerId: String) {
         val peer: RoomMember
         synchronized(this) {
@@ -252,8 +397,24 @@ class RoomManager(
             peer = members[peerId] ?: return
             connections[peerId] = RoomConn(peer)
         }
-        log("[打洞] 对端 TCP 就绪，立即发起打洞 peer=" + peerId)
-        scope.launch(Dispatchers.IO) { punchTask(peer, 0) }
+        log("[打洞] 对端 TCP 就绪 peer=" + peerId + "，等待 SYNC 协调")
+        scope.launch(Dispatchers.IO) {
+            val rtp = getUdpConn(peerId)
+            if (rtp != null) {
+                // 有 UDP-RTP：优先等 SYNC 精确对齐
+                delay(RoomConfig.TCP_READY_SYNC_WAIT_MS)
+                val stillNotConnected = synchronized(this@RoomManager) {
+                    val c = connections[peerId]
+                    c == null || c.state != RoomConnState.CONNECTED
+                }
+                if (!stillNotConnected) return@launch
+                log("[打洞] SYNC 未完成，回退直接打洞 peer=" + peerId +
+                        "（再等 " + RoomConfig.TCP_READY_FALLBACK_DELAY_MS + "ms）")
+                // 回退：两端各自"收到 TCP_READY 后等 Δ"，近似对齐 SYN 发出时刻
+                delay(RoomConfig.TCP_READY_FALLBACK_DELAY_MS)
+            }
+            punchTask(peer, 0)
+        }
     }
 
     /** P2 #8: 对端放弃 TCP → 本端停止空等，标记失败并回退 UDP。
@@ -399,23 +560,43 @@ class RoomManager(
                     break
                 }
             }
+            // fallback: match by public IP (NAT may assign different
+            // ports to mapping-socket vs punch-socket).
+            if (readyPid == null && ip.isNotEmpty()) {
+                for ((pid, m) in members) {
+                    if (m.pubTcp.isNotEmpty() &&
+                        m.pubTcp.substringBeforeLast(':') == ip) {
+                        readyPid = pid
+                        readyMember = m
+                        break
+                    }
+                }
+            }
         }
         if (readyPid == null || readyMember == null) return false
-        // 软握手确认（锁外做，避免阻塞）：成功→验证；失败→仍接管。
-        // 与出站一致：不因握手失败而拒绝连接，避免误杀本可用的连接。
+        // 强制握手确认：失败=半开/单向 → 关闭不接管（避免把死连接当通道）。
         if (punchHandshake(socket, RoomConfig.PUNCH_HANDSHAKE_TIMEOUT_MS)) {
             log("[打洞] 入站连接 " + key + " 握手确认")
         } else {
-            log("[打洞] 入站连接 " + key + "（握手无回应，降级信任）")
+            log("[打洞] 入站连接 " + key + " 握手无回应（半开），关闭不接管")
+            try { socket.close() } catch (_: Exception) {}
+            return false
         }
+        val myPref = inboundIsPreferred(readyPid!!)
         synchronized(this) {
             val c = connections[readyPid!!]
             if (c != null && c.state == RoomConnState.CONNECTED && c.socket != null) {
-                return true  // 已有连接，忽略重复
+                // 已有连接：仅当"新来是主、已有非主"才替换；否则保留已有，
+                // 关闭新入站 socket（避免 fd 泄漏、避免双连接各用一条）。
+                if (!(myPref && !c.preferred)) {
+                    try { socket.close() } catch (_: Exception) {}
+                    return true
+                }
+                closeConn(c)
             }
             // 覆盖前先关掉旧 socket，避免并发入站/出站竞争导致 fd 泄漏
             if (c != null) closeConn(c)
-            val nc = RoomConn(readyMember!!, RoomConnState.CONNECTED, socket, key)
+            val nc = RoomConn(readyMember!!, RoomConnState.CONNECTED, socket, key, myPref)
             applyKeepalive(socket)
             connections[readyPid!!] = nc
         }
@@ -479,7 +660,7 @@ class RoomManager(
                             com.p2p.filetransfer.protocol.TcpStreamSocket(c.socket!!),
                             c.ioLock, false, role)
                     }
-                } else {
+                } else if (!TCP_ONLY) {
                     val rtp = synchronized(this) { udpConns[peerId] }
                     if (rtp != null && idOf(rtp) !in exclude) {
                         return SendChannel(rtp, rtp.ioLock, true, role)
@@ -496,9 +677,11 @@ class RoomManager(
                     com.p2p.filetransfer.protocol.TcpStreamSocket(c.socket!!),
                     c.ioLock, false, "?")
             }
-            val rtp = udpConns[peerId]
-            if (rtp != null && idOf(rtp) !in exclude) {
-                return SendChannel(rtp, rtp.ioLock, true, "?")
+            if (!TCP_ONLY) {
+                val rtp = udpConns[peerId]
+                if (rtp != null && idOf(rtp) !in exclude) {
+                    return SendChannel(rtp, rtp.ioLock, true, "?")
+                }
             }
         }
         return null
@@ -546,6 +729,11 @@ class RoomManager(
      */
     private suspend fun punchTask(peer: RoomMember, atMs: Long) {
         val pid = peer.id
+        // 标准 C/S：ID 小者 listen 等待（不主动 connect，靠 LISTEN socket 接对方 SYN）。
+        if (!isPunchInitiator(pid)) {
+            log("[打洞] peer=" + pid + "：本端 ID 较小，listen 等待对方连接")
+            return
+        }
         // 打洞并发限制：同一 peer 最多 2 个 punchTask 并发
         synchronized(this) {
             val cnt = punchActive[pid] ?: 0
@@ -567,20 +755,40 @@ class RoomManager(
                     log("[打洞] peer=" + pid + " 已由其他任务连接，本任务退出")
                     return
                 }
+                // SYNC 精准打洞优先（全局门闩）：若该 peer 正在"等待/执行精准打洞"
+                // 且未超时，本重试任务（无论来自 punch_go / TCP_READY / 轮次重试）
+                // 一律让路退出，保证"先精准打洞，失败才风暴"的严格顺序。
+                // 避免与精准打洞抢执行权、错过 tGo（导致两端 SYN 错开数秒 → 半开）。
+                // 超时保护：对端不支持 SYNC / COMMIT 丢失时，超时后放行兜底风暴。
+                val waiting = synchronized(this) {
+                    val t0 = awaitingSync[pid]
+                    t0 != null && System.currentTimeMillis() - t0 < SYNC_AWAIT_TIMEOUT_MS
+                }
+                val planned = synchronized(this) { syncPlan[pid] }
+                if (waiting || planned != null) {
+                    log("[打洞] peer=" + pid + " 等待精准打洞中" +
+                            (if (planned != null) "（tGo=" + planned + "）" else "") +
+                            "，重试任务让路退出")
+                    return
+                }
                 // 重读最新成员信息
                 var latest = synchronized(this) { members[pid] } ?: peer
-                // D 修复：pub_tcp 为空说明对端 TCP 公网映射尚未登记，
-                // 此时再重试也无候选可用。主动再发一次 punch_req，
-                // 让服务器重新下发带 pub_tcp 的 punch_go。
-                if (latest.pubTcp.isEmpty()) {
+                // 没靶子不打：pub_tcp 与内网候选都为空 → 无候选可连，打也白打。
+                // 主动再发一次 punch_req 请求映射，短暂等待后重读；仍无则放弃
+                // 本轮（等对端登记映射后由 member_update / punch_go 重新触发）。
+                if (!hasReachableTarget(latest)) {
                     try {
                         signaling?.let {
-                            log("[打洞] peer=" + pid + " pub_tcp 为空，重新请求映射")
+                            log("[打洞] peer=" + pid + " 无靶子（pub_tcp 与内网均空），请求映射后等待")
                             it.requestPunch(pid)
-                            delay(300)
-                            latest = synchronized(this) { members[pid] } ?: latest
                         }
                     } catch (_: Exception) {}
+                    delay(500)
+                    latest = synchronized(this) { members[pid] } ?: latest
+                    if (!hasReachableTarget(latest)) {
+                        log("[打洞] peer=" + pid + " 仍无靶子，放弃本轮（不打）")
+                        return
+                    }
                 }
                 if (attempt == 1) {
                     log("[打洞] 任务启动 peer=" + pid + " 本地端口=" + localTcpPort)
@@ -588,6 +796,9 @@ class RoomManager(
                     log("[打洞] 第 " + attempt + " 轮重试 peer=" + pid +
                             "（pub_tcp=" + latest.pubTcp + "）")
                 }
+                // NAT 预热：打洞前用 UDP keepalive 保持本端 NAT conntrack 热态，
+                // 让紧接的 SYN 更易被 NAT 转发（很多 NAT 对刚建/将超时的 TCP 映射丢 SYN）。
+                try { getUdpConn(pid)?.warmUpNat(5, 20) } catch (_: Exception) {}
                 // 传入 shouldStop：风暴期间若其他任务已连上，立即停止
                 val result = puncher.punch(latest, at) {
                     synchronized(this) {
@@ -657,16 +868,21 @@ class RoomManager(
     }
 
     private fun installSocket(peerId: String, result: PunchResult) {
+        val myPref = outboundIsPreferred(peerId)
         val member: RoomMember
         synchronized(this) {
             val old = connections[peerId]
             if (old != null && old.state == RoomConnState.CONNECTED && old.socket != null) {
-                try { result.socket.close() } catch (_: Exception) {}
-                return
+                // 已有连接：仅当"新来是主、已有非主"才替换；否则丢弃新的。
+                if (!(myPref && !old.preferred)) {
+                    try { result.socket.close() } catch (_: Exception) {}
+                    return
+                }
+                closeConn(old)
             }
             if (old != null) closeConn(old)
             val nc = RoomConn(members[peerId] ?: RoomMember(peerId, "", peerId, "", "", "", emptyList(), 0),
-                RoomConnState.CONNECTED, result.socket, result.ip + ":" + result.port)
+                RoomConnState.CONNECTED, result.socket, result.ip + ":" + result.port, myPref)
             connections[peerId] = nc
             member = nc.member
         }
@@ -729,6 +945,29 @@ class RoomManager(
                 val bad = s == null || s.isClosed || !s.isConnected
                 if (!bad) {
                     tcpAliveFail.remove(pid)
+                    // TCP 心跳 RTT 探测：空闲时发 PING（与 UDP-RTP 心跳对称）。
+                    // 用 ioLock.tryLock 非阻塞获取写权——若正有文件传输持锁，
+                    // 直接跳过本次（不干扰数据流，避免字节流错位）。
+                    val idleEnough: Boolean
+                    synchronized(this) {
+                        idleEnough = nowMs - (peerLastActive[pid] ?: 0L) >= TCP_PING_IDLE_MS &&
+                                nowMs - (tcpLastPingAt[pid] ?: 0L) >= TCP_PING_INTERVAL_MS
+                    }
+                    if (idleEnough) {
+                        val lock = c.ioLock
+                        if (lock.tryLock()) {
+                            try {
+                                s!!.getOutputStream().write(
+                                    com.p2p.filetransfer.protocol.Constants.FLAG_PING)
+                                s.getOutputStream().flush()
+                                synchronized(this) { tcpLastPingAt[pid] = nowMs }
+                                com.p2p.filetransfer.protocol.TcpRttTracker.markPingSent(pid)
+                            } catch (_: Exception) {
+                            } finally {
+                                lock.unlock()
+                            }
+                        }
+                    }
                     continue
                 }
                 // B② 连续失败阈值：未达阈值先记账，不判死（抗瞬时抖动）

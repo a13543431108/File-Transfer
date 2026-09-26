@@ -1,6 +1,7 @@
 package com.p2p.filetransfer.room
 
 import android.util.Log
+import com.p2p.filetransfer.protocol.Constants
 import com.p2p.filetransfer.util.SocketOptimizer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -437,6 +438,21 @@ class SignalingClient(
     }
 
     /**
+     * 时序独占打洞：释放映射观测 socket。
+     *
+     * 打洞要求本地端口上【只有一个 socket】，否则入站 SYN 可能被映射 socket
+     * （ESTABLISHED）抢走而丢弃（Windows 实测）。映射 socket 已完成登记
+     * pub_tcp 的使命，可安全关闭：锥形 NAT 下同一本地端口的 TCP 映射保留
+     * 数分钟，服务器也配置了延迟清理（180s），pub_tcp 仍有效。
+     */
+    fun releaseMapSocket() {
+        val s = mapSocket ?: return
+        try { s.close() } catch (_: Exception) {}
+        mapSocket = null
+        log("[信令] 映射 socket 已关闭（释放本地端口给打洞独占）")
+    }
+
+    /**
      * 停止信令客户端。
      * quiet=true：不发 BYE（网络切换重建用）——服务器保留成员条目，
      * 对端不掉线，重建后以同一 id 回归。
@@ -482,6 +498,7 @@ class SignalingClient(
         val msg = JSONObject().put("type", RoomConfig.T_JOIN).put("ver", RoomConfig.VER)
             .put("room", room).put("name", name).put("tcp", tcpPort)
             .put("lan", lan).put("did", deviceId)
+            .put("can_listen", Constants.CAN_LISTEN)   // 能否 listen+映射同端口
         // 网络重建时携带旧 id，服务器复用之（协议向后兼容：旧服务器忽略该字段）
         if (!reuseId.isNullOrEmpty()) {
             msg.put("reuse_id", reuseId)
@@ -537,7 +554,11 @@ class SignalingClient(
      * 用 SocketChannel + SO_REUSEPORT（公开 API），与打洞 socket 共用 9998。
      */
     private suspend fun openMapping() {
-        for (attempt in 1..3) {
+        var attempt = 0
+        // 持续重试：映射是打洞靶子，失败/慢会让对端一直收不到 pub_tcp。
+        // 只要信令还在运行就不断重试（间隔递增，上限 3s），直到成功。
+        while (running) {
+            attempt += 1
             var s: Socket? = null
             try {
                 // 关键：手机可能同时有 WiFi + 蜂窝。进程被 bindProcessToNetwork(WiFi)，
@@ -597,16 +618,18 @@ class SignalingClient(
                 return
             } catch (e: Exception) {
                 try { s?.close() } catch (_: Throwable) {}
-                log("[映射] 第 " + attempt + " 次失败: " +
+                val backoff = minOf(1000L * attempt, 3000L)
+                log("[映射] 第 " + attempt + " 次失败（" +
+                        (backoff / 1000.0) + "s 后重试）: " +
                         e.javaClass.simpleName + ": " + e.message)
-                if (attempt < 3) { delay(1000); continue }
-                log("[信令] TCP 映射观测连接失败: " + e.message)
+                delay(backoff)
             } catch (t: Throwable) {
                 try { s?.close() } catch (_: Throwable) {}
-                log("[映射] 第 " + attempt + " 次异常: " +
+                val backoff = minOf(1000L * attempt, 3000L)
+                log("[映射] 第 " + attempt + " 次异常（" +
+                        (backoff / 1000.0) + "s 后重试）: " +
                         t.javaClass.simpleName + ": " + t.message)
-                if (attempt < 3) { delay(1000); continue }
-                log("[信令] TCP 映射观测连接异常: " + t.javaClass.simpleName + ": " + t.message)
+                delay(backoff)
             }
         }
     }
@@ -618,6 +641,11 @@ class SignalingClient(
                 RoomConfig.T_MEMBER_JOIN ->
                     parseMember(msg.optJSONObject("member"))?.let { onMemberJoin(it) }
                 RoomConfig.T_MEMBER_LEAVE -> onMemberLeave(msg.optString("id"))
+                // member_update：成员信息更新（如对端 TCP 映射登记完成）。
+                // 走 onMemberJoin 路径（addMember 更新信息 + requestPunch），
+                // 拿到刚登记的有效 pub_tcp 后可立即触发打洞。
+                RoomConfig.T_MEMBER_UPDATE ->
+                    parseMember(msg.optJSONObject("member"))?.let { onMemberJoin(it) }
                 RoomConfig.T_PUNCH_GO -> {
                     val peer = parseMember(msg.optJSONObject("peer"))
                     if (peer != null) {
@@ -669,7 +697,9 @@ class SignalingClient(
             pubUdp = o.optString("pub_udp"),
             lan = lan,
             tcp = o.optInt("tcp", 0),
-            tcpUdpOffset = offset
+            tcpUdpOffset = offset,
+            // 缺失时默认 true（旧服务器/旧对端：按"能 listen"处理，退回 ID 规则）
+            canListen = if (o.has("can_listen")) o.optBoolean("can_listen", true) else true
         )
     }
 }

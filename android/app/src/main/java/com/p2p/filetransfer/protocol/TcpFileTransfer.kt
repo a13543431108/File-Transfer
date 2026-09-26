@@ -63,6 +63,7 @@ class TcpFileTransfer(
     private var serverSocket: ServerSocket? = null
     private var roomServerSocket: ServerSocket? = null   // 房间模式专用端口
     private var serverJob: Job? = null
+    private var roomServerJob: Job? = null
     private var running = false
 
     /**
@@ -80,14 +81,12 @@ class TcpFileTransfer(
         serverJob = parentScope.launch(Dispatchers.IO) {
             bindAndAccept(this, Constants.TCP_PORT, isRoomPort = false)
         }
-        // 房间模式端口（9998）不监听。
-        //
-        // 实测证实（2026-09-24）：Android 上 ServerSocket 无法与出站 socket
-        // 用 SO_REUSEPORT 共存——一旦监听 9998，映射观测 socket 再 bind 9998
-        // 会 EADDRINUSE，退化成随机端口，导致服务器登记错误的 pub_tcp，
-        // 打洞靶子全错，比不监听更糟。故保持"只出站"策略，依赖 TCP 同时
-        // 打开（simultaneous open）。成功率是概率性的，但配合握手确认可
-        // 保证正确性（不成则回退 UDP）。
+        // 房间端口【不监听】（Android 限制）：
+        //   实测 Android 12+ 无法给 ServerSocket 可靠设 SO_REUSEPORT
+        //   （反射取 fd 失败）→ 监听 socket 独占端口 → 映射 socket 绑不上、
+        //   退化为随机端口 → 监听与映射端口不一致 → 打洞失败。
+        //   故手机端"只出站"：打洞时按能力规则主动 connect（见 RoomManager）。
+        //   电脑端（Windows）能共存，由它 listen 接住手机的 connect。
     }
 
     /**
@@ -117,8 +116,11 @@ class TcpFileTransfer(
                 if (!isRoomPort) log("[TCP] 设置监听 socket RCVBUF 失败: " + e.message)
             }
             ss.reuseAddress = true
-            // 注：房间模式 9998 不监听（见 startServer 注释）。
-            // 若未来恢复房间监听，此处需对 ss 调 ReusePort.enableServerSocket(ss, log)。
+            if (isRoomPort) {
+                // 房间端口：必须 SO_REUSEPORT，才能与映射观测 socket
+                // （也绑同端口、也设 SO_REUSEPORT）共存。
+                com.p2p.filetransfer.util.ReusePort.enableServerSocket(ss, log)
+            }
             ss.bind(InetSocketAddress(port), 50)
             if (isRoomPort) roomServerSocket = ss else serverSocket = ss
             log(if (isRoomPort) "[房间] 房间端口 $port 监听成功" else "[TCP] 监听端口 $port 成功")
@@ -152,11 +154,15 @@ class TcpFileTransfer(
         try { ss.close() } catch (_: Exception) {}
     }
 
+    /** 房间端口是否成功监听（供 C/S 打洞判断：未监听则降级为主动 connect）。 */
+    fun isRoomPortBound(): Boolean = roomServerSocket != null
+
     fun stopServer() {
         running = false
         try { serverSocket?.close() } catch (_: Exception) {}
         try { roomServerSocket?.close() } catch (_: Exception) {}
         serverJob?.cancel()
+        roomServerJob?.cancel()
     }
 
     // ================= 接收 =================
@@ -691,6 +697,20 @@ class TcpFileTransfer(
                         Constants.FLAG_FILE -> receiveSingleFile(socket, reader, peerKey)
                         Constants.FLAG_FOLDER -> receiveFolder(socket, reader, peerKey)
                         Constants.FLAG_QUERY_OFFSET -> handleQueryOffset(socket, reader, peerKey)
+                        // TCP 心跳探测：收到 PING 立即回 PONG；收到 PONG 记录 RTT。
+                        // 仅在空闲长连接上出现，不干扰文件数据传输。
+                        Constants.FLAG_PING -> {
+                            try {
+                                socket.outputStream.write(Constants.FLAG_PONG)
+                                socket.outputStream.flush()
+                            } catch (_: Exception) {}
+                        }
+                        Constants.FLAG_PONG -> {
+                            val rtt = TcpRttTracker.markPongReceived(peerKey)
+                            if (rtt != null) {
+                                log("[TCP] 心跳 RTT = " + rtt + " ms（peer=" + peerKey + "）")
+                            }
+                        }
                         else -> stop = true
                     }
                 }
